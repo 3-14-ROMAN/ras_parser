@@ -1,0 +1,17 @@
+{
+  "name": "ras-parser",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "parser.js",
+  "scripts": {
+    "start": "node parser.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ghost-cursor": "^1.4.2",
+    "playwright": "^1.49.0"
+  }
+}
