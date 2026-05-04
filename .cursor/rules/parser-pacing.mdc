@@ -1,0 +1,68 @@
+---
+description: Pacing rules for parser.js — which smartWait context to use where
+globs: parser.js
+alwaysApply: false
+---
+
+# Пейсинг parser.js
+
+В `parser.js` живёт модульный синглтон `_stealth`, инициализируемый
+в `main()` сразу после получения `page`:
+
+```js
+_stealth = new StealthBrowserManager(page, { logger: log });
+```
+
+Все новые функции, которым нужны паузы или клики, должны использовать
+этот синглтон (или принимать `stealth` параметром).
+
+## Какой контекст smartWait использовать
+
+| Сценарий | Контекст |
+|---|---|
+| poll-tick в while-loop, ждём DOM/network событие | `'micro'` |
+| пост-action settle после клика/набора | `'micro'` (по умолчанию у `click`/`type`) |
+| «прочитать страницу», после клика, инициирующего загрузку | `'reading'` |
+| между paginated POST-запросами к арбитру | `'api_delay'` |
+| после `_rotateIp()` — дать прокси переехать | `'ip_cooldown'` |
+| после `page.goto(...)` — JS/jQuery/fingerprint init | `'warmup'` |
+| между retry-попытками `_safeGoto` | `'reading'` |
+
+## Шаблоны
+
+Polling-loop с дедлайном:
+
+```js
+const deadline = monotonic() + seconds;
+while (monotonic() < deadline) {
+  if (eventCaptured()) return true;
+  await _stealth.smartWait("micro"); // НЕ waitForTimeout(N)
+}
+```
+
+Цикл по страницам API:
+
+```js
+for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum += 1) {
+  // ... POST + парсинг ...
+  if (pageNum < MAX_PAGES) {
+    await _stealth.smartWait("api_delay");
+  }
+}
+```
+
+Ротация мобильного IP:
+
+```js
+await fetch(CHANGE_IP_URL, { signal: AbortSignal.timeout(30_000) });
+await _stealth.smartWait("ip_cooldown");
+```
+
+## Запрещено
+
+- `await sleep(...)` (в parser.js нет и не должно быть `sleep`-хелпера)
+- `page.waitForTimeout(...)`, `page.waitForLoadState(...)`
+- Импортить из `config.js` числовые задержки и спать на них —
+  если нужен новый профиль, добавь бакет в `stealthManager.js`
+- Воссоздавать `_humanClick`/свой клик с `page.mouse.*` — используй
+  только `_stealth.click(selector, { afterWait })`

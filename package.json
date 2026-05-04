@@ -5,12 +5,14 @@
   "type": "module",
   "main": "parser.js",
   "scripts": {
-    "start": "node parser.js"
+    "start": "node --env-file=.env parser.js",
+    "test": "node test_escalator.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "@mobileproxy/sdk": "^1.0.0",
     "ghost-cursor": "^1.4.2",
     "playwright": "^1.49.0"
   }

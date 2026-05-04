@@ -1,0 +1,42 @@
+---
+description: Antifraud invariants for the ras_parser project — forbidden APIs and mandatory use of StealthBrowserManager
+alwaysApply: true
+---
+
+# Stealth Invariants (ras_parser)
+
+Любой новый или модифицированный код в этом проекте обязан соблюдать
+антифрод-дисциплину, заложенную в `stealthManager.js`. Нарушения = баг.
+
+## Запрещено в любой логике парсинга
+
+- `setTimeout(...)` напрямую (единственное место, где он жив, — `SLEEP`
+  внутри `stealthManager.js`)
+- `page.waitForTimeout(...)`, `page.waitForLoadState(...)`
+- Любой свой `sleep(ms)` / `await new Promise(r => setTimeout(r, N))`
+- Фиксированные числовые задержки в логике (`500`, `1000`, `2000`, и т.п.)
+- Прямой `page.mouse.move/click`, `locator.click()`, `locator.type()`,
+  `locator.fill()`, `locator.pressSequentially()` — всё это синтетика,
+  которую видит антифрод
+
+## Обязательно
+
+- Все паузы — только через `_stealth.smartWait(actionType)`
+- Все клики — только через `_stealth.click(selector, { afterWait })`
+- Весь набор текста — только через `_stealth.type(selector, text, { afterWait })`
+- Скачивание файлов — только через `_stealth.downloadPdf(...)`
+- Если у метода нет `_stealth` — добавь его параметром или используй
+  модульный синглтон `_stealth` (см. `parser.js`)
+
+## Различай: задержка vs. таймаут
+
+Числовые `timeout:` в Playwright API (`page.goto({timeout})`,
+`waitForEvent({timeout})`, `request.post({timeout})`,
+`AbortSignal.timeout(...)`) — это **дедлайны на отказ**, не задержки.
+Их оставлять можно. Запрещены именно «искусственные паузы между действиями».
+
+## Если нужен новый тип ожидания
+
+Не пиши инлайн-`Math.random()*X+Y`. Добавь новый контекст в
+`WAIT_BUCKETS` внутри `stealthManager.js` (см. правило `stealth-manager`)
+и используй `smartWait('твой_контекст')`.
