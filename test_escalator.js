@@ -17,7 +17,7 @@ import {
   ProxyEscalator,
   ESC_KINDS,
   ESC_LEVELS,
-} from "./escalator.js";
+} from "./network/escalator.js";
 
 const monotonic = () => performance.now() / 1000;
 
@@ -487,6 +487,52 @@ async function test_invalid_kind_throws() {
   console.log("[ok] test_invalid_kind_throws");
 }
 
+async function test_revert_duplicate_ip_counters() {
+  const client = makeMockClient();
+  const esc = new ProxyEscalator({
+    proxyClient: client,
+    stealth: null,
+    logger: () => {},
+    maxIpRotationsBeforeEquipment: 3,
+    maxOperatorSwapsBeforeGeo: 1,
+    maxGeoSwaps: 0,
+    maxTotalFailures: 10,
+    maxBudgetSec: 30,
+  });
+  await esc.recoverFrom("dup-test", { kind: ESC_KINDS.BANNED });
+  assert.equal(esc.summary().consecutiveIpRotations, 1);
+  assert.equal(esc.summary().totalIpRotations, 1);
+  assert.equal(esc.summary().totalFailures, 1);
+  esc.revertLastIpRotationForDuplicateEgress("dup");
+  assert.equal(esc.summary().consecutiveIpRotations, 0);
+  assert.equal(esc.summary().totalIpRotations, 0);
+  assert.equal(esc.summary().totalFailures, 0);
+  console.log("[ok] test_revert_duplicate_ip_counters");
+}
+
+// Test 9. Глобальные пределы budget/totalFailures выключены (0) —
+// длинная череда recoverFrom не кидает EscalationExhausted из _checkBudget.
+async function test_disabled_global_caps_long_run() {
+  const client = makeMockClient();
+  const esc = new ProxyEscalator({
+    proxyClient: client,
+    stealth: makeFakeStealth(),
+    logger: () => {},
+    maxIpRotationsBeforeEquipment: 2000,
+    maxOperatorSwapsBeforeGeo: 2,
+    maxGeoSwaps: 2,
+    maxTotalFailures: 0,
+    maxBudgetSec: 0,
+  });
+  const n = 800;
+  for (let i = 0; i < n; i += 1) {
+    await esc.recoverFrom(`cap-off-${i}`, { kind: ESC_KINDS.BANNED });
+  }
+  assert.equal(esc.summary().totalFailures, n);
+  assert.equal(esc.summary().totalIpRotations, n);
+  console.log("[ok] test_disabled_global_caps_long_run");
+}
+
 // ───────────────────────────────────────────────────────────────
 // Runner
 // ───────────────────────────────────────────────────────────────
@@ -501,6 +547,8 @@ async function main() {
     test_banned_never_changes_geo,
     test_net_down_tries_ip_first,
     test_invalid_kind_throws,
+    test_revert_duplicate_ip_counters,
+    test_disabled_global_caps_long_run,
   ];
   let passed = 0;
   let failed = 0;

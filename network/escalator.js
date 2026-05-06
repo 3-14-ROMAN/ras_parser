@@ -28,10 +28,11 @@
  *         Не больше `maxGeoSwaps` штук на весь прогон.
  *
  *   STOP «EscalationExhausted»
- *      └─ если все доступные уровни выгребены или превышен общий
- *         бюджет (по времени или по числу провалов) — бросаем
- *         исключение наверх. Это страховка, чтобы НЕ было
- *         бесконечного цикла «ip → eq → ip → eq → ip → ...».
+ *      └─ если все доступные уровни выгребены, либо (если заданы
+ *         `maxBudgetSec`/`maxTotalFailures` > 0) превышен тайм-бюджет
+ *         или число вызовов `recoverFrom` — бросаем исключение наверх.
+ *         Сама лестница L1→L2→(L3) уже конечна; опциональные бюджеты —
+ *         дополнительный предохранитель для тех, кто их включит в .env.
  *
  * Контракт `kind`:
  *
@@ -94,15 +95,20 @@ export class ProxyEscalator {
    * @param {(msg:string)=>void} [cfg.logger]
    * @param {number} [cfg.maxIpRotationsBeforeEquipment=3]
    *        Сколько раз подряд пробовать `changeIp` до эскалации.
+   * @param {number} [cfg.preEquipmentIpRotations=0]
+   *        Сколько ДОПОЛНИТЕЛЬНЫХ `changeIp` сделать перед первой
+   *        сменой оборудования (L2/L3) после исчерпания L1.
    * @param {number} [cfg.maxOperatorSwapsBeforeGeo=2]
    *        Сколько раз подряд менять оператора до эскалации в гео.
-   * @param {number} [cfg.maxGeoSwaps=2]
-   *        Жёсткий потолок смен гео за прогон.
-   * @param {number} [cfg.maxTotalFailures=40]
-   *        Сколько всего вызовов `recoverFrom` готовы пережить.
-   * @param {number} [cfg.maxBudgetSec=3600]
-   *        Полный таймбюджет на работу эскалатора (с момента создания).
-   *        Превысили — `EscalationExhausted`.
+ * @param {number} [cfg.maxGeoSwaps=2]
+ *        Потолок смен гео за прогон (**≤0 — без лимита**; частоту режет
+ *        `minGeoSwapGapSec` в RasProxyClient).
+ * @param {number} [cfg.maxTotalFailures=0]
+ *        Сколько всего вызовов `recoverFrom` готовы пережить.
+ *        **0 или меньше — без лимита** (долгие фоновые прогоны).
+ * @param {number} [cfg.maxBudgetSec=0]
+ *        Полный таймбюджет на работу эскалатора (с момента создания).
+ *        **0 или меньше — без лимита.** Иначе превысили — `EscalationExhausted`.
    * @param {object} [cfg.geoFilters]
    *        Ограничения, которые применяются при L3 changeGeo (запуск
    *        ТОЛЬКО при `recoverFrom(reason, {kind:'net_down'})` —
@@ -118,10 +124,11 @@ export class ProxyEscalator {
     stealth = null,
     logger = (m) => process.stdout.write(`${m}\n`),
     maxIpRotationsBeforeEquipment = 3,
+    preEquipmentIpRotations = 0,
     maxOperatorSwapsBeforeGeo = 2,
     maxGeoSwaps = 2,
-    maxTotalFailures = 40,
-    maxBudgetSec = 3600,
+    maxTotalFailures = 0,
+    maxBudgetSec = 0,
     geoFilters = null,
   }) {
     if (!proxyClient) throw new Error("ProxyEscalator: proxyClient is required");
@@ -132,6 +139,7 @@ export class ProxyEscalator {
 
     this.limits = {
       maxIpRotationsBeforeEquipment,
+      preEquipmentIpRotations: Math.max(0, preEquipmentIpRotations),
       maxOperatorSwapsBeforeGeo,
       maxGeoSwaps,
       maxTotalFailures,
@@ -146,6 +154,7 @@ export class ProxyEscalator {
     this.totalFailures = 0;
     this.startedAt = monotonic();
     this.lastAction = null;
+    this.preEquipmentBurstDone = false;
   }
 
   summary() {
@@ -163,13 +172,19 @@ export class ProxyEscalator {
 
   _checkBudget(reason) {
     const elapsed = monotonic() - this.startedAt;
-    if (elapsed > this.limits.maxBudgetSec) {
+    if (
+      this.limits.maxBudgetSec > 0 &&
+      elapsed > this.limits.maxBudgetSec
+    ) {
       throw new EscalationExhausted(
         `[esc] исчерпан общий бюджет ${this.limits.maxBudgetSec}с, причина=${reason}`,
         this.summary(),
       );
     }
-    if (this.totalFailures >= this.limits.maxTotalFailures) {
+    if (
+      this.limits.maxTotalFailures > 0 &&
+      this.totalFailures >= this.limits.maxTotalFailures
+    ) {
       throw new EscalationExhausted(
         `[esc] исчерпан лимит totalFailures=${this.limits.maxTotalFailures}, причина=${reason}`,
         this.summary(),
@@ -233,10 +248,35 @@ export class ProxyEscalator {
       return { level: ESC_LEVELS.IP, detail: res, kind };
     }
 
-    if (
-      this.totalGeoSwaps < this.limits.maxGeoSwaps &&
-      this.operatorSwapsThisGeo < this.limits.maxOperatorSwapsBeforeGeo
-    ) {
+    if (!this.preEquipmentBurstDone && this.limits.preEquipmentIpRotations > 0) {
+      this.log(
+        `[esc] pre-L2 burst: ${this.limits.preEquipmentIpRotations}x changeIp ` +
+          `перед сменой оборудования (${reason})`,
+      );
+      for (let i = 1; i <= this.limits.preEquipmentIpRotations; i += 1) {
+        this.log(
+          `[esc] pre-L2 changeIp #${i}/${this.limits.preEquipmentIpRotations} kind=${kind}`,
+        );
+        let res;
+        try {
+          res = await this.client.rotateIp(`pre-equipment#${i}: ${reason}`);
+        } catch (e) {
+          this.log(`[esc] pre-L2 rotateIp кинул ${e} — продолжаю к оборудованию`);
+          res = { ok: false };
+        }
+        this.totalIpRotations += 1;
+        this.lastAction = ESC_LEVELS.IP;
+        await this._settle(ESC_LEVELS.IP);
+        if (res && res.ok) {
+          this.consecutiveIpRotations += 1;
+        }
+      }
+      this.preEquipmentBurstDone = true;
+    }
+
+    const geoCapOk =
+      this.limits.maxGeoSwaps <= 0 || this.totalGeoSwaps < this.limits.maxGeoSwaps;
+    if (geoCapOk && this.operatorSwapsThisGeo < this.limits.maxOperatorSwapsBeforeGeo) {
       this.log(
         `[esc] L2 changeOperator #${this.operatorSwapsThisGeo + 1}/` +
           `${this.limits.maxOperatorSwapsBeforeGeo} kind=${kind} (${reason})`,
@@ -251,14 +291,17 @@ export class ProxyEscalator {
       this.operatorSwapsThisGeo += 1;
       this.totalOperatorSwaps += 1;
       this.consecutiveIpRotations = 0;
+      this.preEquipmentBurstDone = false;
       this.lastAction = ESC_LEVELS.OPERATOR;
       await this._settle(ESC_LEVELS.OPERATOR);
       return { level: ESC_LEVELS.OPERATOR, detail: res, kind };
     }
 
-    if (kind === ESC_KINDS.NET_DOWN && this.totalGeoSwaps < this.limits.maxGeoSwaps) {
+    if (kind === ESC_KINDS.NET_DOWN && geoCapOk) {
       this.log(
-        `[esc] L3 changeGeo #${this.totalGeoSwaps + 1}/${this.limits.maxGeoSwaps} ` +
+        `[esc] L3 changeGeo #${this.totalGeoSwaps + 1}/${
+          this.limits.maxGeoSwaps <= 0 ? "off" : this.limits.maxGeoSwaps
+        } ` +
           `kind=net_down (${reason}) — \u0421\u041c\u0415\u041d\u042f\u042e \u0420\u0415\u0413\u0418\u041e\u041d ` +
           `(\u043f\u043b\u0430\u0442\u043d\u043e \u0443 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u0430)`,
       );
@@ -272,12 +315,13 @@ export class ProxyEscalator {
       this.totalGeoSwaps += 1;
       this.operatorSwapsThisGeo = 0;
       this.consecutiveIpRotations = 0;
+      this.preEquipmentBurstDone = false;
       this.lastAction = ESC_LEVELS.GEO;
       await this._settle(ESC_LEVELS.GEO);
       return { level: ESC_LEVELS.GEO, detail: res, kind };
     }
 
-    if (kind === ESC_KINDS.BANNED && this.totalGeoSwaps < this.limits.maxGeoSwaps) {
+    if (kind === ESC_KINDS.BANNED && geoCapOk) {
       throw new EscalationExhausted(
         `[esc] L1+L2 исчерпаны в текущем geo (ip×${this.totalIpRotations}, ` +
           `op×${this.totalOperatorSwaps}), kind=banned — changeGeo ПОЛИТИКОЙ ЗАПРЕЩЁН ` +
@@ -292,6 +336,29 @@ export class ProxyEscalator {
         `op×${this.totalOperatorSwaps}, geo×${this.totalGeoSwaps}), ` +
         `kind=${kind}, причина=${reason}`,
       this.summary(),
+    );
+  }
+
+  /**
+   * Провайдер вернул OK на changeIp, но `new_ip` совпал с прошлым вызовом —
+   * эскалация «не была реальной». Откатываем инкременты последнего L1-шага,
+   * чтобы не сжигать лестницу и totalFailures впустую (см. parser.js:
+   * перезапуск браузера и повтор окна).
+   *
+   * @param {string} reason
+   */
+  revertLastIpRotationForDuplicateEgress(reason) {
+    if (this.lastAction !== ESC_LEVELS.IP) {
+      this.log(
+        `[esc] revertLastIpRotation: lastAction=${this.lastAction} — не после L1, пропуск`,
+      );
+      return;
+    }
+    this.totalFailures = Math.max(0, this.totalFailures - 1);
+    this.totalIpRotations = Math.max(0, this.totalIpRotations - 1);
+    this.consecutiveIpRotations = Math.max(0, this.consecutiveIpRotations - 1);
+    this.log(
+      `[esc] откат счётчиков после duplicate new_ip (failures/ip/consecutive −1): ${reason}`,
     );
   }
 
@@ -313,4 +380,3 @@ export class ProxyEscalator {
   }
 }
 
-export default ProxyEscalator;

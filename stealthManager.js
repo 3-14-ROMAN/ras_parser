@@ -8,14 +8,19 @@
  *     задержка проходит через `smartWait(actionType)` с long-tail
  *     распределением по бакетам с весами. Никаких голых
  *     `setTimeout`/`waitForTimeout` за пределами smartWait;
- *   - движения мыши идут по кривым Безье через ghost-cursor, никаких
- *     телепортаций; перед каждым кликом — рандомный offset от центра
- *     элемента + 1..3 микро-«ёрзания» (`cursor.moveBy`);
+ *   - движения мыши идут по кривым Безье через `ghost-cursor-playwright`
+ *     (форк ghost-cursor под Playwright; оригинальный `ghost-cursor`
+ *     дёргает puppeteer-only API: `page.browser()`, `page._client()`,
+ *     `page.target()._targetId` — в Playwright их нет, поэтому он там
+ *     стабильно падает с `TypeError: this.page.browser is not a function`).
+ *     Никаких телепортаций; перед каждым кликом — рандомная точка в
+ *     «толстом ядре» элемента (30..70% от bbox) + 1..3 микро-«ёрзания»
+ *     через `cursor.actions.move({x: prev.x+dx, y: prev.y+dy})`;
  *   - набор текста через `pressSequentially` с РАНДОМНОЙ per-char
  *     задержкой; при длине > 5 символов вставляем «задумчивую» паузу
  *     300..600 мс на случайной позиции в середине слова;
- *   - после каждого `click`/`type` гарантированно вызывается
- *     `smartWait(afterWait)` (по умолчанию 'micro'), чтобы антифрод
+ *   - после каждого `click`/`type`/`pressKey`/`clickBelow` гарантированно
+ *     вызывается `smartWait(afterWait)` (по умолчанию 'micro'), чтобы антифрод
  *     не видел мгновенной реакции скрипта на изменение DOM.
  *
  * Контексты smartWait:
@@ -42,7 +47,13 @@
 
 import path from "node:path";
 import fs from "node:fs";
-import { createCursor } from "ghost-cursor";
+import { createCursor } from "ghost-cursor-playwright";
+
+/** Подробные `[stealth/…]` в консоль (паузы, каждый клик/набор). По умолчанию выкл. */
+const RAS_TRACE_STEALTH = process.env.RAS_TRACE_STEALTH === "1";
+
+/** Пометка на `Page`: уже подменили `mouse.move` clamp’ом по viewport. */
+const MOUSE_CLAMP_INSTALLED = Symbol.for("ras_parser.stealth.mouseClampViewport");
 
 const SLEEP = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -52,6 +63,70 @@ function randUniform(a, b) {
 
 function randInt(a, b) {
   return Math.floor(randUniform(a, b + 1));
+}
+
+function isFiniteNumber(n) {
+  return typeof n === "number" && Number.isFinite(n);
+}
+
+function isValidPoint(pt) {
+  return !!pt && isFiniteNumber(pt.x) && isFiniteNumber(pt.y);
+}
+
+/**
+ * Chromium/CDP отвергает mouse.move с координатами вне viewport (`Invalid parameters`).
+ * В ghost-cursor `clampPositive` обнуляет только отрицательные оси; траектории Безье и
+ * overshoot выводят X/Y за правый/нижний край — то же самое с `_fidgetCursor` у краёв.
+ *
+ * @param {number} n
+ * @param {number} maxCssPx размер оси viewport (CSS px)
+ */
+function clampPixelToViewportAxis(n, maxCssPx) {
+  if (!Number.isFinite(n) || maxCssPx <= 0) return 0;
+  const hi = Math.max(0, maxCssPx - 1);
+  return Math.round(Math.min(Math.max(n, 0), hi));
+}
+
+/**
+ * Подмена `page.mouse.move`: все координаты приводятся к целым и к пределам viewport.
+ * Вызывать до `createCursor()`, чтобы и стартовая точка ghost-cursor проходила через clamp.
+ *
+ * @param {import('playwright').Page} page
+ */
+function installViewportClampedMouseMove(page) {
+  if (page[MOUSE_CLAMP_INSTALLED]) return;
+  page[MOUSE_CLAMP_INSTALLED] = true;
+  const origMove = page.mouse.move.bind(page.mouse);
+  page.mouse.move = async (x, y, moveOpts) => {
+    const vs = page.viewportSize();
+    const vw = vs?.width ?? 4096;
+    const vh = vs?.height ?? 2160;
+    const cx = clampPixelToViewportAxis(x, vw);
+    const cy = clampPixelToViewportAxis(y, vh);
+    return origMove(cx, cy, moveOpts);
+  };
+}
+
+function buildTargetFromBox(box) {
+  if (
+    !box ||
+    !isFiniteNumber(box.x) ||
+    !isFiniteNumber(box.y) ||
+    !isFiniteNumber(box.width) ||
+    !isFiniteNumber(box.height) ||
+    box.width <= 0 ||
+    box.height <= 0
+  ) {
+    return null;
+  }
+  const FX_MIN = 0.3, FX_MAX = 0.7;
+  const FY_MIN = 0.3, FY_MAX = 0.7;
+  return {
+    x: box.x + box.width * FX_MIN,
+    y: box.y + box.height * FY_MIN,
+    width: box.width * (FX_MAX - FX_MIN),
+    height: box.height * (FY_MAX - FY_MIN),
+  };
 }
 
 /**
@@ -92,6 +167,12 @@ const WAIT_BUCKETS = {
     { weight: 12, range: [4000, 7000], label: "api/slow" },
     { weight: 3, range: [7500, 10000], label: "api/stall" },
   ],
+  /** Между кликами пейджера в одной выдаче — короче, чем `api_delay` (без «читал страницу»). */
+  pager: [
+    { weight: 82, range: [320, 850], label: "pager/quick" },
+    { weight: 15, range: [850, 1600], label: "pager/settle" },
+    { weight: 3, range: [1700, 3200], label: "pager/stall" },
+  ],
   ip_cooldown: [
     { weight: 70, range: [12000, 18000], label: "ip/normal" },
     { weight: 25, range: [18000, 28000], label: "ip/slow" },
@@ -112,20 +193,70 @@ const WAIT_BUCKETS = {
     { weight: 25, range: [60000, 120000], label: "equipment_swap/slow" },
     { weight: 5, range: [120000, 180000], label: "equipment_swap/stall" },
   ],
+  /** Интервал между проверками «п. 3.1 ещё на месте» (без искусственных пауз в парсере). */
+  filter31_recheck: [
+    { weight: 85, range: [180_000, 240_000], label: "filter31_recheck/normal" },
+    { weight: 12, range: [240_000, 300_000], label: "filter31_recheck/stretch" },
+    { weight: 3, range: [300_000, 420_000], label: "filter31_recheck/long" },
+  ],
 };
+
+/**
+ * Выбрать длительность паузы из бакета без самого сна (планирование таймеров и т.п.).
+ * @param {keyof typeof WAIT_BUCKETS} [actionType='click']
+ * @returns {number}
+ */
+export function sampleSmartWaitMs(actionType = "click") {
+  const buckets = WAIT_BUCKETS[actionType];
+  if (!buckets) {
+    return sampleSmartWaitMs("click");
+  }
+  const bucket = pickWeighted(buckets);
+  return randUniform(bucket.range[0], bucket.range[1]);
+}
 
 export class StealthBrowserManager {
   /**
+   * Прямой конструктор не вызывать — `createCursor()` в
+   * `ghost-cursor-playwright` async. Используй `await
+   * StealthBrowserManager.create(page, options)`.
+   *
    * @param {import('playwright').Page} page
+   * @param {import('ghost-cursor-playwright').Cursor} cursor
    * @param {{logger?: (msg: string) => void}} [options]
    */
-  constructor(page, options = {}) {
+  constructor(page, cursor, options = {}) {
     if (!page) {
       throw new Error("StealthBrowserManager: page is required");
     }
+    if (!cursor) {
+      throw new Error(
+        "StealthBrowserManager: cursor is required (use StealthBrowserManager.create)",
+      );
+    }
     this.page = page;
-    this.cursor = createCursor(page);
+    this.cursor = cursor;
     this.log = options.logger ?? ((msg) => process.stdout.write(`${msg}\n`));
+  }
+
+  /**
+   * Асинхронная фабрика: поднимает ghost-cursor-playwright и возвращает
+   * готовый `StealthBrowserManager`.
+   *
+   * @param {import('playwright').Page} page
+   * @param {{logger?: (msg: string) => void}} [options]
+   * @returns {Promise<StealthBrowserManager>}
+   */
+  static async create(page, options = {}) {
+    if (!page) {
+      throw new Error("StealthBrowserManager.create: page is required");
+    }
+    installViewportClampedMouseMove(page);
+    const cursor = await createCursor(page, {
+      debug: false,
+      overshootRadius: 0,
+    });
+    return new StealthBrowserManager(page, cursor, options);
   }
 
   /**
@@ -144,9 +275,11 @@ export class StealthBrowserManager {
     }
     const bucket = pickWeighted(buckets);
     const waitMs = randUniform(bucket.range[0], bucket.range[1]);
-    this.log(
-      `[stealth/wait] ${bucket.label}: сплю ${(waitMs / 1000).toFixed(2)}с`,
-    );
+    if (RAS_TRACE_STEALTH) {
+      this.log(
+        `[stealth/wait] ${bucket.label}: сплю ${(waitMs / 1000).toFixed(2)}с`,
+      );
+    }
     await SLEEP(waitMs);
     return waitMs;
   }
@@ -155,16 +288,36 @@ export class StealthBrowserManager {
    * 1..3 микро-«ёрзания» курсором по 2..6 пикселей в случайных направлениях,
    * с микропаузами между ними. Имитирует человека, который «уже навёлся,
    * но ещё не нажал».
+   *
+   * `ghost-cursor-playwright` не имеет `moveBy(dx, dy)` (был в puppeteer-
+   * версии), поэтому считаем абсолютные координаты от `cursor.previous` —
+   * это последняя точка, в которую двигался курсор. Передаём не объект
+   * с >2 ключами, иначе пакет посчитает его BoundingBox-ом и пойдёт в
+   * `getRandomPointInsideElem` (см. `instanceOfVector` в cursor.js).
    */
   async _fidgetCursor() {
     const twitches = randInt(1, 3);
     for (let i = 0; i < twitches; i += 1) {
       const dx = randUniform(-5, 5);
       const dy = randUniform(-3, 3);
+      const prev = this.cursor.previous;
+      if (!isValidPoint(prev)) {
+        if (RAS_TRACE_STEALTH) {
+          this.log(`[stealth/fidget] нет previous-позиции, пропускаю ёрзания`);
+        }
+        return;
+      }
+      const target = { x: prev.x + dx, y: prev.y + dy };
+      if (!isValidPoint(target)) {
+        if (RAS_TRACE_STEALTH) {
+          this.log(`[stealth/fidget] невалидная target-позиция, пропускаю ёрзания`);
+        }
+        return;
+      }
       try {
-        await this.cursor.moveBy({ x: dx, y: dy });
+        await this.cursor.actions.move(target);
       } catch (e) {
-        this.log(`[stealth/fidget] moveBy упал, игнорирую: ${e}`);
+        this.log(`[stealth/fidget] actions.move(by) упал, игнорирую: ${e}`);
         return;
       }
       await SLEEP(randUniform(20, 90));
@@ -174,30 +327,38 @@ export class StealthBrowserManager {
   /**
    * Человечный клик по селектору:
    *   1. scrollIntoViewIfNeeded;
-   *   2. вычисляем рандомный offset внутри «толстого ядра» элемента
-   *      (30..70% по обеим осям) — НЕ кликаем в center/center;
-   *   3. ghost-cursor двигает мышь в эту точку по кривой Безье;
-   *   4. 1..3 микро-ёрзания через cursor.moveBy;
-   *   5. кликаем «по месту» (selector=undefined) с рандомными
-   *      hesitate/waitForClick;
+   *   2. снимаем bbox локатором, сужаем его до «толстого ядра» 30..70%
+   *      по обеим осям — НЕ кликаем в center/center и не на самый край;
+   *   3. ghost-cursor-playwright двигает мышь по кривой Безье в случайную
+   *      точку внутри суженного bbox (`cursor.actions.move(box)`);
+   *   4. 1..3 микро-ёрзания через `_fidgetCursor()`;
+   *   5. кликаем «по месту» — `cursor.actions.click()` без `target` →
+   *      mousedown/mouseup по текущей позиции; `waitBeforeClick` ≈ старый
+   *      `hesitate` (пауза перед нажатием), `waitBetweenClick` ≈ старый
+   *      `waitForClick` (длина hold);
    *   6. автоматический `smartWait(afterWait)` на выходе.
    *
+   * Если bbox получить не удалось — отдаём селектор пакету как fallback,
+   * он сам найдёт и применит `getRandomPointInsideElem` без сужения.
+   *
    * @param {string} selector
-   * @param {{afterWait?: 'micro' | 'click' | 'reading' | 'none'}} [options]
+   * @param {{afterWait?: 'micro' | 'click' | 'reading' | 'none', scrollIntoView?: boolean}} [options]
    * @returns {Promise<boolean>}
    */
   async click(selector, options = {}) {
-    const { afterWait = "micro" } = options;
+    const { afterWait = "micro", scrollIntoView = true } = options;
     const locator = this.page.locator(selector).first();
     if ((await locator.count()) === 0) {
       this.log(`[stealth/click] ${selector} -> элемент не найден`);
       return false;
     }
 
-    try {
-      await locator.scrollIntoViewIfNeeded({ timeout: 5_000 });
-    } catch (e) {
-      this.log(`[stealth/click] scrollIntoView упал, продолжаю: ${e}`);
+    if (scrollIntoView) {
+      try {
+        await locator.scrollIntoViewIfNeeded({ timeout: 5_000 });
+      } catch (e) {
+        this.log(`[stealth/click] scrollIntoView упал, продолжаю: ${e}`);
+      }
     }
 
     let box = null;
@@ -207,63 +368,87 @@ export class StealthBrowserManager {
       this.log(`[stealth/click] boundingBox упал: ${e}`);
     }
 
-    let destination = null;
-    if (box) {
-      const fx = randUniform(0.3, 0.7);
-      const fy = randUniform(0.3, 0.7);
-      destination = { x: box.width * fx, y: box.height * fy };
+    let target;
+    const boxedTarget = buildTargetFromBox(box);
+    if (boxedTarget) {
+      target = boxedTarget;
+    } else {
+      target = selector;
+      if (box) {
+        this.log(
+          `[stealth/click] bbox невалидный, fallback на selector: ${JSON.stringify(box)}`,
+        );
+      }
     }
 
+    const waitBeforeClick = [
+      Math.round(randUniform(40, 120)),
+      Math.round(randUniform(140, 220)),
+    ];
+    const waitBetweenClick = [
+      Math.round(randUniform(25, 60)),
+      Math.round(randUniform(60, 110)),
+    ];
+
     try {
-      if (destination) {
-        await this.cursor.move(selector, { destination });
-      } else {
-        await this.cursor.move(selector);
-      }
+      await this.cursor.actions.move(target);
     } catch (e) {
       this.log(
-        `[stealth/click] cursor.move упал, fallback на cursor.click: ${e}`,
+        `[stealth/click] actions.move упал, fallback на actions.click(target): ${e}`,
       );
       try {
-        await this.cursor.click(
-          selector,
-          destination
-            ? {
-                destination,
-                hesitate: Math.round(randUniform(40, 220)),
-                waitForClick: Math.round(randUniform(25, 110)),
-              }
-            : {
-                hesitate: Math.round(randUniform(40, 220)),
-                waitForClick: Math.round(randUniform(25, 110)),
-              },
-        );
+        await this.cursor.actions.click({
+          target,
+          waitBeforeClick,
+          waitBetweenClick,
+        });
         if (afterWait !== "none") await this.smartWait(afterWait);
         return true;
       } catch (e2) {
-        this.log(`[stealth/click] fallback cursor.click тоже упал: ${e2}`);
+        this.log(`[stealth/click] fallback actions.click(target) тоже упал: ${e2}`);
         return false;
       }
     }
 
-    await this._fidgetCursor();
-
-    const clickOpts = {
-      hesitate: Math.round(randUniform(40, 220)),
-      waitForClick: Math.round(randUniform(25, 110)),
-    };
     try {
-      await this.cursor.click(undefined, clickOpts);
-      const offsetStr = destination
-        ? `offset=(${destination.x.toFixed(0)},${destination.y.toFixed(0)})`
-        : "offset=n/a";
-      this.log(
-        `[stealth/click] ${selector} OK ${offsetStr}, ` +
-          `hesitate=${clickOpts.hesitate}мс, hold=${clickOpts.waitForClick}мс`,
-      );
+      await this._fidgetCursor();
     } catch (e) {
-      this.log(`[stealth/click] cursor.click (at-current) упал: ${e}`);
-      return false;
+      if (RAS_TRACE_STEALTH) {
+        this.log(`[stealth/fidget] неожиданная ошибка, продолжаю без ёрзания: ${e}`);
+      }
+    }
+
+    try {
+      await this.cursor.actions.click({
+        waitBeforeClick,
+        waitBetweenClick,
+      });
+      if (RAS_TRACE_STEALTH) {
+        const offsetStr =
+          typeof target === "object"
+            ? `target-box=(x=${target.x.toFixed(0)},y=${target.y.toFixed(0)},` +
+              `w=${target.width.toFixed(0)},h=${target.height.toFixed(0)})`
+            : "target=selector";
+        this.log(
+          `[stealth/click] ${selector} OK ${offsetStr}, ` +
+            `waitBeforeClick=[${waitBeforeClick.join("..")}]мс, ` +
+            `waitBetweenClick=[${waitBetweenClick.join("..")}]мс`,
+        );
+      }
+    } catch (e) {
+      this.log(
+        `[stealth/click] actions.click (at-current) упал, fallback на click(target): ${e}`,
+      );
+      try {
+        await this.cursor.actions.click({
+          target,
+          waitBeforeClick,
+          waitBetweenClick,
+        });
+      } catch (e2) {
+        this.log(`[stealth/click] fallback click(target) тоже упал: ${e2}`);
+        return false;
+      }
     }
 
     if (afterWait !== "none") {
@@ -326,21 +511,159 @@ export class StealthBrowserManager {
         const chunk = chunks[i];
         const charDelay = randUniform(55, 215);
         await locator.pressSequentially(chunk, { delay: charDelay });
-        this.log(
-          `[stealth/type] ${selector} <- "${chunk}" ` +
-            `(per-char≈${charDelay.toFixed(0)}мс)`,
-        );
+        if (RAS_TRACE_STEALTH) {
+          this.log(
+            `[stealth/type] ${selector} <- "${chunk}" ` +
+              `(per-char≈${charDelay.toFixed(0)}мс)`,
+          );
+        }
         if (i === thinkPauseAfter) {
           const thinkMs = randUniform(300, 600);
-          this.log(
-            `[stealth/type] «задумчивая» пауза ${thinkMs.toFixed(0)}мс ` +
-              `после "${chunk}"`,
-          );
+          if (RAS_TRACE_STEALTH) {
+            this.log(
+              `[stealth/type] «задумчивая» пауза ${thinkMs.toFixed(0)}мс ` +
+                `после "${chunk}"`,
+            );
+          }
           await SLEEP(thinkMs);
         }
       }
     } catch (e) {
       this.log(`[stealth/type] pressSequentially упал: ${e}`);
+      return false;
+    }
+
+    if (afterWait !== "none") {
+      await this.smartWait(afterWait);
+    }
+    return true;
+  }
+
+  /**
+   * Нажатие клавиши в активном фокусе страницы (`page.keyboard`).
+   * Для закрытия datepicker после набора даты и т.п.
+   *
+   * @param {string} key — имя клавиши Playwright, например `'Enter'`, `'Escape'`.
+   * @param {{afterWait?: 'micro' | 'click' | 'reading' | 'none'}} [options]
+   * @returns {Promise<boolean>}
+   */
+  async pressKey(key, options = {}) {
+    const { afterWait = "micro" } = options;
+    if (!key || typeof key !== "string") {
+      this.log("[stealth/key] пустой key");
+      return false;
+    }
+    try {
+      await this.page.keyboard.press(key);
+      if (RAS_TRACE_STEALTH) {
+        this.log(`[stealth/key] press '${key}'`);
+      }
+    } catch (e) {
+      this.log(`[stealth/key] press '${key}' упало: ${e}`);
+      return false;
+    }
+    if (afterWait !== "none") {
+      await this.smartWait(afterWait);
+    }
+    return true;
+  }
+
+  /**
+   * Клик по случайной точке на странице сразу **под** нижней границей
+   * элемента (в координатах viewport). Закрывает перекрывающий календарь,
+   * когда кнопка «Найти» оказывается под выпадашкой.
+   *
+   * @param {string} selector
+   * @param {{afterWait?: 'micro' | 'click' | 'reading' | 'none', gapMin?: number, gapMax?: number}} [options]
+   * @returns {Promise<boolean>}
+   */
+  async clickBelow(selector, options = {}) {
+    const {
+      afterWait = "micro",
+      gapMin = 40,
+      gapMax = 140,
+    } = options;
+    const locator = this.page.locator(selector).first();
+    if ((await locator.count()) === 0) {
+      this.log(`[stealth/clickBelow] ${selector} -> элемент не найден`);
+      return false;
+    }
+
+    try {
+      await locator.scrollIntoViewIfNeeded({ timeout: 5_000 });
+    } catch (e) {
+      this.log(`[stealth/clickBelow] scrollIntoView упал, продолжаю: ${e}`);
+    }
+
+    let box = null;
+    try {
+      box = await locator.boundingBox();
+    } catch (e) {
+      this.log(`[stealth/clickBelow] boundingBox упал: ${e}`);
+    }
+    if (
+      !box ||
+      !isFiniteNumber(box.width) ||
+      !isFiniteNumber(box.height) ||
+      box.width <= 0 ||
+      box.height <= 0
+    ) {
+      this.log(`[stealth/clickBelow] ${selector} -> невалидный bbox`);
+      return false;
+    }
+
+    const vp = this.page.viewportSize();
+    const gap = randUniform(gapMin, gapMax);
+    let x = box.x + box.width * randUniform(0.35, 0.65);
+    let y = box.y + box.height + gap;
+    if (vp) {
+      const margin = randUniform(6, 18);
+      x = Math.min(Math.max(x, margin), vp.width - margin);
+      y = Math.min(y, vp.height - margin);
+    }
+    if (y <= box.y + box.height) {
+      y = box.y + box.height + randUniform(25, 55);
+      if (vp) {
+        const margin = randUniform(6, 18);
+        y = Math.min(y, vp.height - margin);
+      }
+    }
+
+    const target = { x, y };
+    const waitBeforeClick = [
+      Math.round(randUniform(40, 120)),
+      Math.round(randUniform(140, 220)),
+    ];
+    const waitBetweenClick = [
+      Math.round(randUniform(25, 60)),
+      Math.round(randUniform(60, 110)),
+    ];
+
+    try {
+      await this.cursor.actions.move(target);
+    } catch (e) {
+      this.log(`[stealth/clickBelow] actions.move упал: ${e}`);
+      return false;
+    }
+
+    try {
+      await this._fidgetCursor();
+    } catch (e) {
+      this.log(`[stealth/clickBelow] fidget: ${e}`);
+    }
+
+    try {
+      await this.cursor.actions.click({
+        waitBeforeClick,
+        waitBetweenClick,
+      });
+      if (RAS_TRACE_STEALTH) {
+        this.log(
+          `[stealth/clickBelow] ${selector} OK точка≈(${x.toFixed(0)},${y.toFixed(0)})`,
+        );
+      }
+    } catch (e) {
+      this.log(`[stealth/clickBelow] actions.click упал: ${e}`);
       return false;
     }
 
@@ -408,4 +731,3 @@ export class StealthBrowserManager {
   }
 }
 
-export default StealthBrowserManager;

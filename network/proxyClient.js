@@ -53,7 +53,9 @@ export class RasProxyClient {
    * @param {string} cfg.apiToken          — API token MobileProxy
    * @param {string} cfg.proxyKey          — proxy_key из дашборда (для changeIp + резолва proxy_id)
    * @param {number} [cfg.proxyId]         — если знаем заранее, не дёргаем getMyProxy
-   * @param {number} [cfg.minIpRotateGapSec=15] — hard-cooldown между changeIp
+   * @param {number} [cfg.minIpRotateGapSec=300] — hard-cooldown между changeIp
+   * @param {number} [cfg.minEquipmentSwapGapSec=600] — hard-cooldown между changeEquipment (L2/L3 общий нижний предел)
+   * @param {number} [cfg.minGeoSwapGapSec=180] — дополнительно между двумя changeGeo (max с equipment-gap)
    * @param {number} [cfg.requestTimeoutMs=90000]
    * @param {(msg:string)=>void} [cfg.logger]
    */
@@ -61,7 +63,9 @@ export class RasProxyClient {
     apiToken,
     proxyKey,
     proxyId = null,
-    minIpRotateGapSec = 15,
+    minIpRotateGapSec = 300,
+    minEquipmentSwapGapSec = 600,
+    minGeoSwapGapSec = 180,
     requestTimeoutMs = 90_000,
     logger = (m) => process.stdout.write(`${m}\n`),
   }) {
@@ -71,6 +75,8 @@ export class RasProxyClient {
     this.sdk = new MobileProxyClient(apiToken, { timeout: requestTimeoutMs });
     this.proxyKey = proxyKey;
     this.minIpRotateGapSec = minIpRotateGapSec;
+    this.minEquipmentSwapGapSec = minEquipmentSwapGapSec;
+    this.minGeoSwapGapSec = Math.max(0, Number(minGeoSwapGapSec) || 0);
     this.log = logger;
 
     this._proxyId = proxyId !== null ? Number(proxyId) : null;
@@ -81,6 +87,17 @@ export class RasProxyClient {
     this._lastSameRequestAt = new Map();
     this._globalCallTimes = [];
     this._lastIpRotateAt = -Infinity;
+    this._lastEquipmentSwapAt = -Infinity;
+    this._lastGeoSwapAt = -Infinity;
+    /** @type {string | null} последний `new_ip`, возвращённый changeIp (для детекта «ротация без смены»). */
+    this._lastRotateReportedIp = null;
+  }
+
+  /**
+   * Сброс детекта дубликата `new_ip` (после перезапуска браузера / новой сессии).
+   */
+  resetReportedIpTracking() {
+    this._lastRotateReportedIp = null;
   }
 
   // ───────────────────────── rate limit ─────────────────────────
@@ -198,21 +215,6 @@ export class RasProxyClient {
     );
   }
 
-  async getCurrentIp() {
-    const id = await this._resolveProxyId();
-    const resp = await this._call(
-      "proxy_ip",
-      { proxy_id: id },
-      () => this.sdk.getProxyIp(id),
-    );
-    return resp?.ip ?? resp?.IP ?? resp?.proxy_ip ?? resp?.address ?? null;
-  }
-
-  async getBalance() {
-    const resp = await this._call("get_balance", {}, () => this.sdk.getBalance());
-    return resp?.balance ?? resp?.summ ?? resp;
-  }
-
   // ───────────────────────── ротация IP ─────────────────────────
 
   async rotateIp(reason = "") {
@@ -230,18 +232,29 @@ export class RasProxyClient {
       resp = await this.sdk.changeIp(this.proxyKey);
     } catch (e) {
       this.log(`[mp/ip] SDK changeIp упал: ${e}`);
-      return { ok: false, reason: `${e}`, raw: null };
+      return { ok: false, reason: `${e}`, raw: null, newIp: null, duplicateIp: false };
     }
     const status = resp?.status;
     const ok = status === undefined || status === null || status === "OK";
     if (!ok) {
       this.log(`[mp/ip] провайдер не-OK: ${JSON.stringify(resp).slice(0, 300)}`);
-    } else {
+      return { ok, raw: resp, newIp: null, duplicateIp: false };
+    }
+    const newIpRaw = resp?.new_ip;
+    const newIp =
+      newIpRaw !== undefined && newIpRaw !== null && String(newIpRaw).trim()
+        ? String(newIpRaw).trim()
+        : "";
+    let duplicateIp = false;
+    if (newIp && this._lastRotateReportedIp && newIp === this._lastRotateReportedIp) {
+      duplicateIp = true;
       this.log(
-        `[mp/ip] OK new_ip=${resp?.new_ip ?? "?"} rt=${resp?.rt ?? "?"}`,
+        `[mp/ip] ВНИМАНИЕ: new_ip=${newIp} совпадает с прошлой ротацией — egress, возможно, не сменился`,
       );
     }
-    return { ok, raw: resp };
+    if (newIp) this._lastRotateReportedIp = newIp;
+    this.log(`[mp/ip] OK new_ip=${resp?.new_ip ?? "?"} rt=${resp?.rt ?? "?"}`);
+    return { ok, raw: resp, newIp: newIp || null, duplicateIp };
   }
 
   // ───────────────────────── оборудование ─────────────────────────
@@ -253,10 +266,26 @@ export class RasProxyClient {
     );
   }
 
-  async _runChangeEquipment(opts, reason) {
+  async _runChangeEquipment(opts, reason, { isGeoSwap = false } = {}) {
+    const now0 = monotonic();
+    const sinceEquip = now0 - this._lastEquipmentSwapAt;
+    const sinceGeo = now0 - this._lastGeoSwapAt;
+    let waitSec = Math.max(0, this.minEquipmentSwapGapSec - sinceEquip);
+    if (isGeoSwap && this.minGeoSwapGapSec > 0) {
+      waitSec = Math.max(waitSec, this.minGeoSwapGapSec - sinceGeo);
+    }
+    if (waitSec > 0) {
+      const waitMs = Math.ceil(waitSec * 1000) + 100;
+      const what = isGeoSwap ? "оборудования/гео" : "оборудования";
+      this.log(`[mp/eq] hard-cooldown: жду ${(waitMs / 1000).toFixed(1)}с между сменами ${what}`);
+      await sleep(waitMs);
+    }
     const id = await this._resolveProxyId();
     const callOpts = { addToBlackList: 1, ...opts };
     this.log(`[mp/eq] change_equipment(${reason}) opts=${JSON.stringify(callOpts)}`);
+    const tSwap = monotonic();
+    this._lastEquipmentSwapAt = tSwap;
+    if (isGeoSwap) this._lastGeoSwapAt = tSwap;
 
     let resp;
     try {
@@ -406,7 +435,7 @@ export class RasProxyClient {
         `(geoid=${opts.geoId}, eid=${pick.eid ?? "auto"}), ` +
         `reason=${reason}, было='${currentOperator ?? "?"}'`,
     );
-    const r = await this._runChangeEquipment(opts, reason);
+    const r = await this._runChangeEquipment(opts, reason, { isGeoSwap: false });
     return { ...r, kind: "operator", operator: pick.operator, oldOperator: currentOperator };
   }
 
@@ -417,6 +446,8 @@ export class RasProxyClient {
    * @param {object}  [opts]
    * @param {object}  [opts.filters]                — ограничения на выбор гео
    * @param {number}  [opts.filters.requireCountryId]  — если задан, разрешён только id_country
+   * @param {number[]}[opts.filters.excludeCountryIds] — id_country, которые запрещены
+   * @param {RegExp}  [opts.filters.includeCaptionRegex] — whitelist regexp по geo_caption
    * @param {number[]}[opts.filters.excludeGeoIds]     — список geoid, которые не брать
    * @param {number[]}[opts.filters.excludeCityIds]    — список id_city, которые не брать
    * @param {RegExp}  [opts.filters.excludeCaptionRegex] — regexp по geo_caption (миллионники и т.п.)
@@ -455,6 +486,18 @@ export class RasProxyClient {
         ) {
           return false;
         }
+        if (Array.isArray(filters.excludeCountryIds) && filters.excludeCountryIds.length) {
+          if (
+            c.countryId !== null &&
+            filters.excludeCountryIds.map(Number).includes(Number(c.countryId))
+          ) {
+            return false;
+          }
+        }
+        if (filters.includeCaptionRegex instanceof RegExp) {
+          const caption = c.caption ? String(c.caption) : "";
+          if (!filters.includeCaptionRegex.test(caption)) return false;
+        }
         if (Array.isArray(filters.excludeGeoIds) && filters.excludeGeoIds.length) {
           if (filters.excludeGeoIds.map(Number).includes(Number(c.geoid))) return false;
         }
@@ -474,6 +517,8 @@ export class RasProxyClient {
       this.log(
         `[mp/eq] geo-фильтр: ${allCandidates.length} -> ${candidates.length} ` +
           `(country=${filters.requireCountryId ?? "any"}, ` +
+          `excludeCountries=${(filters.excludeCountryIds ?? []).join(",") || "-"}, ` +
+          `includeRegex=${filters.includeCaptionRegex ? "yes" : "no"}, ` +
           `excludeCities=${(filters.excludeCityIds ?? []).join(",") || "-"}, ` +
           `regex=${filters.excludeCaptionRegex ? "yes" : "no"})`,
       );
@@ -490,7 +535,7 @@ export class RasProxyClient {
           `(geoid=${pick.geoid}, eid=${pick.eid ?? "auto"}, operator='${pick.operator ?? "?"}', ` +
           `country=${pick.countryId ?? "?"}), reason=${reason}, было geoid='${currentGeoId ?? "?"}'`,
       );
-      const r = await this._runChangeEquipment(opts, reason);
+      const r = await this._runChangeEquipment(opts, reason, { isGeoSwap: true });
       return {
         ...r,
         kind: "geo",
@@ -648,4 +693,3 @@ function _extractEquipmentCandidates(avail, filters = {}) {
   return filtered;
 }
 
-export default RasProxyClient;

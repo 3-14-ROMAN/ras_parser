@@ -7,10 +7,12 @@ alwaysApply: false
 # Пейсинг parser.js
 
 В `parser.js` живёт модульный синглтон `_stealth`, инициализируемый
-в `main()` сразу после получения `page`:
+в `main()` сразу после получения `page`. Конструктор `StealthBrowserManager`
+напрямую не зовём — `createCursor()` из `ghost-cursor-playwright` async,
+поэтому используем фабрику:
 
 ```js
-_stealth = new StealthBrowserManager(page, { logger: log });
+_stealth = await StealthBrowserManager.create(page, { logger: log });
 ```
 
 Все новые функции, которым нужны паузы или клики, должны использовать
@@ -51,11 +53,10 @@ for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum += 1) {
 }
 ```
 
-Ротация мобильного IP:
+Восстановление через эскалатор:
 
 ```js
-await fetch(CHANGE_IP_URL, { signal: AbortSignal.timeout(30_000) });
-await _stealth.smartWait("ip_cooldown");
+await _recoverFrom("context", { kind: "banned" });
 ```
 
 ## Запрещено

@@ -6,14 +6,18 @@
   "main": "parser.js",
   "scripts": {
     "start": "node --env-file=.env parser.js",
-    "test": "node test_escalator.js"
+    "test": "node test_escalator.js && node test_window_split.js",
+    "proxy:operator": "node --env-file=.env scripts/mp-proxy-api.js operator",
+    "proxy:geo": "node --env-file=.env scripts/mp-proxy-api.js geo",
+    "proxy:ip": "node --env-file=.env scripts/mp-proxy-api.js ip",
+    "proxy:list": "node --env-file=.env scripts/mp-proxy-api.js list"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "@mobileproxy/sdk": "^1.0.0",
-    "ghost-cursor": "^1.4.2",
+    "ghost-cursor-playwright": "^2.1.0",
     "playwright": "^1.49.0"
   }
 }
