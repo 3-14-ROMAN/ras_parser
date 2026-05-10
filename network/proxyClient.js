@@ -1,37 +1,7 @@
 /**
- * RasProxyClient — обёртка над `@mobileproxy/sdk` под нужды ras_parser.
- *
- * Решает задачи, которые SDK сам по себе не решает:
- *
- *   1. **Rate-limit под лимиты провайдера**:
- *      · 1 одинаковый запрос (по сигнатуре `command+args`) не чаще
- *        чем раз в 5 сек (иначе провайдер шлёт
- *        "Too many lonely requests. Timeout 5 second").
- *      · 3 × N запросов в секунду суммарно, где N = число активных
- *        прокси (получаем из `getMyProxy()`). По дефолту считаем 1
- *        прокси (3 req/sec) до того, как доехали до резолва.
- *      · `changeIp` идёт через rotation endpoint, у которого по доке
- *        нет лимита частоты — но у нас всё равно есть hard-cooldown
- *        `minIpRotateGapSec`, чтобы не сжечь модем 10 ротациями подряд.
- *
- *   2. **Lazy-резолв `proxy_id`** по `proxy_key` через `getMyProxy()`.
- *      Заодно подтягиваем `_activeProxyCount`, чтобы потолок
- *      глобального rate-limit был корректным.
- *
- *   3. **Эскалации до смены оборудования**:
- *      · `changeOperator(reason)` — выбирает eid другого оператора
- *        в том же гео (если есть), иначе фоллбекается на «любую другую
- *        SIM», + `addToBlackList=1`, чтобы не вернуться на ту же SIM
- *        в следующий раз.
- *      · `changeGeo(reason)` — то же, но другое гео.
- *      · обе ждут реального переезда модема через `getTaskResult`
- *        (если провайдер вернул `tasks_id`), плюс короткий health-poll.
- *
- * Этот модуль НЕ парсит ras.arbitr.ru — он только общается с
- * провайдером прокси. Поэтому стелс-инвариант про `smartWait`
- * на него не распространяется (это «дедлайны на отказ» / лимиты
- * провайдера, а не имитация человека). Точные паузы — через
- * `node:timers/promises`, а не голый `setTimeout`.
+ * RasProxyClient — обёртка над `@mobileproxy/sdk`: rate-limit под лимиты провайдера,
+ * lazy-резолв `proxy_id`, и три действия — `rotateIp`, `changeOperator`, `changeGeo`.
+ * Cooldowns hard-enforced: changeIp ≥120с, changeEquipment ≥180с.
  */
 
 import { setTimeout as sleep } from "node:timers/promises";
@@ -48,23 +18,12 @@ const TASK_POLL_INTERVAL_SEC = 5;
 const TASK_POLL_MAX_ATTEMPTS = 30;
 
 export class RasProxyClient {
-  /**
-   * @param {object} cfg
-   * @param {string} cfg.apiToken          — API token MobileProxy
-   * @param {string} cfg.proxyKey          — proxy_key из дашборда (для changeIp + резолва proxy_id)
-   * @param {number} [cfg.proxyId]         — если знаем заранее, не дёргаем getMyProxy
-   * @param {number} [cfg.minIpRotateGapSec=300] — hard-cooldown между changeIp
-   * @param {number} [cfg.minEquipmentSwapGapSec=600] — hard-cooldown между changeEquipment (L2/L3 общий нижний предел)
-   * @param {number} [cfg.minGeoSwapGapSec=180] — дополнительно между двумя changeGeo (max с equipment-gap)
-   * @param {number} [cfg.requestTimeoutMs=90000]
-   * @param {(msg:string)=>void} [cfg.logger]
-   */
   constructor({
     apiToken,
     proxyKey,
     proxyId = null,
-    minIpRotateGapSec = 300,
-    minEquipmentSwapGapSec = 600,
+    minIpRotateGapSec = 120,
+    minEquipmentSwapGapSec = 180,
     minGeoSwapGapSec = 180,
     requestTimeoutMs = 90_000,
     logger = (m) => process.stdout.write(`${m}\n`),
@@ -349,25 +308,13 @@ export class RasProxyClient {
     return null;
   }
 
-  /**
-   * Сменить оборудование на ДРУГОГО оператора в том же гео.
-   *
-   * ВАЖНО: эта операция СТРОГО в текущем geo. Никаких слепых фоллбеков
-   * на «любое другое eid». Если в текущем гео нет альтернативного
-   * оператора — возвращаем `ok:false reason='no-same-geo-operator'`,
-   * чтобы вышестоящий код мог решить, эскалироваться ли в L3 changeGeo
-   * (а это уже платно у провайдера). Раньше тут был фоллбек, и он мог
-   * молча увезти SIM в другой регион — теперь так нельзя.
-   */
+  /** Сменить SIM/оператора в текущем geo. Если нет альтернатив — вернёт ok=false → переход на L3. */
   async changeOperator(reason = "") {
     let avail;
     try {
       avail = await this.getAvailableEquipment();
     } catch (e) {
-      this.log(
-        `[mp/eq] getAvailableEquipment упал: ${e} — НЕ делаю слепой ` +
-          `change_equipment (мог бы уехать в другой регион). reason=${reason}`,
-      );
+      this.log(`[mp/eq] getAvailableEquipment упал: ${e}; reason=${reason}`);
       return {
         ok: false,
         reason: `getAvailableEquipment failed: ${e}`,
@@ -389,8 +336,8 @@ export class RasProxyClient {
 
     if (currentGeoId === null) {
       this.log(
-        `[mp/eq] не знаю текущий geoid — НЕ делаю change_equipment без явного ` +
-          `gegio-замка (риск платной смены региона). reason=${reason}`,
+        `[mp/eq] не знаю текущий geoid — пропускаю changeOperator (нужен geo-замок). ` +
+          `reason=${reason}`,
       );
       return {
         ok: false,
@@ -406,10 +353,8 @@ export class RasProxyClient {
     });
     if (!candidates.length) {
       this.log(
-        `[mp/eq] нет альтернативного оператора в текущем гео (geoid=${currentGeoId}) — ` +
-          `НЕ делаю слепой фоллбек на «любое другое eid» (мог бы уехать в платный ` +
-          `другой регион). reason=${reason}. Возвращаю ok=false, пусть верхний слой ` +
-          `решает, эскалироваться ли в changeGeo.`,
+        `[mp/eq] нет альтернативного оператора в текущем гео (geoid=${currentGeoId}); ` +
+          `reason=${reason}. Возвращаю ok=false, верхний слой пойдёт в changeGeo.`,
       );
       return {
         ok: false,
@@ -439,21 +384,7 @@ export class RasProxyClient {
     return { ...r, kind: "operator", operator: pick.operator, oldOperator: currentOperator };
   }
 
-  /**
-   * Сменить географию — взять eid в другом geoid.
-   *
-   * @param {string}  [reason]
-   * @param {object}  [opts]
-   * @param {object}  [opts.filters]                — ограничения на выбор гео
-   * @param {number}  [opts.filters.requireCountryId]  — если задан, разрешён только id_country
-   * @param {number[]}[opts.filters.excludeCountryIds] — id_country, которые запрещены
-   * @param {RegExp}  [opts.filters.includeCaptionRegex] — whitelist regexp по geo_caption
-   * @param {number[]}[opts.filters.excludeGeoIds]     — список geoid, которые не брать
-   * @param {number[]}[opts.filters.excludeCityIds]    — список id_city, которые не брать
-   * @param {RegExp}  [opts.filters.excludeCaptionRegex] — regexp по geo_caption (миллионники и т.п.)
-   * @param {boolean} [opts.allowFallbackOperator=true] — если кандидатов 0,
-   *        падать на `changeOperator()` (true) или возвращать `{ ok:false }` (false).
-   */
+  /** Сменить регион. `filters` (см. config.js GEO_FILTERS) могут отсечь нежелательные гео. */
   async changeGeo(reason = "", { filters = null, allowFallbackOperator = true } = {}) {
     let avail;
     try {
@@ -547,19 +478,9 @@ export class RasProxyClient {
     }
 
     if (filters) {
-      this.log(
-        "[mp/eq] под фильтр не подходит ни одно гео — НЕ делаю слепой changeOperator " +
-          "(иначе вернёмся в Москву). Возвращаю ok=false.",
-      );
-      return {
-        ok: false,
-        reason: "no-allowed-geo",
-        kind: "geo",
-        oldGeoId: currentGeoId,
-        raw: null,
-      };
+      this.log(`[mp/eq] под фильтр не подходит ни одно гео — ok=false, reason=${reason}`);
+      return { ok: false, reason: "no-allowed-geo", kind: "geo", oldGeoId: currentGeoId, raw: null };
     }
-
     this.log("[mp/eq] нет альтернативного гео — фоллбек на смену оператора");
     if (allowFallbackOperator) return await this.changeOperator(`fallback-from-geo: ${reason}`);
     return { ok: false, reason: "no-alt-geo", kind: "geo", raw: null };
@@ -577,23 +498,7 @@ function _extractProxyArray(resp) {
   return [];
 }
 
-/**
- * Парсим ответ `get_geo_operator_list`. Реальная схема провайдера:
- *
- * ```
- * { status: "ok", geo_operator_list: {
- *     "<geoid>": {
- *       geoid, geo_caption, id_city, id_country,
- *       count_free: { "<operator>": "<count>", ... }
- *     }, ...
- * }}
- * ```
- *
- * Возвращаем «плоский» список кандидатов уровня (geoid, operator) с
- * метаданными `caption / cityId / countryId / count`. На всякий случай
- * рекурсия запасным путём ловит и старый формат с явным `eid` (если
- * провайдер вдруг такое отдаст в будущем).
- */
+/** Плоский список кандидатов (geoid, operator) из `geo_operator_list` провайдера. */
 function _extractEquipmentCandidates(avail, filters = {}) {
   const out = [];
 

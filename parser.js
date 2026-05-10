@@ -1,45 +1,14 @@
 /**
- * Сбор справочника DocumentType с https://ras.arbitr.ru/.
+ * Сбор PDF-ссылок и справочника DocumentType с https://ras.arbitr.ru/.
  *
- * Логика:
- * 1. Поднимаем Chromium через мобильный прокси (HTTP, авторизация по
- *    user/pass из config.js).
- * 2. Открываем ras.arbitr.ru, после load-event прогреваем страницу
- *    через `_stealth.smartWait('warmup')` — рандомное ожидание из
- *    бакетов 5..10с / 10..18с / 25..45с, чтоб WASM-fingerprint и
- *    jQuery успели инициализироваться без машинного «ровно 8 секунд».
- * 3. Опционально: п. 3.1 «поставки» на форме — перед каждым «Найти», если режим включён;
- *    затем период (поля под `#sug-dates`),
- *    затем жмём «Найти» через `_stealth.click(...)` (несколько селекторов +
- *    jQuery-fallback) и ждём первый POST на .../Search; после выдачи — типы РАК
- *    и «Только завершенные», если включены в настройках.
- * 4. Перехватываем url/headers/body первого POST -> /Search и
- *    сохраняем шаблон.
- * 5. Для каждого календарного окна подставляем DateFrom/DateTo в форму
- *    (период поиска), жмём «Найти» и ждём POST /Search — страница 1.
- *    Страницы 2..MAX_PAGES — клик по «вперёд» в пейджере (`ul#pages`),
- *    снова ждём /Search. Между страницами —
- *    `_stealth.smartWait('api_delay')`.
- * 6. Из каждого item достаём TypeId / Type (имя) и копим в dict
- *    (один ключ на id: подпись улучшается, если приходит более длинное
- *    имя или заменяется синтетический id_<uuid>), инкрементально пишем
- *    document_types.json.
- *    Режим decision_links: при включённом фильтре 3.1 на форме доверяем выдаче RAS и
- *    отбору по TypeId; дополнительную проверку карточки kad на 3.1 не делаем.
- * 7. Если страница падает (исключение / not-200 / json-decode) —
- *    идём в `_recoverFrom(...)` через ProxyEscalator (changeIp /
- *    changeOperator / changeGeo по политике kind), затем retry.
- *
- * Антифрод-инвариант: в этом файле НЕТ ни одного `setTimeout`,
- * `waitForTimeout`, `waitForLoadState` и фиксированных числовых
- * пауз — все ожидания идут через бакеты `StealthBrowserManager.smartWait`.
+ * Поток: Chromium через мобильный прокси → форма поиска (категория 3.1, период,
+ * РАК, статус) → первый POST /Search ловится для capture url/headers/body →
+ * страницы 2..N идут прямым `page.request.post`. Бан/таймаут → `_recoverFrom`
+ * через ProxyEscalator (changeIp → changeOperator → changeGeo, циклически).
  */
 
-// ВАЖНО: side-effect-импорт ДОЛЖЕН быть первым. Он загружает .env через
-// process.loadEnvFile() ДО того, как config.js прочитает process.env.*
-// на top-level. Без этого `node parser.js` (без --env-file) уходит
-// в 200 попыток goto с ERR_INVALID_AUTH_CREDENTIALS, потому что
-// MP_PROXY_USER/PASS пустые.
+// Side-effect импорт первым: подхватывает .env через process.loadEnvFile()
+// до того как config.js прочитает process.env на top-level.
 import "./network/loadEnv.js";
 
 import fs from "node:fs";
@@ -57,12 +26,8 @@ import {
   CHANGE_GEO_COOLDOWN_SEC,
   CHANGE_IP_COOLDOWN_SEC,
   ESC_EQUIPMENT_COOLDOWN_SEC,
-  ESC_MAX_BUDGET_SEC,
-  ESC_MAX_GEO_SWAPS,
   ESC_MAX_IP_BEFORE_EQUIPMENT,
   ESC_MAX_OPERATOR_BEFORE_GEO,
-  ESC_PRE_EQUIPMENT_IP_ROTATIONS,
-  ESC_MAX_TOTAL_FAILURES,
   GEO_FILTERS,
   MP_API_TOKEN,
   MP_PROXY_ID,
@@ -70,19 +35,14 @@ import {
   PROXY_PASS,
   PROXY_SERVER,
   PROXY_USER,
-  SLOW_RESPONSE_THRESHOLD_MS,
-  WINDOW_MIN_DAYS,
-  WINDOW_SPLIT_FACTOR,
 } from "./network/config.js";
 import {
-  ESC_KINDS,
   ESC_LEVELS,
   EscalationExhausted,
   ProxyEscalator,
 } from "./network/escalator.js";
 import { RasProxyClient } from "./network/proxyClient.js";
 import { StealthBrowserManager } from "./stealthManager.js";
-import { splitWindow } from "./windowSplit.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -95,13 +55,9 @@ const OUT_PATH = path.join(PARSED_DATA_DIR, "document_types.json");
 
 const DEBUG_DIR = path.join(PROJECT_DIR, "debug");
 const LINKS_OUT_PATH = path.join(PARSED_DATA_DIR, "decision_links.json");
-/** NDJSON отладочной сессии (дублирует ingest; не зависит от localhost:7437). */
-const AGENT_DEBUG_LOG_PATH = path.join(
-  PROJECT_DIR,
-  ".cursor",
-  "debug-5afdb1.log",
-);
-
+const LINKS_FILE_BASENAME = "decision_links";
+const LINKS_CHUNK_SIZE = 3000;
+const LINKS_CHUNK_NAME_RE = /^decision_links_(\d{4})\.json$/;
 /**
  * Панель комбобокса «Категория спора» по заголовку секции.
  * Якорь XPath устойчивее `#caseCategory` при дубликатах id / смене разметки.
@@ -148,43 +104,6 @@ const RAS_PERIOD_DATE_FROM_XPATH =
 const RAS_PERIOD_DATE_TO_XPATH =
   "xpath=(//div[@id='sug-dates']//input[@placeholder='дд.мм.гггг'])[2]";
 
-/** П. 3.1 на карточке kad — совпадает с подписью в фильтре RAS «Категория спора». */
-const KAD_SUPPLY_DISPUTE_CATEGORY_31_TEXT =
-  "3.1. Споры о неисполнении или ненадлежащем исполнении обязательств по договорам поставки";
-
-function _normalizeCategoryProbeBlob(s) {
-  return String(s ?? "")
-    .replace(/\u00a0/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-const KAD_SUPPLY_CATEGORY_31_NEEDLE_NORM = _normalizeCategoryProbeBlob(
-  KAD_SUPPLY_DISPUTE_CATEGORY_31_TEXT,
-);
-const KAD_CATEGORY_FIELD_LABEL_NORM = _normalizeCategoryProbeBlob("Категория спора");
-
-function _htmlToPlainForCategoryProbe(html) {
-  return String(html ?? "")
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ")
-    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|tr|td|th|li|h\d)\s*>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&#160;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
-}
-
-function _kadHtmlShowsSupplyCategory31(html) {
-  const blob = _normalizeCategoryProbeBlob(_htmlToPlainForCategoryProbe(html));
-  if (!blob.includes(KAD_CATEGORY_FIELD_LABEL_NORM)) return false;
-  return blob.includes(KAD_SUPPLY_CATEGORY_31_NEEDLE_NORM);
-}
-
 /** «Ctrl→» внизу выдачи — следующая страница результатов. */
 const RAS_PAGER_NEXT_XPATH =
   "xpath=//ul[@id='pages']/li[contains(@class,'rarr')]//a";
@@ -193,24 +112,16 @@ const DEBUG_SCREENSHOT = path.join(DEBUG_DIR, "debug_page.png");
 const DEBUG_HTML = path.join(DEBUG_DIR, "debug_page.html");
 const DEBUG_SEARCH_DIR = path.join(DEBUG_DIR, "search");
 
-/**
- * Сколько раз подряд разрешено перезапустить браузер и заново прогнать
- * то же календарное окно, если провайдер вернул тот же `new_ip` подряд.
- */
+/** Перезапусков браузера на одном окне при дубль-IP (защита от вечного цикла). */
 const MAX_WINDOW_RECYCLES_AFTER_DUP_IP =
   Number.parseInt(process.env.RAS_MAX_DUP_IP_RECYCLES ?? "8", 10) || 8;
 
-/** Детальные логи клика «Найти» (probe handlers). Без этого — тише. */
+/** Детальные логи кликов и пауз stealthManager. */
 const RAS_TRACE_STEALTH = process.env.RAS_TRACE_STEALTH === "1";
 
-/**
- * После успешного L1 `changeIp` при `kind=banned` заново поднять Chromium,
- * снова открыть ras, «Найти» и перехватить POST — те же даты подставит
- * `main` при повторе окна. По умолчанию выключено, чтобы не плодить
- * дополнительные окна браузера в headful-режиме.
- */
+/** После changeIp пересоздавать Chromium (новые куки/сессия). */
 const RECYCLE_BROWSER_AFTER_BANNED_L1 =
-  (process.env.RAS_RECYCLE_BROWSER_AFTER_BANNED_L1 ?? "0") !== "0";
+  (process.env.RAS_RECYCLE_BROWSER_AFTER_BANNED_L1 ?? "1") !== "0";
 
 class RecycleWindowError extends Error {
   constructor(message) {
@@ -219,61 +130,26 @@ class RecycleWindowError extends Error {
   }
 }
 
-/**
- * Сигнал «текущее окно дат — слишком тяжёлая выборка для RAS».
- *
- * Бросается из `_walkPagesForBody`, когда один POST `/Search` ответил
- * дольше `SLOW_RESPONSE_THRESHOLD_MS`. Это первый признак, что пул
- * прокси разогрет: антиабуз RAS уже начал нам троттлить, и через
- * несколько запросов прилетит 451. Обработчик в `main()` дробит
- * окно на `WINDOW_SPLIT_FACTOR` подокон, ротейтит IP через
- * `_recoverFrom('banned')` и повторяет запрос на более лёгкой
- * выборке (Query Downgrade + Circuit Breaker).
- *
- * Уже собранные на странице items не теряются — `_walkPagesForBody`
- * сохраняет их через `_save()` после каждой успешной страницы и
- * `documentTypes` дедуплицируется по `TypeId`.
- *
- * @typedef {{ endDay: Date, daysSpan: number, latencyMs: number, pageNum: number }} WindowDowngradeInfo
- */
-class WindowDowngradeError extends Error {
-  /**
-   * @param {string} message
-   * @param {WindowDowngradeInfo} info
-   */
-  constructor(message, info) {
-    super(message);
-    this.name = "WindowDowngradeError";
-    this.info = info;
-  }
-}
-
-/** Потолок страниц пейджера на одно календарное окно. RAS_MAX_SEARCH_PAGES в .env. */
+/** Потолок страниц пейджера на одно календарное окно. */
 const MAX_PAGES = Math.max(
   1,
   Number.parseInt(process.env.RAS_MAX_SEARCH_PAGES ?? "40", 10) || 40,
 );
 
-/**
- * Сколько полных раундов (8 попыток + recovery) допустимо на одну страницу
- * выдачи без успешного JSON. Иначе `while (data === null)` крутится вечно.
- */
+/** Раундов (8 попыток + recovery) на одну страницу до сдачи. */
 const MAX_SEARCH_PAGE_DATA_ROUNDS = Math.max(
   5,
   Number.parseInt(process.env.RAS_MAX_SEARCH_PAGE_DATA_ROUNDS ?? "30", 10) || 30,
 );
 
-/**
- * Автостоп при подряд идущих пустых «внешних» окнах (нет дел в интервале).
- * ≤0 — выключено (без лимита). Раньше было захардкожено 60.
- */
+/** Подряд пустых окон до автостопа. ≤0 — без лимита. */
 const RAS_EMPTY_WINDOW_STREAK_LIMIT = (() => {
   const n = Number.parseInt(process.env.RAS_EMPTY_WINDOW_STREAK_LIMIT ?? "0", 10);
   return Number.isFinite(n) ? n : 0;
 })();
-/** Каждые N страниц пейджера — контроль заголовков РАК/«Статус» (без POST-починки на месте). */
+/** Каждые N страниц пейджера — проверка заголовков РАК/Статус. */
 const FILTER_PAGER_TITLE_RECHECK_EVERY = 3;
-/** Ожидание POST /Search после «Найти» в heartbeat-режиме (мс). RAS_WAIT_SEARCH_MS, минимум 5с. */
+/** Таймаут ожидания POST /Search после «Найти» (мс), минимум 5с. */
 const WAIT_FOR_SEARCH_MS = Math.max(
   5_000,
   Number.parseInt(process.env.RAS_WAIT_SEARCH_MS ?? "60000", 10) || 60_000,
@@ -318,6 +194,8 @@ let _searchPostSeq = 0;
  */
 let _browserRecycleForDuplicateIp = null;
 let _xvfbProcess = null;
+/** true только когда main() уже в цикле окон — RecycleWindowError имеет смысл только там. */
+let _inWindowLoop = false;
 
 function _hasCmd(cmd) {
   const probe = spawnSync("bash", ["-lc", `command -v "${cmd}"`], {
@@ -379,53 +257,12 @@ const _responseLog = [];
 let _firstItemLogged = false;
 let _searchDumpIdx = 0;
 
-/**
- * Единственный «легальный» источник пауз во всём parser.js — это
- * `_stealth.smartWait(...)`. В этом файле НЕТ ни одного `setTimeout`,
- * `waitForTimeout`, `waitForLoadState` и фиксированных числовых
- * интервалов в логике парсинга. Все ожидания идут через бакеты
- * рандомизатора в StealthBrowserManager.
- *
- * @type {StealthBrowserManager | null}
- */
+/** @type {StealthBrowserManager | null} */
 let _stealth = null;
 
-/**
- * Эскалатор восстановления (обязательный): ProxyEscalator
- * с лестницей changeIp → changeOperator → changeGeo.
- *
- * @type {ProxyEscalator | null}
- */
 let _escalator = null;
 
 const monotonic = () => performance.now() / 1000;
-
-// #region agent log
-function _agentDebugLog(location, message, data, hypothesisId) {
-  const payload = {
-    sessionId: "5afdb1",
-    location,
-    message,
-    data,
-    hypothesisId,
-    timestamp: Date.now(),
-  };
-  try {
-    fs.mkdirSync(path.dirname(AGENT_DEBUG_LOG_PATH), { recursive: true });
-    fs.appendFileSync(AGENT_DEBUG_LOG_PATH, `${JSON.stringify(payload)}\n`, "utf8");
-  } catch (e) {
-    log(`[agent-debug] запись ${AGENT_DEBUG_LOG_PATH}: ${e}`);
-  }
-  fetch("http://localhost:7437/ingest/92c381b7-7965-4e93-9977-dd75f5f783f1", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "5afdb1",
-    },
-    body: JSON.stringify(payload),
-  }).catch(() => {});
-}
-// #endregion
 
 function pad2(n) {
   return String(n).padStart(2, "0");
@@ -447,33 +284,8 @@ function log(msg) {
   process.stdout.write(`[${ts}] ${text}\n`);
 }
 
-function _dumpSearchResponse(label, body, suffix = "json") {
-  if (body === null || body === undefined) return null;
-  try {
-    fs.mkdirSync(DEBUG_SEARCH_DIR, { recursive: true });
-  } catch (e) {
-    log(`[debug/search] не создал ${DEBUG_SEARCH_DIR}: ${e}`);
-    return null;
-  }
-  _searchDumpIdx += 1;
-  const safeLabel = Array.from(String(label))
-    .map((c) => (/[A-Za-z0-9\-_]/.test(c) ? c : "_"))
-    .join("");
-  const fname = `${String(_searchDumpIdx).padStart(3, "0")}_${safeLabel}.${suffix}`;
-  const p = path.join(DEBUG_SEARCH_DIR, fname);
-  try {
-    if (Buffer.isBuffer(body)) {
-      fs.writeFileSync(p, body);
-    } else {
-      fs.writeFileSync(p, body, "utf-8");
-    }
-    const length = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(body, "utf-8");
-    log(`[debug/search] сохранил ${p} (${length} байт)`);
-    return p;
-  } catch (e) {
-    log(`[debug/search] не записал ${p}: ${e}`);
-    return null;
-  }
+function _dumpSearchResponse(_label, _body, _suffix = "json") {
+  return null;
 }
 
 function _detectChromiumExecutable() {
@@ -705,11 +517,137 @@ function _saveDecisionLinks() {
     n: idx + 1,
     ...row,
   }));
-  const payload = {
-    summary: { total: rows.length },
-    results: rows,
-  };
-  fs.writeFileSync(LINKS_OUT_PATH, JSON.stringify(payload, null, 2), "utf-8");
+  const totalChunks = Math.max(1, Math.ceil(rows.length / LINKS_CHUNK_SIZE));
+  /** @type {Set<string>} */
+  const activeChunkNames = new Set();
+
+  for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx += 1) {
+    const from = chunkIdx * LINKS_CHUNK_SIZE;
+    const to = from + LINKS_CHUNK_SIZE;
+    const chunkRows = rows.slice(from, to);
+    const chunkName = `${LINKS_FILE_BASENAME}_${String(chunkIdx + 1).padStart(4, "0")}.json`;
+    const chunkPath = path.join(PARSED_DATA_DIR, chunkName);
+    const payload = {
+      summary: {
+        total: rows.length,
+        chunkIndex: chunkIdx + 1,
+        chunkTotal: totalChunks,
+        chunkSize: LINKS_CHUNK_SIZE,
+      },
+      results: chunkRows,
+    };
+    fs.writeFileSync(chunkPath, JSON.stringify(payload, null, 2), "utf-8");
+    activeChunkNames.add(chunkName);
+  }
+
+  let parsedEntries = [];
+  try {
+    parsedEntries = fs.readdirSync(PARSED_DATA_DIR);
+  } catch (e) {
+    log(`[save] не прочитал папку ${PARSED_DATA_DIR} для очистки старых chunks: ${e}`);
+    return;
+  }
+  for (const name of parsedEntries) {
+    if (!LINKS_CHUNK_NAME_RE.test(name)) continue;
+    if (activeChunkNames.has(name)) continue;
+    const stalePath = path.join(PARSED_DATA_DIR, name);
+    try {
+      fs.unlinkSync(stalePath);
+    } catch (e) {
+      log(`[save] не удалил старый chunk ${stalePath}: ${e}`);
+    }
+  }
+
+  if (fs.existsSync(LINKS_OUT_PATH)) {
+    try {
+      fs.unlinkSync(LINKS_OUT_PATH);
+    } catch (e) {
+      log(`[save] не удалил legacy-файл ${LINKS_OUT_PATH}: ${e}`);
+    }
+  }
+}
+
+function _decisionLinkKeyFromRow(row) {
+  const idKey = String(row?.id ?? "").trim();
+  if (idKey) return idKey;
+  return [
+    String(row?.caseId ?? "").trim(),
+    String(row?.fileName ?? "").trim(),
+    String(row?.registrationDate ?? "").trim(),
+  ].join("|");
+}
+
+function _loadExistingDecisionLinks() {
+  /** @type {Array<{ idx: number, path: string }>} */
+  const chunkFiles = [];
+  let parsedEntries = [];
+  try {
+    parsedEntries = fs.readdirSync(PARSED_DATA_DIR);
+  } catch {
+    parsedEntries = [];
+  }
+  for (const name of parsedEntries) {
+    const m = name.match(LINKS_CHUNK_NAME_RE);
+    if (!m) continue;
+    const sourcePath = path.join(PARSED_DATA_DIR, name);
+    const idx = parseInt(m[1], 10);
+    if (!Number.isFinite(idx)) continue;
+    chunkFiles.push({ idx, path: sourcePath });
+  }
+  chunkFiles.sort((a, b) => a.idx - b.idx);
+
+  /** @type {string[]} */
+  const sourcePaths = [];
+  if (chunkFiles.length > 0) {
+    for (const chunk of chunkFiles) sourcePaths.push(chunk.path);
+  } else if (fs.existsSync(LINKS_OUT_PATH) && fs.statSync(LINKS_OUT_PATH).isFile()) {
+    sourcePaths.push(LINKS_OUT_PATH);
+  }
+
+  if (!sourcePaths.length) {
+    log(
+      `[load] ${LINKS_OUT_PATH} / ${LINKS_FILE_BASENAME}_NNNN.json нет — стартуем с пустого набора decision_links`,
+    );
+    return;
+  }
+
+  let loaded = 0;
+  let totalRows = 0;
+  for (const sourcePath of sourcePaths) {
+    let raw;
+    try {
+      raw = fs.readFileSync(sourcePath, "utf-8");
+    } catch (e) {
+      log(`[load] не прочитал ${sourcePath}: ${e}`);
+      continue;
+    }
+    if (!raw.trim()) {
+      log(`[load] ${sourcePath} пустой — пропускаю`);
+      continue;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      log(`[load] ${sourcePath} битый JSON (${e}) — игнорирую содержимое`);
+      continue;
+    }
+
+    const rows = Array.isArray(data?.results) ? data.results : [];
+    totalRows += rows.length;
+    for (const row of rows) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+      const key = _decisionLinkKeyFromRow(row);
+      if (!key || decisionLinks.has(key)) continue;
+      decisionLinks.set(key, row);
+      loaded += 1;
+    }
+  }
+
+  log(
+    `[load] из ${sourcePaths.length} file(s): строк results=${totalRows}, загружено=${loaded}`,
+  );
 }
 
 /**
@@ -718,47 +656,15 @@ function _saveDecisionLinks() {
  *
  * @returns {Promise<boolean>}
  */
-async function _verifyKadCardShowsSupplyCategory31(page, cardUrl) {
-  let lastErr = "";
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const resp = await page.request.get(cardUrl, { timeout: 120_000 });
-      const status = resp.status();
-      if (status !== 200) {
-        lastErr = `http=${status}`;
-        await _stealth.smartWait("reading");
-        continue;
-      }
-      const html = await resp.text();
-      if (_kadHtmlShowsSupplyCategory31(html)) return true;
-      return false;
-    } catch (e) {
-      lastErr = String(e && e.message ? e.message : e);
-      await _stealth.smartWait("reading");
-    }
-  }
-  log(`[links-category] не удалось проверить карточку ${cardUrl}: ${lastErr}`);
-  return false;
-}
-
 /**
- * @param {Map<string, boolean> | null} [kadCaseCategory31Cache]
- *        один запрос kad на CaseId за проход `_walkPagesForBody` (в выдаче одно дело
- *        может повторяться на нескольких страницах с разными Id документов).
- * @param {Set<string> | null} [kadCategorySkipLogged] ключ CaseId или cardUrl — один `[links-skip]` на дело за окно.
- * @param {boolean} [trustRasSupplyCategory31=false] фильтр 3.1 уже задан на RAS — не ходим на kad.
+ * Категория 3.1 (поставки) уже задана фильтром на RAS — серверной выдаче доверяем,
+ * на kad.arbitr.ru за каждой карточкой не лезем. Если supplyFilter31 не выставлен,
+ * собираем ссылки без проверки категории.
+ *
  * @returns {Promise<{ added: number, skippedCategory: number }>}
  */
-async function _collectDecisionLinks(
-  items,
-  targetTypeIdsSet,
-  page,
-  kadCaseCategory31Cache = null,
-  kadCategorySkipLogged = null,
-  trustRasSupplyCategory31 = false,
-) {
+function _collectDecisionLinks(items, targetTypeIdsSet) {
   let added = 0;
-  let skippedCategory = 0;
   for (const item of items) {
     const documentTypeId = _extractDocumentTypeId(item);
     if (!documentTypeId || !targetTypeIdsSet.has(documentTypeId)) continue;
@@ -771,47 +677,10 @@ async function _collectDecisionLinks(
       [item?.CaseId ?? "", item?.FileName ?? "", item?.RegistrationDate ?? ""].join("|");
     if (!key || decisionLinks.has(key)) continue;
 
-    const cardUrl = _buildCaseCardUrl(item);
-    if (!cardUrl) continue;
-
-    const caseIdRaw = item?.CaseId;
-    const caseId =
-      caseIdRaw !== undefined && caseIdRaw !== null
-        ? String(caseIdRaw).trim()
-        : "";
-
-    let categoryOk;
-    if (trustRasSupplyCategory31) {
-      categoryOk = true;
-    } else if (caseId && kadCaseCategory31Cache && kadCaseCategory31Cache.has(caseId)) {
-      categoryOk = kadCaseCategory31Cache.get(caseId);
-    } else {
-      categoryOk = await _verifyKadCardShowsSupplyCategory31(page, cardUrl);
-      if (caseId && kadCaseCategory31Cache) {
-        kadCaseCategory31Cache.set(caseId, categoryOk);
-      }
-    }
-
-    if (!categoryOk) {
-      skippedCategory += 1;
-      const logKey = caseId || cardUrl;
-      const shouldLog =
-        !kadCategorySkipLogged || !kadCategorySkipLogged.has(logKey);
-      if (shouldLog) {
-        if (kadCategorySkipLogged) kadCategorySkipLogged.add(logKey);
-        log(
-          `[links-skip] дело ${caseId || "?"} — на карточке kad нет категории спора 3.1 (поставки)`,
-        );
-      }
-      await _stealth.smartWait("api_delay");
-      continue;
-    }
-
     decisionLinks.set(key, _buildDecisionRecord(item, documentTypeId, pdfUrl));
     added += 1;
-    await _stealth.smartWait("api_delay");
   }
-  return { added, skippedCategory };
+  return { added, skippedCategory: 0 };
 }
 
 function _rebuildIdToKeyIndex() {
@@ -1075,29 +944,8 @@ async function _awaitPostSearchJson(respPromise, dumpLabelPrefix, roundtripStart
   }
 }
 
-const ESC_KIND_BANNED = ESC_KINDS.BANNED;
-const ESC_KIND_NET_DOWN = ESC_KINDS.NET_DOWN;
 
-/**
- * «Прокси-туннель дрогнул»: HTTP-CONNECT к мобильному прокси не открылся
- * или закрылся в момент TLS-туннелирования. Это НЕ лечится ротацией IP —
- * виноват апстрим прокси-провайдера, новый IP не починит сломанный
- * туннелировщик. Лечится коротким backoff'ом и повторной попыткой
- * на том же IP (см. `'proxy_flap'`-бакет в `stealthManager.js`).
- *
- * Покрывает Chromium-коды, которые в наших измерениях соответствуют
- * `Proxy CONNECT aborted` / `connection to proxy closed`:
- *   - ERR_EMPTY_RESPONSE        — прокси принял CONNECT и оборвал;
- *   - ERR_TUNNEL_CONNECTION_FAILED;
- *   - ERR_PROXY_CONNECTION_FAILED;
- *   - ERR_SOCKS_CONNECTION_FAILED;
- *   - ERR_CONNECTION_CLOSED      — закрытие на полпути;
- *   - ERR_CONNECTION_ABORTED     — то же.
- *
- * `ERR_CONNECTION_RESET` сюда сознательно НЕ включён: сайт за прокси
- * тоже может прислать TCP RST (например, при бане), и для нас это
- * `_isRotatableNetworkError`, а не флап.
- */
+/** Прокси-туннель дрогнул: апстрим провайдера, не лечится ротацией IP — короткий backoff. */
 function _isProxyTunnelFlap(err) {
   if (!err) return false;
   const s = `${err && err.message ? err.message : err}`;
@@ -1106,13 +954,7 @@ function _isProxyTunnelFlap(err) {
   );
 }
 
-/**
- * `ERR_INVALID_AUTH_CREDENTIALS` (Chromium) и связанные коды —
- * провайдер отверг логин/пароль на CONNECT. Ротация IP, смена
- * оборудования и cooldown'ы тут БЕСПОЛЕЗНЫ: это конфиг, а не сеть.
- * Любой такой код = fail-fast, чтобы не сжигать 200 попыток впустую,
- * как было видно в логе при запуске без `--env-file=.env`.
- */
+/** Провайдер отверг логин/пароль прокси (конфиг, не сеть) — fail-fast, не крутим. */
 function _isProxyAuthError(err) {
   if (!err) return false;
   const s = `${err && err.message ? err.message : err}`;
@@ -1121,21 +963,7 @@ function _isProxyAuthError(err) {
   );
 }
 
-/**
- * «Настоящая сетевая ошибка/таймаут», для которой имеет смысл крутить
- * мобильный IP: либо сеть на нашей стороне сдохла, либо сайт нас
- * целенаправленно режет.
- *
- * Покрывает:
- *   - Chromium net::ERR_* — CONNECTION_RESET/REFUSED/TIMED_OUT,
- *     NAME_NOT_RESOLVED, NETWORK_CHANGED, INTERNET_DISCONNECTED и пр.;
- *   - Playwright-таймауты `page.goto`/`request.post`
- *     ("Timeout 60000ms exceeded");
- *   - Node-уровень: ECONNRESET, ECONNREFUSED, ETIMEDOUT, ENETUNREACH,
- *     EAI_AGAIN.
- *
- * Флапы прокси-туннеля (см. `_isProxyTunnelFlap`) сюда НЕ входят.
- */
+/** Реальный отвал сети/таймаут — нужно крутить IP. Флапы туннеля сюда не входят. */
 function _isRotatableNetworkError(err) {
   if (!err) return false;
   if (_isProxyTunnelFlap(err)) return false;
@@ -1149,33 +977,7 @@ function _isRotatableNetworkError(err) {
   );
 }
 
-/**
- * «Похоже на бан/throttle от целевого сайта» — HTTP-уровень.
- *
- * Принимает:
- *   - число (HTTP status, например 403);
- *   - строку с кодом внутри (например `"status=429"` от `_browseSearchPage`).
- *
- * Триггерим ротацию IP на:
- *   - 403 (Forbidden) — типичный «по IP отлуп»;
- *   - 429 (Too Many Requests) — rate limit;
- *   - 451 (Unavailable For Legal Reasons) — RAS использует именно этот
- *     код как «ваш IP в чёрном списке». Тело ответа — статическая HTML
- *     страница `<title>Доступ заблокирован</title>` + `/static/img/blocked.png`.
- *     Снимается ТОЛЬКО ротацией IP. См. инцидент 2026-05-04: 270 страниц
- *     подряд скипнулось без единой ротации, потому что 451 не был в
- *     списке (всё, кстати, было дополнительно прикрыто failsafe в
- *     `_walkPagesForBody` — тогда же).
- *   - 500..525 — серверная пятисотка / Cloudflare 520..525, которая в
- *     90% случаев у арбитров означает, что наш IP попал в throttle.
- * 401, 404 и прочие 4xx — нет смысла крутить IP, это «корректный отказ».
- *
- * ВНИМАНИЕ: если RAS однажды переедет на ещё один новый «бан-код»
- * (например, 418/498), парсер всё равно его поймает: при 8 неудачных
- * попытках подряд `_walkPagesForBody` сам форсит `_recoverFrom('banned')`
- * перед следующим раундом — то есть этот предикат — оптимизация
- * («крутить IP с 1-й попытки, а не с 9-й»), а не единственная защита.
- */
+/** «Бан/throttle сайтом» по HTTP-коду: 403/429/451/5xx. Принимает число или строку с `status=NNN`. */
 function _isLikelyBanned(errOrStatus) {
   if (errOrStatus === null || errOrStatus === undefined) return false;
   let code = null;
@@ -1195,156 +997,14 @@ function _isLikelyBanned(errOrStatus) {
   );
 }
 
-/**
- * Единый предикат «нужно крутить мобильный IP, прежде чем ретраить».
- * Флапы прокси-туннеля сюда НЕ попадают — они лечатся коротким
- * `proxy_flap`-backoff'ом, см. `_isProxyTunnelFlap`.
- */
 function _shouldRotateIp(err) {
   return _isRotatableNetworkError(err) || _isLikelyBanned(err);
 }
 
-/**
- * Сколько подряд `proxy_flap`-провалов мы готовы пережить через
- * короткий backoff на одном IP, прежде чем эскалируемся до
- * полноценной ротации мобильного IP. Идея: один флап — это шум
- * апстрима провайдера, 5 подряд — это уже что-то системное (порт
- * упал на нашем мобильном IP, апстрим деградирует), и тогда стоит
- * хотя бы попробовать переехать.
- */
+/** Сколько подряд `proxy_flap`-провалов терпим перед эскалацией ротации IP. */
 const PROXY_FLAP_ROTATE_AFTER = 5;
 
-/**
- * Кэш «диагноз ACL» по hostname:port. Раз в `ACL_DIAG_TTL_MS` пере-
- * проверяем, не пускает ли провайдер CONNECT (актуально только если
- * мы где-то поймали `proxy_flap`). На каждом флапе бьёмся не дольше
- * чем ACL_DIAG_TIMEOUT_MS.
- */
-const ACL_DIAG_TTL_MS = 30_000;
-const ACL_DIAG_TIMEOUT_MS = 6_000;
-const _aclDiagCache = new Map();
-
-/**
- * Парсит URL прокси из `MP_PROXY_SERVER` в `{ host, port, isHttps }`.
- * Возвращает null, если URL не распарсился.
- */
-function _parseProxyEndpoint(server) {
-  if (!server) return null;
-  try {
-    const u = new URL(server);
-    const isHttps = u.protocol === "https:";
-    const port = u.port ? Number(u.port) : isHttps ? 443 : 80;
-    return { host: u.hostname, port, isHttps };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Делает «голый» CONNECT-запрос на прокси и читает первую строку
- * ответа. Используем чтобы отличить ACL у провайдера (HTTP 403
- * на CONNECT с телом «Access control list denies you») от обычного
- * флапа апстрима. Chromium это всё показывает одинаково как
- * `ERR_TUNNEL_CONNECTION_FAILED`, без HTTP-кода.
- *
- * @returns {Promise<{kind:'acl'|'ok'|'auth'|'other'|'unreachable', code:number|null, line:string|null}>}
- */
-async function _diagnoseProxyAcl(targetHost, targetPort = 443) {
-  const ep = _parseProxyEndpoint(PROXY_SERVER);
-  if (!ep || ep.isHttps) {
-    return { kind: "unreachable", code: null, line: "no-http-proxy-endpoint" };
-  }
-  const cacheKey = `${ep.host}:${ep.port}|${targetHost}:${targetPort}`;
-  const cached = _aclDiagCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < ACL_DIAG_TTL_MS) return cached.value;
-
-  const auth =
-    PROXY_USER && PROXY_PASS
-      ? Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString("base64")
-      : null;
-  const req =
-    `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
-    `Host: ${targetHost}:${targetPort}\r\n` +
-    (auth ? `Proxy-Authorization: Basic ${auth}\r\n` : "") +
-    `Connection: close\r\n\r\n`;
-
-  const result = await new Promise((resolve) => {
-    let buf = "";
-    let resolved = false;
-    const finish = (value) => {
-      if (resolved) return;
-      resolved = true;
-      try {
-        socket.destroy();
-      } catch {}
-      resolve(value);
-    };
-    const socket = net.createConnection({ host: ep.host, port: ep.port });
-    socket.setTimeout(ACL_DIAG_TIMEOUT_MS);
-    socket.on("connect", () => socket.write(req));
-    socket.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      const eol = buf.indexOf("\r\n");
-      if (eol === -1 && buf.length < 8192) return;
-      const line = (eol === -1 ? buf : buf.slice(0, eol)).trim();
-      const m = line.match(/^HTTP\/\d\.\d\s+(\d{3})/);
-      const code = m ? Number(m[1]) : null;
-      let kind = "other";
-      if (code === 200) kind = "ok";
-      else if (code === 403) kind = "acl";
-      else if (code === 407) kind = "auth";
-      finish({ kind, code, line });
-    });
-    socket.on("timeout", () =>
-      finish({ kind: "unreachable", code: null, line: "timeout" }),
-    );
-    socket.on("error", (e) =>
-      finish({ kind: "unreachable", code: null, line: `${e}` }),
-    );
-    socket.on("close", () => {
-      if (!resolved) finish({ kind: "unreachable", code: null, line: "closed" });
-    });
-  });
-
-  _aclDiagCache.set(cacheKey, { at: Date.now(), value: result });
-  return result;
-}
-
-function _aclDiagDropCache() {
-  _aclDiagCache.clear();
-}
-
-/**
- * Открывает страницу, крутя мобильный IP при сетевых/прокси-ошибках
- * И при бан/throttle-сигналах от целевого сайта.
- *
- * Логика на каждую попытку:
- *   1) `_isProxyTunnelFlap`-исключение (CONNECT aborted / EMPTY_RESPONSE /
- *      TUNNEL_CONNECTION_FAILED) → НЕ эскалируем, делаем
- *      `smartWait('proxy_flap')` и retry. Это шум апстрима провайдера,
- *      новый IP не лечит. Считаем подряд-флапы в `flapStreak`; если их
- *      набралось `PROXY_FLAP_ROTATE_AFTER` — эскалируемся через
- *      `_recoverFrom(...)`, потому что апстрим прокси может зацепиться
- *      за другой IP/SIM, а на нашем IP «висит» (5+ подряд — уже не
- *      случайность).
- *   2) `_isRotatableNetworkError` (REFUSED/TIMED_OUT/RESET/таймаут goto
- *      и т.п.) → `_recoverFrom(...)`, retry. Эскалатор сам решит:
- *      changeIp, changeOperator или changeGeo. Если внутри упал —
- *      отдельный `smartWait('ip_cooldown')` и снова retry.
- *   3) HTTP-ответ с бан-кодом (403/429/5xx — см. `_isLikelyBanned`)
- *      → `_recoverFrom(...)` + retry.
- *   4) `sentinelSelector` задан, страница вернула 200, но селектора
- *      в DOM нет → считаем «капча/тех.работы», `_recoverFrom(...)` + retry.
- *   5) любое другое исключение (не сеть, не бан) → `smartWait('reading')`
- *      и retry без эскалации (трогать прокси бесполезно — это, например,
- *      парсерная ошибка селектора).
- *   * Эскалатор может бросить `EscalationExhausted` — мы НЕ ловим его
- *     здесь, оно прорастает до `main()` и завершает прогон. Это и
- *     гарантирует, что цикл смены IP/оборудования не уйдёт в вечность.
- *
- * `maxAttempts` — страховка, чтобы не висеть совсем вечно при
- * системной проблеме (нет конфига, выключен прокси-аккаунт и т.п.).
- */
+/** Открывает страницу с ретраями: flap → smartWait, net/ban → `_recoverFrom`. */
 async function _safeGoto(
   page,
   url,
@@ -1418,20 +1078,13 @@ async function _safeGoto(
 
     if (flapErr !== null) {
       flapStreak += 1;
-      // Диагностический CONNECT — только в лог, без авто-эскалации в changeGeo.
-      // Раньше тут был ACL fast-track сразу в L3, сейчас политика «менять
-      // регион — последнее средство». Если ACL реальный, лестница ниже
-      // (changeOperator → changeGeo) до него доедет сама.
-      await _logAclDiagnostic(url);
       if (flapStreak >= PROXY_FLAP_ROTATE_AFTER) {
         log(
-          `[goto] ${flapStreak} прокси-флапов подряд — kind=net_down, ` +
-            `эскалирую через _recoverFrom, апстрим провайдера может ` +
-            `зацепиться за другой IP/SIM`,
+          `[goto] ${flapStreak} прокси-флапов подряд — эскалирую через _recoverFrom, ` +
+            `апстрим провайдера может зацепиться за другой IP/SIM`,
         );
         const rotated = await _recoverFrom(
           `safeGoto flap-streak=${flapStreak}`,
-          { kind: ESC_KIND_NET_DOWN },
         );
         if (!rotated) {
           log(
@@ -1445,14 +1098,7 @@ async function _safeGoto(
       }
     } else if (banReason !== null) {
       flapStreak = 0;
-      // Различаем «сайт нас режет» (HTTP 403/429/5xx, sentinel-нет) и
-      // «реальный отвал сети» (Playwright-таймаут goto, ERR_CONNECTION_*,
-      // ECONNRESET и т.п.). Платный changeGeo (L3) разрешён эскалатору
-      // только при kind=net_down.
-      const isNetDown =
-        banReason.startsWith("net ") || /timeout|timed out/i.test(banReason);
-      const kind = isNetDown ? ESC_KIND_NET_DOWN : ESC_KIND_BANNED;
-      const rotated = await _recoverFrom(`safeGoto ${banReason}`, { kind });
+      const rotated = await _recoverFrom(`safeGoto ${banReason}`);
       if (!rotated) {
         log("[goto] _recoverFrom не сработал — отдельный ip_cooldown и пробую снова");
         await _stealth.smartWait("ip_cooldown");
@@ -1470,30 +1116,6 @@ async function _safeGoto(
   }
 }
 
-async function _dumpButtonHandlers(page) {
-  try {
-    const info = await page.evaluate(`(() => {
-      const el = document.getElementById('b-form-submit');
-      const inner = el && el.querySelector('button[type="submit"]');
-      const $ = window.jQuery;
-      const evOuter = ($ && $._data && el) ? $._data(el, 'events') : null;
-      const evInner = ($ && $._data && inner) ? $._data(inner, 'events') : null;
-      const evDoc = ($ && $._data) ? ($._data(document, 'events') || {}) : {};
-      return {
-        hasJQuery: !!$,
-        hasOuter: !!el,
-        hasInner: !!inner,
-        outerEvents: evOuter ? Object.keys(evOuter) : [],
-        innerEvents: evInner ? Object.keys(evInner) : [],
-        docClickHandlers: Array.isArray(evDoc.click) ? evDoc.click.length : 0,
-        docSubmitHandlers: Array.isArray(evDoc.submit) ? evDoc.submit.length : 0,
-      };
-    })()`);
-    log(`[click/probe] handlers: ${JSON.stringify(info)}`);
-  } catch (e) {
-    log(`[click/probe] page.evaluate упал: ${e}`);
-  }
-}
 
 function _searchCaptured() {
   return _captured.url !== null;
@@ -1579,14 +1201,6 @@ async function _ensureSupplyCategoryComboboxReady(page) {
       } catch {
         /* ignore */
       }
-      // #region agent log
-      _agentDebugLog(
-        "parser.js:_ensureSupplyCategoryComboboxReady",
-        "category combobox ready",
-        probe,
-        "H2",
-      );
-      // #endregion
       log(`[filter-debug] категория UI готово: ${JSON.stringify(probe)}`);
       return true;
     }
@@ -1611,28 +1225,12 @@ async function _ensureSupplyCategoryComboboxReady(page) {
       inputCount: await wrapEnd.locator("input.js-input").count(),
     };
   }
-  // #region agent log
-  _agentDebugLog(
-    "parser.js:_ensureSupplyCategoryComboboxReady",
-    "category combobox wait exhausted",
-    probeEnd,
-    "H3",
-  );
-  // #endregion
   log(`[filter-debug] категория UI не появилась за ожидание: ${JSON.stringify(probeEnd)}`);
   return false;
 }
 
 async function _categoryShowsSupply31(page) {
   if (await _categoryNativeSelectShowsSupply31(page)) {
-    // #region agent log
-    _agentDebugLog(
-      "parser.js:_categoryShowsSupply31",
-      "3.1 detected via native select",
-      {},
-      "H1",
-    );
-    // #endregion
     return true;
   }
   try {
@@ -1752,6 +1350,38 @@ async function _verifyListingFiltersOrRepair(page, uiFilters, supplyFilter31 = f
  *
  * @returns {Promise<boolean>}
  */
+/**
+ * Forсированный выбор 3.1 через нативный `<select>`. Используем когда UI-клик
+ * по выпадающему `<li>` не сработал (RAS-комбобокс закрылся «слишком быстро»,
+ * клик попал мимо и т.п.). jQuery-комбо подписан на `change` нативного select —
+ * `selectOption` + явный dispatch гарантирует синхронизацию обоих.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function _forceSupplyCategory31ViaNativeSelect(page) {
+  try {
+    const wrap = page.locator(RAS_CATEGORY_COMBO_ROOT_XPATH).first();
+    if ((await wrap.count()) === 0) return false;
+    const sel = wrap.locator("select.select").first();
+    if ((await sel.count()) === 0) return false;
+    await sel.selectOption({ value: "3.1" }, { timeout: 5_000 });
+    // Триггерим события — RAS-комбо реагирует и на change, и на input.
+    await sel.evaluate((el) => {
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      if (window.jQuery) {
+        try {
+          window.jQuery(el).trigger("change");
+        } catch {}
+      }
+    });
+    return true;
+  } catch (e) {
+    log(`[filter] forceSupply via select упал: ${e}`);
+    return false;
+  }
+}
+
 async function _applySupplyDisputeFilter31(page) {
   if (await _categoryShowsSupply31(page)) {
     log("[filter] категория 3.1 (поставки) уже выбрана — пропуск кликов");
@@ -1769,39 +1399,70 @@ async function _applySupplyDisputeFilter31(page) {
     RAS_CATEGORY_DOWN_BUTTON_FALLBACK_SEL,
     RAS_CATEGORY_INPUT_CLICK_SEL,
   ];
-  let opened = false;
-  for (let i = 0; i < categoryClickSelectors.length; i += 1) {
-    const sel = categoryClickSelectors[i];
-    log(
-      `[filter-debug] категория: открытие списка, способ ${i + 1}/${categoryClickSelectors.length}`,
-    );
-    opened = await _stealth.click(sel, { afterWait: "click" });
-    if (opened) break;
+
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    let opened = false;
+    for (let i = 0; i < categoryClickSelectors.length; i += 1) {
+      const sel = categoryClickSelectors[i];
+      log(
+        `[filter] категория: попытка ${attempt}/${MAX_ATTEMPTS}, ` +
+          `открытие списка способом ${i + 1}/${categoryClickSelectors.length}`,
+      );
+      opened = await _stealth.click(sel, { afterWait: "click" });
+      if (opened) break;
+      await _stealth.smartWait("micro");
+    }
+    if (!opened) {
+      log(`[filter] попытка ${attempt}/${MAX_ATTEMPTS}: список не открылся`);
+      continue;
+    }
+
+    const item = page.locator(RAS_SUPPLY_FILTER_31_LI_XPATH).first();
+    try {
+      await item.waitFor({ state: "visible", timeout: 8_000 });
+    } catch (e) {
+      log(
+        `[filter] попытка ${attempt}/${MAX_ATTEMPTS}: пункт 3.1 не появился: ${e}`,
+      );
+      continue;
+    }
+
     await _stealth.smartWait("micro");
-  }
-  if (!opened) {
-    log("[filter] не удалось кликнуть по кнопке раскрытия категории");
-    return false;
+    const picked = await _stealth.click(RAS_SUPPLY_FILTER_31_LI_XPATH, {
+      afterWait: "click",
+    });
+    if (!picked) {
+      log(`[filter] попытка ${attempt}/${MAX_ATTEMPTS}: клик по пункту 3.1 не удался`);
+      continue;
+    }
+
+    // КРИТИЧНО: проверяем что 3.1 реально выбралась. Без этой проверки парсер
+    // может молча идти дальше с пустым фильтром и собрать «грязные» данные
+    // по ВСЕМ категориям (см. инцидент с 6283 нерелевантными записями).
+    await _stealth.smartWait("click");
+    if (await _categoryShowsSupply31(page)) {
+      log(`[filter] выбран п. 3.1 (поставки) с попытки ${attempt}/${MAX_ATTEMPTS}`);
+      return true;
+    }
+    log(
+      `[filter] попытка ${attempt}/${MAX_ATTEMPTS}: после клика 3.1 не отобразилась — повторяю`,
+    );
   }
 
-  const item = page.locator(RAS_SUPPLY_FILTER_31_LI_XPATH).first();
-  try {
-    await item.waitFor({ state: "visible", timeout: 15_000 });
-  } catch (e) {
-    log(`[filter] пункт 3.1 не появился в DOM: ${e}`);
-    return false;
+  // Все UI-попытки промахнулись — fallback через selectOption на нативном <select>.
+  log("[filter] UI-кликом 3.1 не выбралась, fallback через нативный select…");
+  const forced = await _forceSupplyCategory31ViaNativeSelect(page);
+  if (forced) {
+    await _stealth.smartWait("click");
+    if (await _categoryShowsSupply31(page)) {
+      log("[filter] 3.1 выставлена через нативный select (fallback)");
+      return true;
+    }
+    log("[filter] fallback через select прошёл, но проверка _categoryShowsSupply31=false");
   }
-
-  await _stealth.smartWait("micro");
-  const picked = await _stealth.click(RAS_SUPPLY_FILTER_31_LI_XPATH, {
-    afterWait: "micro",
-  });
-  if (!picked) {
-    log("[filter] клик по пункту 3.1 не удался");
-    return false;
-  }
-  log("[filter] выбран п. 3.1 (поставки)");
-  return true;
+  log("[filter] не удалось выставить 3.1 ни UI-кликом, ни через нативный select");
+  return false;
 }
 
 /**
@@ -1818,7 +1479,6 @@ async function _clickFind(page, opts = {}) {
 
   if (RAS_TRACE_STEALTH) {
     log("[click] Ищу кнопку «Найти» и пытаюсь кликнуть...");
-    await _dumpButtonHandlers(page);
   }
 
   const sawFreshSearch = async () => {
@@ -1966,35 +1626,54 @@ async function _applyFinishedStatusFilterPick(page) {
 }
 
 /**
- * Полный UI выбора статуса (без сброса `_captured` и без heartbeat).
+ * UI выбора «Только завершённые» с verify+retry. После клика проверяем заголовок
+ * через `_statusFilterTitleShowsFinished`; если не сошёлся — повторяем (до 3 попыток).
  *
- * @returns {Promise<{ ok: boolean, changed: boolean, parsed: object|null }>}
+ * @returns {Promise<{ ok: boolean, changed: boolean, parsed: object|null, searchRoundtripMs?: number }>}
  */
 async function _applyFinishedStatusFilterUi(page) {
   if (await _statusFilterTitleShowsFinished(page)) {
     log('[filter] статус «Только завершенные» уже по заголовку — пропуск');
     return { ok: true, changed: false, parsed: null };
   }
-  if (!(await _applyFinishedStatusFilterUntilPick(page))) {
-    return { ok: false, changed: false, parsed: null };
+
+  const MAX_ATTEMPTS = 3;
+  let cumulativeChanged = false;
+  let lastParsed = null;
+  let lastRoundtripMs;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    log(`[filter] статус: попытка ${attempt}/${MAX_ATTEMPTS}`);
+    if (!(await _applyFinishedStatusFilterUntilPick(page))) {
+      log(`[filter] статус: не раскрыл фильтр (попытка ${attempt})`);
+      continue;
+    }
+    const pick = await _applyFinishedStatusFilterPick(page);
+    await _stealth.click(RAS_STATUS_FILTER_TOGGLE_XPATH, { afterWait: "click" });
+    if (!pick.ok) {
+      log(`[filter] статус: pick fail (попытка ${attempt})`);
+      continue;
+    }
+    if (pick.changed) {
+      cumulativeChanged = true;
+      lastParsed = pick.parsed;
+      lastRoundtripMs = pick.searchRoundtripMs;
+    }
+    await _stealth.smartWait("click");
+    if (await _statusFilterTitleShowsFinished(page)) {
+      log(`[filter] статус: применён успешно с попытки ${attempt}/${MAX_ATTEMPTS}`);
+      return {
+        ok: true,
+        changed: cumulativeChanged,
+        parsed: lastParsed,
+        searchRoundtripMs: cumulativeChanged ? lastRoundtripMs : undefined,
+      };
+    }
+    log(`[filter] статус: после попытки ${attempt} заголовок не подтверждает выбор — retry`);
   }
-  const pick = await _applyFinishedStatusFilterPick(page);
-  if (!pick.ok) return { ok: false, changed: false, parsed: null };
-  if (!pick.changed) {
-    await _stealth.click(RAS_STATUS_FILTER_TOGGLE_XPATH, {
-      afterWait: "click",
-    });
-    return { ok: true, changed: false, parsed: null };
-  }
-  await _stealth.click(RAS_STATUS_FILTER_TOGGLE_XPATH, {
-    afterWait: "click",
-  });
-  return {
-    ok: true,
-    changed: true,
-    parsed: pick.parsed,
-    searchRoundtripMs: pick.searchRoundtripMs,
-  };
+
+  log("[filter] статус: исчерпаны попытки — возвращаю ok=false");
+  return { ok: false, changed: cumulativeChanged, parsed: lastParsed };
 }
 
 /**
@@ -2029,130 +1708,112 @@ async function _applyFinishedStatusFilter(page) {
 }
 
 /**
- * РАК: выбрать три типа документа в UI (без сброса `_captured` и без heartbeat).
- * Уже отмеченные пункты не кликаем повторно (повторный клик снимает выбор).
+ * РАК: 3 типа документа в UI с verify+retry. После применения проверяем заголовок
+ * через `_rakDocFilterTitleLooksComplete`; если не сошёлся — повторяем (до 3 попыток).
  *
- * После каждого нового выбора пункта ждём свой POST `/Search` и только затем
- * идём дальше — иначе серия запросов даёт гонку и шаблон `_captured` остаётся
- * от первого ответа.
- *
- * @returns {Promise<{ ok: boolean, changed: boolean, parsed: object|null }>}
+ * @returns {Promise<{ ok: boolean, changed: boolean, parsed: object|null, searchRoundtripMs?: number }>}
  */
 async function _applyRakDocumentTypeFilterUi(page) {
   if (await _rakDocFilterTitleLooksComplete(page)) {
-    log('[filter] РАК: по заголовку «Тип документа» все три типа уже выбраны');
+    log('[filter] РАК: по заголовку все три типа уже выбраны — пропуск');
     return { ok: true, changed: false, parsed: null };
   }
-
-  log("[filter] РАК: раскрываю фильтр «Тип документа»…");
-  const toggle = page.locator(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH).first();
-  try {
-    await toggle.waitFor({ state: "visible", timeout: 20_000 });
-  } catch (e) {
-    log(`[filter] РАК: фильтр «Тип документа» не появился: ${e}`);
-    return { ok: false, changed: false, parsed: null };
-  }
-
-  const opened = await _stealth.click(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH, {
-    afterWait: "click",
-  });
-  if (!opened) {
-    log("[filter] РАК: не удалось раскрыть фильтр «Тип документа»");
-    return { ok: false, changed: false, parsed: null };
-  }
-
   const options = [
-    {
-      xpath: RAS_DOC_TYPE_DECISION_OPTION_XPATH,
-      label: "Решение",
-      dumpSlug: "rak-decision",
-    },
-    {
-      xpath: RAS_DOC_TYPE_APPEAL_OPTION_XPATH,
-      label: "Постановление апелляции",
-      dumpSlug: "rak-appeal",
-    },
-    {
-      xpath: RAS_DOC_TYPE_CASSATION_OPTION_XPATH,
-      label: "Постановление кассации",
-      dumpSlug: "rak-cassation",
-    },
+    { xpath: RAS_DOC_TYPE_DECISION_OPTION_XPATH, label: "Решение", dumpSlug: "rak-decision" },
+    { xpath: RAS_DOC_TYPE_APPEAL_OPTION_XPATH, label: "Постановление апелляции", dumpSlug: "rak-appeal" },
+    { xpath: RAS_DOC_TYPE_CASSATION_OPTION_XPATH, label: "Постановление кассации", dumpSlug: "rak-cassation" },
   ];
 
-  let changed = false;
-  /** @type {object|null} */
+  const MAX_ATTEMPTS = 3;
   let lastParsed = null;
-  /** @type {number|undefined} */
   let lastRakSearchMs;
-  for (const opt of options) {
-    const option = page.locator(opt.xpath).first();
+  let cumulativeChanged = false;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    log(`[filter] РАК: попытка ${attempt}/${MAX_ATTEMPTS}, раскрываю фильтр…`);
+    const toggle = page.locator(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH).first();
     try {
-      await option.waitFor({ state: "visible", timeout: 15_000 });
+      await toggle.waitFor({ state: "visible", timeout: 20_000 });
     } catch (e) {
-      log(`[filter] РАК: пункт «${opt.label}» не появился: ${e}`);
-      await _stealth.click(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH, {
-        afterWait: "click",
-      });
-      return { ok: false, changed, parsed: lastParsed };
+      log(`[filter] РАК: фильтр не появился (попытка ${attempt}): ${e}`);
+      continue;
     }
-    let already = false;
-    try {
-      already = await option.evaluate((el) => {
-        const li = el.closest("li");
-        if (!li) return false;
-        const inp = li.querySelector('input[type="checkbox"]');
-        if (inp) return inp.checked;
-        return li.classList.contains("ui-state-active");
-      });
-    } catch {
-      already = false;
-    }
-    if (already) {
-      log(`[filter] РАК: «${opt.label}» уже выбран — пропуск`);
+    if (!(await _stealth.click(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH, { afterWait: "click" }))) {
+      log(`[filter] РАК: не раскрылся (попытка ${attempt})`);
       continue;
     }
 
-    const searchT0 = performance.now();
-    const respPromise = page.waitForResponse(_searchPostResponsePredicate, {
-      timeout: 120_000,
-    });
-    const picked = await _stealth.click(opt.xpath, { afterWait: "micro" });
-    if (!picked) {
-      void respPromise.catch(() => {});
-      log(`[filter] РАК: не удалось выбрать «${opt.label}»`);
-      await _stealth.click(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH, {
-        afterWait: "click",
-      });
-      return { ok: false, changed, parsed: lastParsed };
+    let attemptOk = true;
+    let changed = false;
+    for (const opt of options) {
+      const option = page.locator(opt.xpath).first();
+      try {
+        await option.waitFor({ state: "visible", timeout: 15_000 });
+      } catch (e) {
+        log(`[filter] РАК: пункт «${opt.label}» не появился: ${e}`);
+        attemptOk = false;
+        break;
+      }
+      let already = false;
+      try {
+        already = await option.evaluate((el) => {
+          const li = el.closest("li");
+          if (!li) return false;
+          const inp = li.querySelector('input[type="checkbox"]');
+          if (inp) return inp.checked;
+          return li.classList.contains("ui-state-active");
+        });
+      } catch {
+        already = false;
+      }
+      if (already) {
+        log(`[filter] РАК: «${opt.label}» уже выбран — пропуск`);
+        continue;
+      }
+      const searchT0 = performance.now();
+      const respPromise = page.waitForResponse(_searchPostResponsePredicate, { timeout: 120_000 });
+      const picked = await _stealth.click(opt.xpath, { afterWait: "micro" });
+      if (!picked) {
+        void respPromise.catch(() => {});
+        log(`[filter] РАК: не удалось выбрать «${opt.label}» (попытка ${attempt})`);
+        attemptOk = false;
+        break;
+      }
+      changed = true;
+      log(`[filter] РАК: выбран «${opt.label}», жду /Search…`);
+      const ing = await _awaitPostSearchJson(respPromise, `filter-${opt.dumpSlug}`, searchT0);
+      if (!ing.ok) {
+        log(`[filter] РАК: после «${opt.label}» нет валидного /Search: ${ing.reason}`);
+        attemptOk = false;
+        break;
+      }
+      lastParsed = ing.parsed;
+      lastRakSearchMs = ing.roundtripMs;
+      await _stealth.smartWait("click");
     }
-    changed = true;
-    log(`[filter] РАК: выбран пункт «${opt.label}», жду соответствующий /Search…`);
-    const ing = await _awaitPostSearchJson(
-      respPromise,
-      `filter-${opt.dumpSlug}`,
-      searchT0,
-    );
-    if (!ing.ok) {
-      log(`[filter] РАК: после «${opt.label}» нет валидного /Search: ${ing.reason}`);
-      await _stealth.click(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH, {
-        afterWait: "click",
-      });
-      return { ok: false, changed, parsed: lastParsed };
+    if (changed) cumulativeChanged = true;
+    await _stealth.click(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH, { afterWait: "click" });
+
+    if (!attemptOk) {
+      log(`[filter] РАК: попытка ${attempt}/${MAX_ATTEMPTS} провалилась — retry`);
+      continue;
     }
-    lastParsed = ing.parsed;
-    lastRakSearchMs = ing.roundtripMs;
+
     await _stealth.smartWait("click");
+    if (await _rakDocFilterTitleLooksComplete(page)) {
+      log(`[filter] РАК: применён успешно с попытки ${attempt}/${MAX_ATTEMPTS}`);
+      return {
+        ok: true,
+        changed: cumulativeChanged,
+        parsed: lastParsed,
+        searchRoundtripMs: cumulativeChanged ? lastRakSearchMs : undefined,
+      };
+    }
+    log(`[filter] РАК: после попытки ${attempt} заголовок не подтверждает выбор — retry`);
   }
 
-  await _stealth.click(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH, {
-    afterWait: "click",
-  });
-  return {
-    ok: true,
-    changed,
-    parsed: lastParsed,
-    searchRoundtripMs: changed ? lastRakSearchMs : undefined,
-  };
+  log("[filter] РАК: исчерпаны попытки — возвращаю ok=false");
+  return { ok: false, changed: cumulativeChanged, parsed: lastParsed };
 }
 
 /**
@@ -2199,110 +1860,34 @@ async function _applyRakDocumentTypeFilter(page) {
   return true;
 }
 
-/**
- * Единая точка восстановления при «надо сделать что-то с прокси».
- *
- * Эскалатор сам решает, крутить IP / менять оператора / менять гео,
- * и сам делает settle через
- * `smartWait('ip_cooldown' | 'equipment_swap')`. Если эскалатор кидает
- * `EscalationExhausted` — пробрасываем НАВЕРХ, ловится в `main()`,
- * это сигнал «всё, дальше парсить бессмысленно». Это страховка от
- * бесконечного цикла ip↔eq↔ip↔eq.
- *
- * @param {string} reason
- * @param {object} [opts]
- * @param {'banned'|'net_down'} [opts.kind='banned']
- *        Природа сбоя — управляет, разрешена ли эскалатору ПЛАТНАЯ
- *        смена региона (L3 changeGeo). Подробности — JSDoc
- *        `ProxyEscalator.recoverFrom`.
- * @returns {Promise<boolean>} true если что-то получилось сделать (хоть
- * IP покрутили, хоть оборудование сменили), false — если SDK тоже сломался.
- * @throws {EscalationExhausted}
- */
-async function _recoverFrom(reason = "", opts = {}) {
-  const r = await _escalator.recoverFrom(reason, opts);
-  if (
-    r.level === ESC_LEVELS.IP &&
-    r.detail &&
-    r.detail.ok &&
-    r.detail.duplicateIp
-  ) {
-    log(
-      `[recover] changeIp вернул тот же new_ip — считаю ротацию фиктивной, ` +
-        "откат счётчиков эскалатора + recycle браузера",
-    );
+/** Единая точка recovery: эскалатор крутит IP/operator/geo. В цикле окон при changeIp/duplicate
+ *  пересоздаёт браузер и кидает RecycleWindowError, чтобы main подхватил новые куки.
+ *  В setup-фазе (вне цикла окон) recycle НЕ делаем — `page` живёт в локали main и
+ *  пересоздание ломает уже работающий вызов _safeGoto. */
+async function _recoverFrom(reason = "", _opts = {}) {
+  const r = await _escalator.recoverFrom(reason, _opts);
+  if (r.level === ESC_LEVELS.IP && r.detail?.ok && r.detail.duplicateIp) {
+    log(`[recover] changeIp вернул тот же new_ip`);
     _escalator.revertLastIpRotationForDuplicateEgress(reason);
-    if (_browserRecycleForDuplicateIp) await _browserRecycleForDuplicateIp();
-    throw new RecycleWindowError(
-      `duplicate new_ip после changeIp (${reason}) — браузер пересоздан, повтори окно`,
-    );
+    if (_inWindowLoop && _browserRecycleForDuplicateIp) {
+      await _browserRecycleForDuplicateIp();
+      throw new RecycleWindowError(`duplicate new_ip (${reason})`);
+    }
+    return true;
   }
   if (
+    _inWindowLoop &&
     RECYCLE_BROWSER_AFTER_BANNED_L1 &&
-    opts.kind === ESC_KIND_BANNED &&
     r.level === ESC_LEVELS.IP &&
     r.detail?.ok &&
-    !r.detail.duplicateIp &&
     _browserRecycleForDuplicateIp
   ) {
-    log(
-      "[recover] после changeIp по бану (новый new_ip) — пересоздаю браузер, " +
-        "заново «Найти» и перехват POST; main повторит то же календарное окно",
-    );
+    log(`[recover] после changeIp — recycle браузера`);
     await _browserRecycleForDuplicateIp();
-    throw new RecycleWindowError(
-      `banned L1 после changeIp (${reason}) — браузер пересоздан, повтори окно`,
-    );
+    throw new RecycleWindowError(`recycle after changeIp (${reason})`);
   }
-  log(
-    `[recover] level=${r.level} kind=${r.kind} OK; ` +
-      `summary=${JSON.stringify(_escalator.summary())}`,
-  );
+  log(`[recover] level=${r.level} OK; summary=${JSON.stringify(_escalator.summary())}`);
   return true;
-}
-
-/**
- * Диагностика «есть ли у провайдера ACL на наш hostname на текущей SIM»
- * (HTTP 403 на CONNECT к прокси). Раньше тут был fast-track сразу в L3
- * changeGeo. Сейчас политика пользователя: «менять регион — платно,
- * делать только при полном отвале сети, когда смена IP не помогла».
- * ACL под это формально не подходит (это не отвал сети, это блок
- * hostname), поэтому автоматический fast-track выключен и эта функция
- * работает чисто как информативный лог: при `proxy_flap` мы делаем
- * один CONNECT, пишем в лог что это ACL/обычный флап/таймаут — и
- * идём дальше в обычную лестницу через `_recoverFrom('net_down')`
- * после streak'а.
- *
- * Если ACL действительно есть, лестница доберётся до changeGeo сама,
- * но сначала отработают changeIp и changeOperator (в том же гео).
- * Это и хотел пользователь — менять регион в самую последнюю очередь.
- */
-async function _logAclDiagnostic(url) {
-  let host = "ras.arbitr.ru";
-  let port = 443;
-  try {
-    const u = new URL(url);
-    host = u.hostname || host;
-    port = u.port ? Number(u.port) : u.protocol === "http:" ? 80 : 443;
-  } catch {}
-
-  const diag = await _diagnoseProxyAcl(host, port);
-  if (diag.kind === "acl") {
-    log(
-      `[acl] CONNECT ${host}:${port} → ${diag.code} '${diag.line ?? ""}' — ` +
-        `провайдер блокирует hostname на текущей SIM. ACL fast-track ВЫКЛЮЧЕН ` +
-        `(политика: смена региона — последнее средство). Идём по лестнице ` +
-        `changeIp → changeOperator (в том же гео) → changeGeo.`,
-    );
-  } else if (diag.kind === "ok") {
-    log(`[acl] CONNECT ${host}:${port} → 200 (туннель ОК) — это шум апстрима, не ACL`);
-  } else {
-    log(
-      `[acl] CONNECT ${host}:${port} диагностика: ${diag.kind} ` +
-        `${diag.code ?? ""} ${diag.line ?? ""}`,
-    );
-  }
-  _aclDiagDropCache();
 }
 
 /** ISO `2025-05-01T00:00:00` → `01.05.2025` для полей периода. */
@@ -2368,7 +1953,6 @@ function _searchPostResponsePredicate(r) {
  * @param {boolean} [uiFilters.rakDocumentTypeFilter=false]
  * @param {boolean} [uiFilters.statusFinishedOnly=false]
  * @param {boolean} [supplyFilter31=false] перед «Найти» выставить п. 3.1 (поставки), если ещё нет.
- * @param {boolean} [_forceSupplyFilter31=false] зарезервировано (категория выставляется перед каждым «Найти»).
  * @returns {Promise<[number|null, object|null, string, number]>}
  */
 async function _uiRunSearchFromForm(
@@ -2377,7 +1961,6 @@ async function _uiRunSearchFromForm(
   label,
   uiFilters = {},
   supplyFilter31 = false,
-  _forceSupplyFilter31 = false,
 ) {
   const {
     rakDocumentTypeFilter = false,
@@ -2390,7 +1973,12 @@ async function _uiRunSearchFromForm(
   if (supplyFilter31) {
     const ok31 = await _applySupplyDisputeFilter31(page);
     if (!ok31) {
-      log("[filter] перед «Найти»: категория 3.1 не выставлена — продолжаю");
+      log(
+        "[filter] перед «Найти»: 3.1 не выставлена — НЕ кликаю «Найти», " +
+          "иначе соберём ВСЕ категории. Возвращаю ошибку, _walkPagesForBody " +
+          "поднимет recovery (reload + _applySupplyDisputeFilter31 заново).",
+      );
+      return [null, null, "supply-filter-31-not-applied", performance.now() - t0];
     }
   }
 
@@ -2560,125 +2148,49 @@ async function _pagerNextIsVisible(page) {
  *
  * @returns {Promise<[number|null, object|null, string, number]>}
  */
-async function _uiClickPagerNext(page, label) {
+/**
+ * Страницы 2..N: прямой POST `/Search` через `page.request.post` вместо клика
+ * по пейджеру. Имя функции оставлено как было (вызывается из `_browseSearchPage`
+ * и `_recoverListingUiAfterFailedRound`); реальной работы с UI больше нет.
+ *
+ * Куки/прокси берутся из browser context'а (page.request шарит контекст с page).
+ * URL/headers — из `_captured`, обновлённых после первого «Найти» в окне.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} label
+ * @param {object} bodyObj — будет мутирован: bodyObj.Page = pageNum
+ * @param {number} pageNum
+ * @returns {Promise<[number|null, object|null, string, number]>}
+ */
+async function _uiClickPagerNext(page, label, bodyObj, pageNum) {
   const t0 = performance.now();
-  const nextLoc = page.locator(RAS_PAGER_NEXT_XPATH).first();
-  try {
-    if (!(await nextLoc.isVisible())) {
-      return [null, null, "pager-next-hidden", performance.now() - t0];
-    }
-  } catch (e) {
-    return [null, null, `pager-check: ${e}`, performance.now() - t0];
-  }
-
-  /**
-   * Раньше ждали «любой» POST /Search через waitForResponse — при сбое клика
-   * (пейджер вне видимой зоны hit-test, перекрытие списком дел) POST не уходил,
-   * а таймаут 120с ошибочно выглядел как «сеть». Цепляемся к конкретному Request.
-   */
-  const reqPromise = page.waitForRequest(
-    (req) => req.method() === "POST" && _isSearchUrl(req.url()),
-    { timeout: 120_000 },
-  );
-
-  const tBeforeClick = performance.now();
-  // scrollIntoView по умолчанию true у _stealth.click — иначе после длинной
-  // выдачи «Ctrl→» часто не получает mousedown и POST не уходит.
-  const clicked = await _stealth.click(RAS_PAGER_NEXT_XPATH, {
-    afterWait: "none",
-  });
-  const tAfterClick = performance.now();
-  if (!clicked) {
-    void reqPromise.catch(() => {});
-    return [null, null, "pager-click-failed", performance.now() - t0];
-  }
-
-  let searchRequest;
-  try {
-    searchRequest = await reqPromise;
-  } catch (e) {
-    return [null, null, `wait-response: ${e}`, performance.now() - t0];
-  }
+  const url = _captured.url ? String(_captured.url) : "";
+  if (!url) return [null, null, "no-captured-url", performance.now() - t0];
+  const headers = _sanitizeReplayHeaders(_captured.headers);
+  bodyObj.Page = pageNum;
 
   let response;
   try {
-    response = await searchRequest.response();
-    if (response === null) {
-      return [null, null, "pager-no-response", performance.now() - t0];
-    }
+    response = await page.request.post(url, {
+      headers,
+      data: JSON.stringify(bodyObj),
+      timeout: 60_000,
+    });
   } catch (e) {
-    return [null, null, `wait-response: ${e}`, performance.now() - t0];
+    return [null, null, `request: ${e}`, performance.now() - t0];
   }
 
-  const tAfterResp = performance.now();
-  /** POST /Search: время после завершения клика до ответа (без паузы «чтения»). */
-  const elapsedMs = tAfterResp - tAfterClick;
-
-  /** Сразу читаем тело до пауз/логов: иначе CDP может вытеснить ресурс ответа. */
-  let raw = null;
-  try {
-    raw = await response.body();
-  } catch (e) {
-    log(`[ui-pager] resp.body() упал: ${e}`);
-  }
-
-  const agentPayload = {
-    sessionId: "7805f8",
-    runId: "post-fix",
-    hypothesisId: "H1-verify",
-    location: "parser.js:_uiClickPagerNext",
-    message: "pager phase timings",
-    data: {
-      label,
-      prepMs: tBeforeClick - t0,
-      clickNoAfterWaitMs: tAfterClick - tBeforeClick,
-      awaitRespAfterClickMs: tAfterResp - tAfterClick,
-      elapsedMsReported: elapsedMs,
-      respUrlSuffix: (() => {
-        try {
-          return response.url().slice(-48);
-        } catch {
-          return "";
-        }
-      })(),
-    },
-    timestamp: Date.now(),
-  };
-  // #region agent log
-  fetch("http://localhost:7437/ingest/92c381b7-7965-4e93-9977-dd75f5f783f1", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "7805f8",
-    },
-    body: JSON.stringify(agentPayload),
-  }).catch(() => {});
-  try {
-    fs.appendFileSync(
-      path.join(path.dirname(fileURLToPath(import.meta.url)), ".cursor", "debug-7805f8.log"),
-      `${JSON.stringify(agentPayload)}\n`,
-    );
-  } catch {
-    /* ignore */
-  }
-  // #endregion agent log
-
-  await _stealth.smartWait("micro");
-
-  if (raw !== null && raw !== undefined) {
-    _dumpSearchResponse(`${label}-status${response.status()}`, raw, "bin");
-  }
-
-  if (response.status() !== 200) {
-    return [response.status(), null, `status=${response.status()}`, elapsedMs];
+  const elapsed = performance.now() - t0;
+  const status = response.status();
+  if (status !== 200) {
+    return [status, null, `status=${status}`, elapsed];
   }
 
   try {
-    const text = raw !== null && raw !== undefined ? raw.toString("utf8") : await response.text();
-    const parsed = JSON.parse(text);
-    return [200, parsed, "", elapsedMs];
+    const parsed = await response.json();
+    return [200, parsed, "", elapsed];
   } catch (e) {
-    return [response.status(), null, `json-decode: ${e}`, elapsedMs];
+    return [status, null, `json-decode: ${e}`, elapsed];
   }
 }
 
@@ -2703,14 +2215,7 @@ function _guardSearchResponsePage(out, pageNum, label) {
   return out;
 }
 
-/**
- * Страница 1 — даты + «Найти»; при необходимости РАК/статус (см. `_uiRunSearchFromForm`);
- * дальше — клик по пейджеру.
- *
- * @param {object} [uiFilters] передаётся только для `pageNum === 1` (и для редкого контроля на пейджере).
- * @param {boolean} [supplyFilter31=false] только для `pageNum === 1`.
- * @returns {Promise<[number|null, object|null, string, number]>}
- */
+/** Страница 1 — UI «Найти», 2..N — direct POST через `_uiClickPagerNext`. */
 async function _browseSearchPage(
   page,
   pageNum,
@@ -2718,23 +2223,15 @@ async function _browseSearchPage(
   label,
   uiFilters = {},
   supplyFilter31 = false,
-  _forceSupplyFilter31 = false,
 ) {
   if (pageNum === 1) {
     return _guardSearchResponsePage(
-      await _uiRunSearchFromForm(
-        page,
-        bodyObj,
-        label,
-        uiFilters,
-        supplyFilter31,
-        _forceSupplyFilter31,
-      ),
+      await _uiRunSearchFromForm(page, bodyObj, label, uiFilters, supplyFilter31),
       pageNum,
       label,
     );
   }
-  const out = await _uiClickPagerNext(page, label);
+  const out = await _uiClickPagerNext(page, label, bodyObj, pageNum);
   const [st] = out;
   if (
     FILTER_PAGER_TITLE_RECHECK_EVERY > 0 &&
@@ -2809,25 +2306,8 @@ async function _recoverListingUiAfterFailedRound(
   );
   if (parsed !== null && parsed !== undefined) {
     log(
-      `[${labelPrefix}] UI-recovery: после «Найти» открыта страница 1 выдачи, ` +
-        `промотка к ${pageNum}…`,
-    );
-    for (let p = 2; p < pageNum; p += 1) {
-      const [, parsedNav, errNav] = await _uiClickPagerNext(
-        page,
-        `${labelPrefix}-recover-advance-${p}`,
-      );
-      if (parsedNav === null || parsedNav === undefined) {
-        log(
-          `[${labelPrefix}] UI-recovery: промотка к странице ${pageNum} ` +
-            `остановилась на шаге ${p}: ${errNav}`,
-        );
-        return false;
-      }
-      await _stealth.smartWait("api_delay");
-    }
-    log(
-      `[${labelPrefix}] UI-recovery: промотка готова, следующий запрос — страница ${pageNum}`,
+      `[${labelPrefix}] UI-recovery: после «Найти» страница 1 восстановлена, ` +
+        `следующий direct POST — страница ${pageNum}`,
     );
     return true;
   }
@@ -2837,34 +2317,10 @@ async function _recoverListingUiAfterFailedRound(
 }
 
 /**
- * Проходит все страницы окна, инкрементально дописывая `documentTypes`.
+ * Обходит все страницы окна. Страница 1 — UI-«Найти», 2..N — direct POST.
+ * Контракт: данные не теряются — на неудаче крутим раунды до успеха или
+ * пока эскалатор сам не кинет EscalationExhausted.
  *
- * КОНТРАКТ: данные на странице НЕ ТЕРЯЮТСЯ. Если страницу не удалось
- * достать с первой пачки попыток — функция продолжает крутить раунды
- * (8 быстрых попыток + один `_recoverFrom('banned')` если эскалатор за
- * раунд так и не вызвался; затем reload главной и повтор параметров поиска,
- * для страницы > 1 — промотка пейджера) на той же странице выдачи, пока:
- *
- *   • либо страница придёт успешно → идём дальше;
- *   • либо эскалатор сам кинет `EscalationExhausted` (выгребен бюджет
- *     или лимит totalFailures) — функция НЕ ловит это исключение,
- *     оно всплывает в `main()` (см. `parser.js:` обработчик возле конца),
- *     где штатно выводится саммари и закрывается браузер. Уже
- *     записанные в `document_types.json` данные не теряются — он
- *     дописывается инкрементально через `_save()` после каждой
- *     успешной страницы.
- *
- * Никаких `пропуск страницы` / `continue` — это было причиной потери
- * 1+ страниц подряд в инциденте 2026-05-04 (270 страниц подряд
- * проскипалось со status=451 без единой ротации IP).
- */
-/**
- * @param {object} [subWindow] — `{ endDay: Date, daysSpan: number }`
- *        текущего под-окна. Используется для триггера
- *        `WindowDowngradeError`: если latency ответа `/Search` превысила
- *        порог И `daysSpan > WINDOW_MIN_DAYS`, бросаем сигнал в
- *        `main()`, который дробит окно. Если не передан — фича
- *        выключена в этом вызове.
  * @param {object} [uiFilters] — флаги `rakDocumentTypeFilter` / `statusFinishedOnly`
  *        для страницы 1: после смены дат всегда «Найти»; РАК/статус — только если
  *        выдача по периоду не пустая (иначе их нет в DOM).
@@ -2873,21 +2329,13 @@ async function _recoverListingUiAfterFailedRound(
  */
 async function _walkPagesForBody(
   page,
-  _url,
-  _headers,
   bodyObj,
   labelPrefix,
   mode,
   targetTypeIdsSet,
-  subWindow = null,
   uiFilters = {},
   supplyFilter31 = false,
 ) {
-  const kadCaseCategory31Cache =
-    mode === MODE_DECISION_LINKS && !supplyFilter31 ? new Map() : null;
-  const kadCategorySkipLogged =
-    mode === MODE_DECISION_LINKS && !supplyFilter31 ? new Set() : null;
-
   const stats = {
     total: null,
     return_count: null,
@@ -2963,15 +2411,13 @@ async function _walkPagesForBody(
 
         if (isFlap) {
           flapStreak += 1;
-          await _logAclDiagnostic(_url);
           if (flapStreak >= PROXY_FLAP_ROTATE_AFTER) {
             log(
               `[${labelPrefix} p${pageNum} r${pageRound}] ` +
-                `${flapStreak} прокси-флапов подряд — kind=net_down, эскалирую через _recoverFrom`,
+                `${flapStreak} прокси-флапов подряд — эскалирую через _recoverFrom`,
             );
             const rotated = await _recoverFrom(
               `${labelPrefix} p${pageNum} r${pageRound} flap-streak=${flapStreak}`,
-              { kind: ESC_KIND_NET_DOWN },
             );
             escalatedThisRound = true;
             if (!rotated) {
@@ -3003,14 +2449,8 @@ async function _walkPagesForBody(
           }
         } else if (rotate) {
           flapStreak = 0;
-          // _isRotatableNetworkError → реальный отвал сети (timeout, ECONNRESET и т.п.),
-          // L3 changeGeo для эскалатора разрешён.
-          // _isLikelyBanned → HTTP 403/429/451/5xx, ban сайтом — менять регион запрещено.
-          const isNetDown = _isRotatableNetworkError(err);
-          const kind = isNetDown ? ESC_KIND_NET_DOWN : ESC_KIND_BANNED;
           const rotated = await _recoverFrom(
             `${labelPrefix} p${pageNum} r${pageRound} ${err}`,
-            { kind },
           );
           escalatedThisRound = true;
           if (!rotated) {
@@ -3080,12 +2520,10 @@ async function _walkPagesForBody(
             : "no-rotation-trigger";
         log(
           `[${labelPrefix} p${pageNum} r${pageRound}] failsafe: раунд провалился ` +
-            `(${reason}), эскалатор не вызывался — форс _recoverFrom(banned). ` +
+            `(${reason}), эскалатор не вызывался — форс _recoverFrom. ` +
             `Если повторяется на новом HTTP-коде — занеси его в _isLikelyBanned.`,
         );
-        await _recoverFrom(`${labelPrefix} p${pageNum} r${pageRound} ${reason}`, {
-          kind: ESC_KIND_BANNED,
-        });
+        await _recoverFrom(`${labelPrefix} p${pageNum} r${pageRound} ${reason}`);
       }
 
       await _recoverListingUiAfterFailedRound(
@@ -3155,14 +2593,7 @@ async function _walkPagesForBody(
       relabeled = typeStats.relabeled;
       _save();
     } else {
-      const linkOut = await _collectDecisionLinks(
-        items,
-        targetTypeIdsSet,
-        page,
-        kadCaseCategory31Cache,
-        kadCategorySkipLogged,
-        supplyFilter31,
-      );
+      const linkOut = _collectDecisionLinks(items, targetTypeIdsSet);
       linksAdded = linkOut.added;
       linksSkippedCategoryPage = linkOut.skippedCategory;
       stats.links_skipped_category += linkOut.skippedCategory;
@@ -3187,37 +2618,6 @@ async function _walkPagesForBody(
           `всего пропусков за окно=${stats.links_skipped_category}, ` +
           `всего ссылок=${decisionLinks.size}, ` +
           `latency=${lastSuccessElapsedMs.toFixed(0)}мс`,
-      );
-    }
-
-    // Query Downgrade + Circuit Breaker: latency ответа `/Search` превысила
-    // порог → пул прокси разогрет, RAS уже начал нас троттлить. Прерываем
-    // оставшуюся пагинацию, наверх в main() уйдёт сигнал «дроби окно».
-    // Items уже сохранены через `_save()` выше, так что данные не теряются.
-    if (
-      SLOW_RESPONSE_THRESHOLD_MS > 0 &&
-      lastSuccessElapsedMs > SLOW_RESPONSE_THRESHOLD_MS &&
-      subWindow !== null
-    ) {
-      if (subWindow.daysSpan > WINDOW_MIN_DAYS) {
-        const msg =
-          `[${labelPrefix} p${pageNum}] latency=${lastSuccessElapsedMs.toFixed(0)}мс > ` +
-          `порог ${SLOW_RESPONSE_THRESHOLD_MS}мс — окно ` +
-          `daysSpan=${subWindow.daysSpan} слишком тяжёлое, прерываю пагинацию ` +
-          `(items уже сохранены), иду в Query Downgrade`;
-        log(msg);
-        throw new WindowDowngradeError(msg, {
-          endDay: subWindow.endDay,
-          daysSpan: subWindow.daysSpan,
-          latencyMs: lastSuccessElapsedMs,
-          pageNum,
-        });
-      }
-      log(
-        `[${labelPrefix} p${pageNum}] latency=${lastSuccessElapsedMs.toFixed(0)}мс > ` +
-          `порог ${SLOW_RESPONSE_THRESHOLD_MS}мс, но daysSpan=${subWindow.daysSpan} ` +
-          `уже на минимуме (WINDOW_MIN_DAYS=${WINDOW_MIN_DAYS}) — дальше не дроблю, ` +
-          `продолжаю текущее окно`,
       );
     }
 
@@ -3491,8 +2891,8 @@ async function _promptSetup(headless) {
     log("[setup] фильтр РАК (Тип документа)=выкл (RAS_DOC_FILTER_RAK)");
   }
   if (rakDocumentTypeFilter === null) {
-    rakDocumentTypeFilter = await _askYesNoDefaultNo(
-      "Тип документа РАК? да/нет [Enter = нет]: ",
+    rakDocumentTypeFilter = await _askYesNoDefaultYes(
+      "Тип документа РАК (Решение/Апелляция/Кассация)? да/нет [Enter = да]: ",
     );
   }
 
@@ -3513,8 +2913,8 @@ async function _promptSetup(headless) {
     log("[setup] статус «только завершенные»=выкл (RAS_STATUS_FINISHED_ONLY)");
   }
   if (statusFinishedOnly === null) {
-    statusFinishedOnly = await _askYesNoDefaultNo(
-      "Статус только завершённые? да/нет [Enter = нет]: ",
+    statusFinishedOnly = await _askYesNoDefaultYes(
+      "Статус только завершённые? да/нет [Enter = да]: ",
     );
   }
 
@@ -3772,34 +3172,7 @@ async function _waitForSearchWithHeartbeat(timeoutMs) {
   return false;
 }
 
-/**
- * Поднять «боевую сессию» поиска: открыть главную, прогреть страницу,
- * нажать «Найти», поймать первый POST `/Search`.
- *
- * Лечит «тихий бан» арбитра: страница грузится, кнопка кликается, но
- * клик «холостой» — JS не отправляет POST на `/Search`. В этом случае:
- *   1) ротируем IP (с hard-cooldown ≥ `CHANGE_IP_COOLDOWN_SEC`),
- *   2) переоткрываем главную через `_safeGoto`,
- *   3) повторяем клик и ожидание.
- *
- * Если по периоду дел нет, RAS не показывает верхние фильтры «Тип документа»
- * / «Статус». После первого `/Search` это видно из JSON (`_rasListingEmptyBeforeTopFilters`);
- * тогда РАК/статус не трогаем и не считаем ситуацию баном (не крутим IP).
- *
- * Не «жжёт» ротации без надобности: ротация триггерится только если
- * `/Search` так и не был пойман за `WAIT_FOR_SEARCH_MS` (живая сессия
- * сюда не доходит — она вернётся после первого же успешного клика).
- *
- * @param {object} [opts]
- * @param {boolean} [opts.supplyFilter31=false] перед «Найти» выбрать п. 3.1 (поставки).
- * @param {boolean} [opts.statusFinishedOnly=false] после первого поиска выбрать верхний фильтр
- *        «Статус -> Только завершенные» и перехватить обновлённый `/Search`.
- * @param {boolean} [opts.rakDocumentTypeFilter=false] после первого поиска выбрать
- *        «Тип документа -> Решение + Постановление апелляции + Постановление кассации».
- * @param {object|null} [opts.periodBody=null] ISO `{ DateFrom, DateTo }` для полей периода:
- *        после п. 3.1 и до первого «Найти» (как ручной порядок на сайте).
- * @returns {Promise<boolean>} true — сессия поднята (`_captured.url` не null).
- */
+/** Поднимает сессию поиска: goto → форма (3.1/период) → «Найти» → ловит первый POST /Search. */
 async function _setupSearchSession(
   page,
   {
@@ -3818,12 +3191,10 @@ async function _setupSearchSession(
 
       log(
         `[setup] попытка ${attempt}/${maxAttempts}: «тихий бан» — ` +
-          `kind=banned (страница загрузилась, JS не отработал — это бан сайтом, ` +
-          `не отвал сети), эскалирую через _recoverFrom и переоткрываю главную`,
+          `страница загрузилась, JS не отработал, эскалирую через _recoverFrom ` +
+          `и переоткрываю главную`,
       );
-      const rotated = await _recoverFrom(`silent-ban setup#${attempt}`, {
-        kind: ESC_KIND_BANNED,
-      });
+      const rotated = await _recoverFrom(`silent-ban setup#${attempt}`);
       if (!rotated) {
         log("[setup] _recoverFrom не сработал — отдельный ip_cooldown");
         await _stealth.smartWait("ip_cooldown");
@@ -3850,8 +3221,11 @@ async function _setupSearchSession(
       const applied = await _applySupplyDisputeFilter31(page);
       if (!applied) {
         log(
-          "[filter] не удалось применить фильтр 3.1 — продолжаю поиск без него",
+          `[setup] попытка ${attempt}/${maxAttempts}: фильтр 3.1 не применился. ` +
+            `БЕЗ ФИЛЬТРА «Найти» собирает дела ВСЕХ категорий — это мусор. ` +
+            `Перезапускаю сессию через _recoverFrom + reload вместо тихого продолжения.`,
         );
+        continue;
       }
     }
 
@@ -4039,9 +3413,11 @@ async function main() {
   if (mode === MODE_TYPES) {
     _loadExisting();
   } else {
-    decisionLinks.clear();
-    _saveDecisionLinks();
-    log(`[setup] сбор только PDF-ссылок по TypeId (${targetTypeIds.length} шт.) -> ${LINKS_OUT_PATH}`);
+    _loadExistingDecisionLinks();
+    log(
+      `[setup] сбор только PDF-ссылок по TypeId (${targetTypeIds.length} шт.) -> ` +
+        `${LINKS_FILE_BASENAME}_NNNN.json (по ${LINKS_CHUNK_SIZE} записей)`,
+    );
   }
 
   try {
@@ -4109,20 +3485,12 @@ async function main() {
       stealth: _stealth,
       logger: log,
       maxIpRotationsBeforeEquipment: ESC_MAX_IP_BEFORE_EQUIPMENT,
-      preEquipmentIpRotations: ESC_PRE_EQUIPMENT_IP_ROTATIONS,
       maxOperatorSwapsBeforeGeo: ESC_MAX_OPERATOR_BEFORE_GEO,
-      maxGeoSwaps: ESC_MAX_GEO_SWAPS,
-      maxTotalFailures: ESC_MAX_TOTAL_FAILURES,
-      maxBudgetSec: ESC_MAX_BUDGET_SEC,
       geoFilters: GEO_FILTERS,
     });
     log(
       `[escalator] включён: maxIp=${ESC_MAX_IP_BEFORE_EQUIPMENT}, ` +
-        `preEqIp=${ESC_PRE_EQUIPMENT_IP_ROTATIONS}, ` +
         `maxOp=${ESC_MAX_OPERATOR_BEFORE_GEO}, ` +
-        `maxGeo=${ESC_MAX_GEO_SWAPS <= 0 ? "off" : ESC_MAX_GEO_SWAPS}, ` +
-        `maxFails=${ESC_MAX_TOTAL_FAILURES <= 0 ? "off" : ESC_MAX_TOTAL_FAILURES}, ` +
-        `budget=${ESC_MAX_BUDGET_SEC <= 0 ? "off" : `${ESC_MAX_BUDGET_SEC}с`}, ` +
         `maxSearchPages=${MAX_PAGES}, ` +
         `emptyStreakStop=${RAS_EMPTY_WINDOW_STREAK_LIMIT <= 0 ? "off" : RAS_EMPTY_WINDOW_STREAK_LIMIT}, ` +
         `waitSearchMs=${WAIT_FOR_SEARCH_MS}`,
@@ -4229,9 +3597,6 @@ async function main() {
     if (!sessionUp) {
       log("[result] Запрос /Search не пойман. Смотри ./debug/ артефакты.");
     } else {
-      let url = String(_captured.url);
-      let headers = _sanitizeReplayHeaders(_captured.headers);
-
       let bodyTemplate = null;
       const maxBodyParseAttempts = 5;
       for (let bpa = 1; bpa <= maxBodyParseAttempts; bpa += 1) {
@@ -4256,8 +3621,6 @@ async function main() {
             bodyTemplate = null;
             break;
           }
-          url = String(_captured.url);
-          headers = _sanitizeReplayHeaders(_captured.headers);
         }
       }
 
@@ -4266,11 +3629,6 @@ async function main() {
         let cycle = 0;
         let emptyStreak = 0;
 
-        // Стек под-окон текущего outer-цикла. Изначально содержит ровно
-        // одно полное окно `windowDays`. При срабатывании Query Downgrade
-        // (latency `/Search` > SLOW_RESPONSE_THRESHOLD_MS) текущее под-окно
-        // дробится на WINDOW_SPLIT_FACTOR кусков и кладётся обратно — LIFO,
-        // чтобы первой обрабатывалась самая «свежая» половина.
         let pendingSubs = [{ endDay: outerEnd, daysSpan: windowDays }];
         let outerHadItems = false;
         let outerStats = {
@@ -4279,10 +3637,10 @@ async function main() {
           relabeledTypes: 0,
           pagesSeen: 0,
           subsDone: 0,
-          downgrades: 0,
           linksSkippedCategory: 0,
         };
 
+        _inWindowLoop = true;
         while (cycle < cycles) {
           if (pendingSubs.length === 0) {
             if (outerHadItems) {
@@ -4292,7 +3650,6 @@ async function main() {
                 `=== цикл ${cycle}/${_cyclesLabel(cycles)} готов ` +
                   `(${_formatDdMmYyyy(outerEnd)}, ${windowDays}д): ` +
                   `sub-окон=${outerStats.subsDone}, ` +
-                  `downgrades=${outerStats.downgrades}, ` +
                   `страниц=${outerStats.pagesSeen}, ` +
                   `items=${outerStats.totalItems}, ` +
                   (mode === MODE_TYPES
@@ -4349,7 +3706,6 @@ async function main() {
               relabeledTypes: 0,
               pagesSeen: 0,
               subsDone: 0,
-              downgrades: 0,
               linksSkippedCategory: 0,
             };
             continue;
@@ -4374,68 +3730,19 @@ async function main() {
 
           let stats = null;
           let dupRecycleAttempts = 0;
-          let downgradeRetry = false;
           while (true) {
             try {
               stats = await _walkPagesForBody(
                 page,
-                url,
-                headers,
                 bodyTemplate,
                 label,
                 mode,
                 targetTypeIdsSet,
-                sub,
-                {
-                  rakDocumentTypeFilter,
-                  statusFinishedOnly,
-                },
+                { rakDocumentTypeFilter, statusFinishedOnly },
                 supplyFilter31,
               );
               break;
             } catch (err) {
-              if (err instanceof WindowDowngradeError) {
-                outerStats.downgrades += 1;
-                const halves = splitWindow(sub, WINDOW_SPLIT_FACTOR);
-                log(
-                  `[downgrade] ${_formatDdMmYyyy(sub.endDay)}/${sub.daysSpan}д ` +
-                    `→ дроблю на ${halves.length}: ` +
-                    halves
-                      .map(
-                        (h) =>
-                          `${_formatDdMmYyyy(h.endDay)}/${h.daysSpan}д`,
-                      )
-                      .join(", "),
-                );
-                for (const h of [...halves].reverse()) pendingSubs.push(h);
-                try {
-                  await _recoverFrom(
-                    `window downgrade ${err.info.latencyMs.toFixed(0)}мс ` +
-                      `на ${_formatDdMmYyyy(sub.endDay)}/${sub.daysSpan}д p${err.info.pageNum}`,
-                    { kind: ESC_KIND_BANNED },
-                  );
-                } catch (recErr) {
-                  if (recErr instanceof RecycleWindowError) {
-                    log(
-                      `[downgrade] _recoverFrom вызвал recycle браузера — ` +
-                        `это ОК, под-окно уже в стеке, продолжаю`,
-                    );
-                  } else {
-                    throw recErr;
-                  }
-                }
-                url = String(_captured.url);
-                headers = _sanitizeReplayHeaders(_captured.headers);
-                try {
-                  bodyTemplate = JSON.parse(_captured.body);
-                } catch (pe) {
-                  throw new Error(
-                    `[main] downgrade: шаблон запроса битый: ${pe}`,
-                  );
-                }
-                downgradeRetry = true;
-                break;
-              }
               if (!(err instanceof RecycleWindowError)) throw err;
               dupRecycleAttempts += 1;
               if (dupRecycleAttempts > MAX_WINDOW_RECYCLES_AFTER_DUP_IP) {
@@ -4449,23 +3756,17 @@ async function main() {
                   `${_formatDdMmYyyy(sub.endDay)}/${sub.daysSpan}д ` +
                   `(recycle ${dupRecycleAttempts}/${MAX_WINDOW_RECYCLES_AFTER_DUP_IP})`,
               );
-              url = String(_captured.url);
-              headers = _sanitizeReplayHeaders(_captured.headers);
-              let freshTmpl = null;
               try {
-                freshTmpl = JSON.parse(_captured.body);
+                bodyTemplate = JSON.parse(_captured.body);
               } catch (pe) {
                 throw new Error(`[main] recycle: шаблон запроса битый: ${pe}`);
               }
-              bodyTemplate = freshTmpl;
               bodyTemplate.DateFrom = df;
               bodyTemplate.DateTo = dt;
               setupPeriodRef.DateFrom = df;
               setupPeriodRef.DateTo = dt;
             }
           }
-
-          if (downgradeRetry) continue;
 
           outerStats.subsDone += 1;
           outerStats.totalItems += stats.items;
@@ -4503,40 +3804,27 @@ async function main() {
       );
     } else {
       _saveDecisionLinks();
-      log(`=== готово. PDF-ссылки собраны: ${decisionLinks.size} -> ${LINKS_OUT_PATH} ===`);
+      log(
+        `=== готово. PDF-ссылки собраны: ${decisionLinks.size} -> ` +
+          `${LINKS_FILE_BASENAME}_NNNN.json (по ${LINKS_CHUNK_SIZE} записей) ===`,
+      );
     }
   } catch (e) {
     if (e instanceof EscalationExhausted) {
-      log(`[escalator] исчерпан: ${e.message}`);
+      // В штатном флоу эскалатор больше это не кидает; ловим как страховку
+      // на случай ручного `throw EscalationExhausted` где-то в коде или
+      // несовместимого старого кода в catch-цепочке.
+      log(`[escalator] неожиданный EscalationExhausted: ${e.message}`);
       log(`[escalator] summary=${JSON.stringify(e.summary)}`);
-      if (/исчерпан общий бюджет/i.test(e.message)) {
-        log(
-          "[escalator] сработал ESC_MAX_BUDGET_SEC (тайм-лимит эскалатора). " +
-            "Для длительных прогонов поставь в .env ESC_MAX_BUDGET_SEC=0 (без лимита) " +
-            "или увеличь значение, затем перезапусти.",
-        );
-      } else if (/исчерпан лимит totalFailures/i.test(e.message)) {
-        log(
-          "[escalator] сработал ESC_MAX_TOTAL_FAILURES. " +
-            "Для длительных прогонов поставь ESC_MAX_TOTAL_FAILURES=0 (без лимита) " +
-            "или увеличь значение. Защита от зацикливания на одном IP — лестница L1/L2.",
-        );
-      } else {
-        log(
-          "[escalator] больше менять прокси нечем (лестница L1/L2/L3), прекращаю прогон. " +
-            "Проверь баланс/доступность гео и перезапусти.",
-        );
-      }
     } else if (e instanceof RecycleWindowError) {
       log(`[main] RecycleWindowError вне цикла окон: ${e.message}`);
-    } else if (e instanceof WindowDowngradeError) {
-      log(`[main] WindowDowngradeError вне цикла окон: ${e.message}`);
     } else {
       log(`Error: ${e}`);
       if (e && e.stack) process.stderr.write(`${e.stack}\n`);
     }
   } finally {
     _browserRecycleForDuplicateIp = null;
+    _inWindowLoop = false;
     log("[shutdown] закрываю браузер");
     if (context !== null) {
       try {

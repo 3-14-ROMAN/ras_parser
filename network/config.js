@@ -17,42 +17,26 @@ export const MP_PROXY_ID = process.env.MP_PROXY_ID
   ? Number(process.env.MP_PROXY_ID)
   : null;
 
+// Cooldowns — единственное реальное ограничение провайдера MobileProxy.Space.
+// Сами действия (changeIp/changeEquipment/changeGeo) бесплатные.
 export const CHANGE_IP_COOLDOWN_SEC = Number(
-  process.env.MP_CHANGE_IP_COOLDOWN_SEC ?? 300,
+  process.env.MP_CHANGE_IP_COOLDOWN_SEC ?? 120,
 );
-/** Минимум секунд между двумя вызовами changeGeo (не суммируется сугубо с L2 — берётся max с общим cooldown оборудования). */
 export const CHANGE_GEO_COOLDOWN_SEC = Number(
   process.env.MP_CHANGE_GEO_COOLDOWN_SEC ?? 180,
 );
 export const ESC_EQUIPMENT_COOLDOWN_SEC = Number(
-  process.env.ESC_EQUIPMENT_COOLDOWN_SEC ?? 600,
-);
-export const ESC_PRE_EQUIPMENT_IP_ROTATIONS = Math.max(
-  0,
-  Number(process.env.ESC_PRE_EQUIPMENT_IP_ROTATIONS ?? 3),
+  process.env.ESC_EQUIPMENT_COOLDOWN_SEC ?? 180,
 );
 
-// changeIp подряд до changeOperator. Дефолт 5 — сначала автоматически
-// выгребаем дешёвую ротацию IP с паузами (`MP_CHANGE_IP_COOLDOWN_SEC` +
-// smartWait ip_cooldown), затем L2/L3.
+// changeIp подряд до перехода на L2 (changeOperator).
 export const ESC_MAX_IP_BEFORE_EQUIPMENT = Number(
-  process.env.ESC_MAX_IP_BEFORE_EQUIPMENT ?? 5,
+  process.env.ESC_MAX_IP_BEFORE_EQUIPMENT ?? 3,
 );
-// changeOperator (строго в текущем geoid) подряд до changeGeo.
+// changeOperator подряд до перехода на L3 (changeGeo).
 export const ESC_MAX_OPERATOR_BEFORE_GEO = Number(
   process.env.ESC_MAX_OPERATOR_BEFORE_GEO ?? 2,
 );
-// Потолок changeGeo на весь прогон. **≤0 — без лимита** (частота всё равно
-// ограничена `MP_CHANGE_GEO_COOLDOWN_SEC` в RasProxyClient). ВНИМАНИЕ: смена
-// региона у провайдера платная; штатно L3 только при kind='net_down'.
-export const ESC_MAX_GEO_SWAPS = Number(process.env.ESC_MAX_GEO_SWAPS ?? 0);
-// 0 = без лимита. От бесконечного «recover без прогресса» защищает лестница
-// L1/L2/L3 в escalator.js, а не эти счётчики.
-export const ESC_MAX_TOTAL_FAILURES = Number(
-  process.env.ESC_MAX_TOTAL_FAILURES ?? 0,
-);
-// 0 = без лимита по времени жизни эскалатора (недельные фоновые прогоны).
-export const ESC_MAX_BUDGET_SEC = Number(process.env.ESC_MAX_BUDGET_SEC ?? 0);
 
 /**
  * Адаптивное дробление окна по latency (Query Downgrade + Circuit Breaker).
