@@ -40,6 +40,7 @@
 
 import fs from "node:fs";
 
+import { PDF_GEO_FILTERS } from "../network/config.js";
 import {
   markExtractFailed,
   markPdfDownloaded,
@@ -70,6 +71,37 @@ const KEEP_PDF_ON_DISK = (process.env.RAS_PDF_KEEP_FILE ?? "1") === "1";
 const PDF_TIMING = (process.env.RAS_PDF_TIMING ?? "0") === "1";
 
 /**
+ * No-progress watchdog. Если ни один PDF не сохранён за STUCK_TIMEOUT_MS —
+ * логируем warning. Если за STUCK_FATAL_MS — кидаем ошибку, и supervisor в
+ * scripts/download-acts.js перезапустит весь пайплайн (закроет Chromium-ы,
+ * пересоздаст пул, освободит lease — чистый рестарт). Это страховка от ситуации,
+ * когда все воркеры залипли в карантине / прокси-сервер тихо умер / PG ушла
+ * в read-only.
+ *
+ * 0 в любой переменной = соответствующая ступень отключена.
+ */
+const STUCK_TIMEOUT_MS = Math.max(0, Number(process.env.RAS_PDF_STUCK_TIMEOUT_MS ?? 1_800_000));
+const STUCK_FATAL_MS = Math.max(
+  STUCK_TIMEOUT_MS,
+  Number(process.env.RAS_PDF_STUCK_FATAL_MS ?? 5_400_000),
+);
+/** Сколько раз ретраить PG-запрос selectPendingPdf при транзиентных ошибках. */
+const FETCH_BATCH_MAX_RETRIES = Math.max(
+  1,
+  Number(process.env.RAS_PDF_FETCH_BATCH_MAX_RETRIES ?? 6),
+);
+/** Начальный backoff между ретраями (мс), удваивается до 60с. */
+const FETCH_BATCH_BACKOFF_MS = Math.max(
+  100,
+  Number(process.env.RAS_PDF_FETCH_BATCH_BACKOFF_MS ?? 2_000),
+);
+/** Пауза воркера после неожиданного исключения внутри основного цикла. */
+const WORKER_UNEXPECTED_PAUSE_MS = Math.max(
+  1_000,
+  Number(process.env.RAS_PDF_WORKER_UNEXPECTED_PAUSE_MS ?? 30_000),
+);
+
+/**
  * Backoff после одиночной infra-ошибки (warmup/proxy tunnel) на этом воркере.
  * Минимум 10с — иначе один битый прокси прогоняет всю очередь за секунды.
  */
@@ -90,6 +122,9 @@ const INFRA_PAUSE_MAX_MS = Math.max(
   Number(process.env.RAS_PDF_INFRA_PAUSE_MAX_MS ?? 120_000),
 );
 
+/** Интервал heartbeat-метрик пайплайна (мс). 0 = выключить лог. */
+const HEARTBEAT_MS = Math.max(0, Number(process.env.RAS_PDF_HEARTBEAT_MS ?? 60_000));
+
 /**
  * RAS_PDF_PARALLEL_DOWNLOADERS:
  *   - "auto" / пусто / 0 → использовать ВСЕ найденные через getMyProxy прокси
@@ -103,10 +138,104 @@ const PARALLEL_MAX =
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Ответ changeEquipment/changeGeo: `checked[proxy_id] === false` — смена не подтверждена провайдером.
+ * @param {{ raw?: any, task?: any }} r
+ * @param {number} proxyId
+ */
+function _equipmentCheckedFalseForProxy(r, proxyId) {
+  const idNum = Number(proxyId);
+  if (!Number.isFinite(idNum)) return false;
+  const keys = [String(idNum), idNum];
+  for (const src of [r?.raw, r?.task]) {
+    if (!src || typeof src !== "object") continue;
+    const c = src.checked;
+    if (!c || typeof c !== "object" || Array.isArray(c)) continue;
+    for (const k of keys) {
+      if (Object.prototype.hasOwnProperty.call(c, k) && c[k] === false) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Извлекает из ответа changeIp/changeEquipment поле `ipguardian.net.<proxy_id>`
+ * и возвращает короткое описание, если IP найден в abuse-списках. Pravocaptcha
+ * на kad.arbitr.ru почти наверняка 451'нит такие IP — пользователю важно это
+ * видеть в логе, чтобы понимать: проблема не в коде, а в качестве прокси.
+ *
+ * @param {{ raw?: any, task?: any }} r
+ * @param {number|string|null} proxyId
+ * @returns {{ ip: string, found: boolean, sources: string[] } | null}
+ */
+function _extractIpGuardianAbuse(r, proxyId) {
+  if (proxyId == null) return null;
+  const keys = [String(proxyId), Number(proxyId)];
+  for (const src of [r?.raw, r?.task]) {
+    if (!src || typeof src !== "object") continue;
+    const ipg = src["ipguardian.net"];
+    if (!ipg || typeof ipg !== "object") continue;
+    for (const k of keys) {
+      const entry = ipg[k];
+      if (!entry || typeof entry !== "object") continue;
+      const found = entry.found === true;
+      const ip = String(entry.ip ?? "").trim();
+      const sources = Array.isArray(entry.sources)
+        ? entry.sources
+            .map((s) => s?.maintainer ?? s?.filename ?? s?.category ?? null)
+            .filter(Boolean)
+            .map(String)
+        : [];
+      if (!ip && !found && !sources.length) continue;
+      return { ip, found, sources };
+    }
+  }
+  return null;
+}
+
 function _randIntInclusive(lo, hi) {
   const a = Math.max(0, Math.floor(lo));
   const b = Math.max(a, Math.floor(hi));
   return a + Math.floor(Math.random() * (b - a + 1));
+}
+
+/**
+ * Ретрай PG-запроса при транзиентных ошибках (потеря соединения, рестарт сервера,
+ * read-only, рестарт docker-compose и т.п.). Экспоненциальный backoff,
+ * максимум FETCH_BATCH_MAX_RETRIES попыток, прерывается shouldStop().
+ *
+ * Используется для `selectPendingPdf` / `selectByIds` — это бьющие в БД запросы,
+ * без них пайплайн не может ехать. UPDATE'ы внутри worker'а (markPdf*) уже
+ * обёрнуты try/catch на месте — там фейл одного UPDATE не блокирует пайплайн.
+ *
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @param {string} label
+ * @param {(m: string) => void} log
+ * @param {(() => boolean) | undefined} shouldStop
+ * @returns {Promise<T>}
+ */
+async function _retryPgCall(fn, label, log, shouldStop) {
+  let lastErr;
+  let backoffMs = FETCH_BATCH_BACKOFF_MS;
+  for (let i = 1; i <= FETCH_BATCH_MAX_RETRIES; i += 1) {
+    if (typeof shouldStop === "function" && shouldStop()) {
+      throw lastErr ?? new Error(`${label}: stopped before retry`);
+    }
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      log(
+        `[pipe/pg-retry] ${label} attempt ${i}/${FETCH_BATCH_MAX_RETRIES} упал: ` +
+          `${e && (e.message ?? e)} — backoff ${backoffMs}ms`,
+      );
+      if (i >= FETCH_BATCH_MAX_RETRIES) break;
+      await _interruptibleSleep(backoffMs, shouldStop);
+      backoffMs = Math.min(60_000, backoffMs * 2);
+    }
+  }
+  throw lastErr ?? new Error(`${label}: max retries reached`);
 }
 
 /**
@@ -158,6 +287,361 @@ async function _attemptWorkerRecovery({ label, downloader, log }) {
   // что мы можем; считаем за успех.
   if (!ipRotateAttempted) return true;
   return ipRotated;
+}
+
+/**
+ * Last-ditch попытка вернуть прокси к жизни ПЕРЕД уходом в quarantine-sleep.
+ * Вызывается ровно в момент превышения порога карантина — даём один шанс
+ * сменой IP/гео без жжения PDF_MAX_ATTEMPTS на уровне акта.
+ *
+ *   reason="infra" → changeGeo (туннель/warmup гнилые — меняем gateway/регион).
+ *   451 → см. `_attempt451ProxyRecoverBeforeQuarantine` (чередование IP/гео на воркере).
+ *
+ * Возвращает true, если recover успел сменить IP/гео И surface перезапустился.
+ * `ok=false` от прокси-API чаще всего значит hard-cooldown (например, 24ч
+ * между changeGeo) — тогда падаем в обычный quarantine sleep.
+ *
+ * @param {{ label: string, downloader: any, log: (m: string) => void, reason: "infra" }} opts
+ * @returns {Promise<boolean>}
+ */
+async function _attemptProxyRecoverBeforeQuarantine({ label, downloader, log, reason }) {
+  const client = downloader.proxyClient;
+  if (!client) return false;
+  const action = "changeGeo";
+  const apiName = "changeGeo";
+  if (typeof client[apiName] !== "function") return false;
+  let ok = false;
+  let detail = "";
+  let r = null;
+  try {
+    const recoverReason = `pdf-quarantine recover ${reason}`;
+    const geoFilters = downloader.geoFilters ?? PDF_GEO_FILTERS;
+    r = await client.changeGeo(recoverReason, { filters: geoFilters });
+    ok = r?.ok === true;
+    if (!ok && r?.reason) detail = ` reason=${String(r.reason).slice(0, 80)}`;
+  } catch (e) {
+    detail = ` threw=${e && e.message}`;
+  }
+  if (ok && r) {
+    try {
+      const pid = await client.getResolvedProxyId();
+      if (_equipmentCheckedFalseForProxy(r, pid)) {
+        ok = false;
+        detail = " checked=false";
+      }
+    } catch {
+      // без proxy_id не сопоставляем checked — оставляем ok как вернул клиент
+    }
+  }
+  log(`[pdf/proxy-recover] action=${action} reason=${reason} ok=${ok}${detail}`);
+  if (!ok) return false;
+  try {
+    await downloader._restartPdfSurface(`proxy-recover ${reason} before quarantine`);
+  } catch (e) {
+    log(`[${label}] proxy-recover _restartPdfSurface failed: ${e && e.message}`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Last-ditch 451 recover: чередование rotateIp / changeGeo на этом воркере
+ * (next451RecoverAction снаружи). Тот же recoverReason, что и раньше для 451.
+ *
+ * @param {{ label: string, downloader: any, log: (m: string) => void, action: "ip"|"geo" }} opts
+ * @returns {Promise<boolean>}
+ */
+async function _attempt451ProxyRecoverBeforeQuarantine({ label, downloader, log, action }) {
+  const client = downloader.proxyClient;
+  if (!client) return false;
+  const recoverReason = "pdf-quarantine recover 451";
+  let ok = false;
+  let detail = "";
+  let r = null;
+  const apiLabel = action === "ip" ? "rotateIp" : "changeGeo";
+  try {
+    if (action === "ip") {
+      if (typeof client.rotateIp !== "function") return false;
+      r = await client.rotateIp(recoverReason);
+    } else {
+      if (typeof client.changeGeo !== "function") return false;
+      const geoFilters = downloader.geoFilters ?? PDF_GEO_FILTERS;
+      r = await client.changeGeo(recoverReason, { filters: geoFilters });
+    }
+    ok = r?.ok === true;
+    if (!ok && r?.reason) detail = ` reason=${String(r.reason).slice(0, 80)}`;
+  } catch (e) {
+    detail = ` threw=${e && e.message}`;
+  }
+  if (action === "geo" && ok && r) {
+    try {
+      const pid = await client.getResolvedProxyId();
+      if (_equipmentCheckedFalseForProxy(r, pid)) {
+        ok = false;
+        detail = " checked=false";
+      }
+    } catch {
+      // без proxy_id не сопоставляем checked — оставляем ok как вернул клиент
+    }
+  }
+  log(`[pdf/proxy-recover] action=${apiLabel} reason=451 ok=${ok}${detail}`);
+  if (!ok) return false;
+  try {
+    await downloader._restartPdfSurface("proxy-recover 451 before quarantine");
+  } catch (e) {
+    log(`[${label}] proxy-recover _restartPdfSurface failed: ${e && e.message}`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Достать текущий id_country у воркера. Первый источник — поле `countryId`
+ * на самом worker'е (createPdfPool пробрасывает его из getMyProxy). Фоллбек
+ * через `proxyClient._getMyInfo()` — на случай, если discoverProxies не
+ * заполнил countryId (single-proxy fallback из MP_PROXY_* env).
+ *
+ * @param {{ proxyClient?: any, countryId?: number | null }} worker
+ * @returns {Promise<number | null>}
+ */
+async function _resolveWorkerCountryId(worker) {
+  if (Number.isFinite(worker?.countryId) && worker.countryId > 0) {
+    return Number(worker.countryId);
+  }
+  const c = worker?.proxyClient;
+  if (!c || typeof c._getMyInfo !== "function") return null;
+  try {
+    const info = await c._getMyInfo();
+    const raw = info?.id_country ?? info?.country_id ?? null;
+    const n = raw != null ? Number(raw) : null;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Preflight: для каждого воркера, у которого стартовый прокси в РФ
+ * (id_country=1), один раз сделать changeGeo в не-РФ (фильтр PDF_GEO_FILTERS
+ * + safety-net excludeCountryIds=[1] из network/config.js). После успешного
+ * changeGeo перезапускаем surface, чтобы Chromium перепогрел сессию с новым IP.
+ *
+ * Не критично: changeGeo может упасть на cooldown / no-allowed-geo — просто
+ * логируем и продолжаем. Воркер тогда поймает первый 451 и сработает обычный
+ * L3 force-geo recovery.
+ *
+ * @param {{ workers: any[], log: (m: string) => void }} opts
+ */
+async function _preflightLeaveRussiaIfNeeded({ workers, log }) {
+  for (const w of workers) {
+    const countryId = await _resolveWorkerCountryId(w);
+    if (countryId !== 1) {
+      log(`[pipe/preflight] ${w.label} country_id=${countryId ?? "?"} — пропускаю (не РФ)`);
+      continue;
+    }
+    if (!w.proxyClient || typeof w.proxyClient.changeGeo !== "function") {
+      log(`[pipe/preflight] ${w.label} country_id=1 (РФ), но proxyClient/changeGeo нет — пропускаю`);
+      continue;
+    }
+    log(`[pipe/preflight] ${w.label} стартовый прокси в РФ — делаю changeGeo на не-РФ`);
+    let r;
+    try {
+      r = await w.proxyClient.changeGeo("pdf-preflight leave RU", {
+        filters: PDF_GEO_FILTERS,
+      });
+    } catch (e) {
+      log(`[pipe/preflight] ${w.label} changeGeo threw: ${e && e.message} — продолжаю как есть`);
+      continue;
+    }
+    if (!r?.ok) {
+      log(
+        `[pipe/preflight] ${w.label} changeGeo не сработал (reason=${r?.reason ?? "?"}) — ` +
+          `продолжаю как есть, дальше сработает обычный force-geo recovery`,
+      );
+      continue;
+    }
+    log(
+      `[pipe/preflight] ${w.label} changeGeo OK geo='${r.caption ?? "?"}' ` +
+        `country=${r.detail?.countryId ?? "?"} — рестарт Chromium surface`,
+    );
+    try {
+      const proxyId =
+        (typeof w.proxyClient.getResolvedProxyId === "function"
+          ? await w.proxyClient.getResolvedProxyId()
+          : null) ?? null;
+      const abuse = _extractIpGuardianAbuse(r, proxyId);
+      if (abuse?.found) {
+        log(
+          `[pipe/preflight] ${w.label} ВНИМАНИЕ: новый IP ${abuse.ip} в abuse-списках ` +
+            `(${abuse.sources.join(", ") || "?"}) — pravocaptcha kad.arbitr.ru скорее всего ` +
+            `отдаст 451. Если 451 продолжится — нужны другие/качественные прокси.`,
+        );
+      }
+    } catch {}
+    try {
+      await w.downloader._restartPdfSurface("preflight leave RU");
+    } catch (e) {
+      log(`[pipe/preflight] ${w.label} _restartPdfSurface failed: ${e && e.message}`);
+    }
+  }
+}
+
+/**
+ * Heartbeat-метрики пайплайна. Чистая observability — не влияет на путь
+ * скачивания/extract'а, только периодически логирует сводку.
+ *
+ *   [pipe/metrics] pdf/min 1m=N 5m=N.N 15m=N.N | since_last: ok=N deferred=N
+ *     dl_failed=N ex_failed=N | avg_ms: download=N extract=N mark_pg=N
+ *     queue_wait=N pace=N | queue=N/CAP session_saved=N
+ *
+ *   pdf/min     — sliding rate за 1 / 5 / 15 минут (по timestamp'ам успехов)
+ *   since_last  — счётчики событий между двумя report'ами
+ *   avg_ms      — средние длительности этапов между двумя report'ами
+ *   queue       — глубина download→extract буфера на момент report'а
+ *
+ * Все timestamp'ы через Date.now(), длительности через performance.now() —
+ * замеры локальные в _downloadWorker / _processOne, передаются сюда noteXxx().
+ *
+ * Включается RAS_PDF_HEARTBEAT_MS (default 60_000). 0 = выключено.
+ */
+class MetricsReporter {
+  constructor() {
+    /** @type {number[]} timestamps (Date.now()) успешных PDF, ring до 15 мин. */
+    this._okTs = [];
+    this._sumDownloadMs = 0;
+    this._countDownload = 0;
+    this._sumExtractMs = 0;
+    this._countExtract = 0;
+    this._sumMarkPgMs = 0;
+    this._countMarkPg = 0;
+    this._sumQueueWaitMs = 0;
+    this._countQueueWait = 0;
+    this._sumPaceMs = 0;
+    this._countPace = 0;
+    this._intervalOk = 0;
+    this._intervalDeferred = 0;
+    this._intervalDlFailed = 0;
+    this._intervalExFailed = 0;
+  }
+
+  /**
+   * @param {{ downloadMs: number, markMs: number, queueWaitMs: number, paceMs?: number }} t
+   */
+  noteDownloadOk(t) {
+    this._okTs.push(Date.now());
+    if (Number.isFinite(t.downloadMs)) {
+      this._sumDownloadMs += t.downloadMs;
+      this._countDownload += 1;
+    }
+    if (Number.isFinite(t.markMs)) {
+      this._sumMarkPgMs += t.markMs;
+      this._countMarkPg += 1;
+    }
+    if (Number.isFinite(t.queueWaitMs)) {
+      this._sumQueueWaitMs += t.queueWaitMs;
+      this._countQueueWait += 1;
+    }
+    if (Number.isFinite(t.paceMs)) {
+      this._sumPaceMs += t.paceMs;
+      this._countPace += 1;
+    }
+    this._intervalOk += 1;
+    this._trimOldTimestamps();
+  }
+
+  noteDeferred() {
+    this._intervalDeferred += 1;
+  }
+
+  noteDlFailed() {
+    this._intervalDlFailed += 1;
+  }
+
+  /**
+   * @param {{ extractMs: number, markMs: number }} t
+   */
+  noteExtractOk(t) {
+    if (Number.isFinite(t.extractMs)) {
+      this._sumExtractMs += t.extractMs;
+      this._countExtract += 1;
+    }
+    if (Number.isFinite(t.markMs)) {
+      this._sumMarkPgMs += t.markMs;
+      this._countMarkPg += 1;
+    }
+  }
+
+  noteExFailed() {
+    this._intervalExFailed += 1;
+  }
+
+  _trimOldTimestamps() {
+    const cutoff = Date.now() - 15 * 60 * 1000;
+    let i = 0;
+    while (i < this._okTs.length && this._okTs[i] < cutoff) i += 1;
+    if (i > 0) this._okTs.splice(0, i);
+  }
+
+  /**
+   * Сколько PDF успешных за последние `minutes` минут (sliding).
+   * @param {number} minutes
+   */
+  _countSince(minutes) {
+    const cutoff = Date.now() - minutes * 60 * 1000;
+    let i = 0;
+    while (i < this._okTs.length && this._okTs[i] < cutoff) i += 1;
+    return this._okTs.length - i;
+  }
+
+  /**
+   * Собрать строку метрик. Сбрасывает per-interval средние и счётчики событий,
+   * но НЕ ring `_okTs` (он нужен для sliding rate).
+   *
+   * @param {{ queueSize: number, queueCap: number, sessionSaved: number }} ctx
+   * @returns {string}
+   */
+  buildReport({ queueSize, queueCap, sessionSaved }) {
+    this._trimOldTimestamps();
+    const r1 = this._countSince(1);
+    const r5 = this._countSince(5);
+    const r15 = this._countSince(15);
+    const avg = (sum, n) => (n > 0 ? Math.round(sum / n) : 0);
+    const avgDownload = avg(this._sumDownloadMs, this._countDownload);
+    const avgExtract = avg(this._sumExtractMs, this._countExtract);
+    const avgMark = avg(this._sumMarkPgMs, this._countMarkPg);
+    const avgQueueWait = avg(this._sumQueueWaitMs, this._countQueueWait);
+    const avgPace = avg(this._sumPaceMs, this._countPace);
+    const intervalOk = this._intervalOk;
+    const intervalDef = this._intervalDeferred;
+    const intervalDlFail = this._intervalDlFailed;
+    const intervalExFail = this._intervalExFailed;
+
+    this._sumDownloadMs = 0;
+    this._countDownload = 0;
+    this._sumExtractMs = 0;
+    this._countExtract = 0;
+    this._sumMarkPgMs = 0;
+    this._countMarkPg = 0;
+    this._sumQueueWaitMs = 0;
+    this._countQueueWait = 0;
+    this._sumPaceMs = 0;
+    this._countPace = 0;
+    this._intervalOk = 0;
+    this._intervalDeferred = 0;
+    this._intervalDlFailed = 0;
+    this._intervalExFailed = 0;
+
+    const rate5 = (r5 / 5).toFixed(1);
+    const rate15 = (r15 / 15).toFixed(1);
+    return (
+      `[pipe/metrics] pdf/min 1m=${r1} 5m=${rate5} 15m=${rate15} | ` +
+      `since_last: ok=${intervalOk} deferred=${intervalDef} ` +
+      `dl_failed=${intervalDlFail} ex_failed=${intervalExFail} | ` +
+      `avg_ms: download=${avgDownload} extract=${avgExtract} mark_pg=${avgMark} ` +
+      `queue_wait=${avgQueueWait} pace=${avgPace} | ` +
+      `queue=${queueSize}/${queueCap} session_saved=${sessionSaved}`
+    );
+  }
 }
 
 /**
@@ -307,7 +791,15 @@ export async function runPipeline({ workDir, logger, ids = null }) {
   const log = logger ?? ((m) => process.stdout.write(`${m}\n`));
   fs.mkdirSync(workDir, { recursive: true });
 
-  const stats0 = await pipelineStats();
+  // Startup PG-запросы прячем за тем же retry, что и worker'ные: если БД
+  // на старте мигнула (docker-compose restart, рестарт postgres) — supervisor
+  // не должен пинать пайплайн раз в секунду, мы сами подождём.
+  const stats0 = await _retryPgCall(
+    () => pipelineStats(),
+    "pipelineStats(initial)",
+    log,
+    undefined,
+  );
   log(
     `[pipe] стартую: total_keep=${stats0.total_keep}, pdf_done=${stats0.pdf_done}, ` +
       `text_done=${stats0.text_done}, pending_pdf=${stats0.pending_pdf}, pending_text=${stats0.pending_text}`,
@@ -342,6 +834,16 @@ export async function runPipeline({ workDir, logger, ids = null }) {
     maxWorkers: PARALLEL_MAX,
   });
   log(`[pipe] download pool: ${workers.length} воркер(ов)`);
+
+  // Preflight: если стартовый прокси воркера в РФ (id_country=1), pravocaptcha
+  // на kad.arbitr.ru банит его 451 на первом же запросе. Лучше потратить
+  // одну changeGeo (≤180с cooldown) до старта, чем сжечь N актов на 451+defer
+  // и потом всё равно уйти в quarantine. Не блокирующее: если changeGeo не
+  // помог (cooldown/no-candidates) — продолжаем как раньше, в надежде на
+  // L3 force-geo по ходу работы.
+  if (String(process.env.RAS_PDF_PREFLIGHT_GEO_IF_RU ?? "0").trim() === "1") {
+    await _preflightLeaveRussiaIfNeeded({ workers, log });
+  }
 
   // Общий стейт для лога «все воркеры в карантине». Один раз шумим, при
   // первом же релизе сбрасываем флаг — следующий all-sleeping тоже залогируется.
@@ -378,24 +880,6 @@ export async function runPipeline({ workDir, logger, ids = null }) {
   process.once("SIGINT", () => onSignal("SIGINT"));
   process.once("SIGTERM", () => onSignal("SIGTERM"));
 
-  // ── Шаг 3: shared-source актов (БД-батчи или явный список). ──
-  const explicitIds = Array.isArray(ids) && ids.length ? ids : null;
-  let explicitConsumed = false;
-  const source = new SharedActQueue({
-    fetchBatch: async () => {
-      if (explicitIds) {
-        if (explicitConsumed) return [];
-        explicitConsumed = true;
-        const batch = await selectByIds(explicitIds);
-        log(`[pipe/claim] explicit ids: запрошено=${explicitIds.length}, найдено=${batch.length}`);
-        return batch;
-      }
-      return selectPendingPdf(BATCH_SIZE);
-    },
-    refillable: !explicitIds,
-    logger: log,
-  });
-
   // ── Шаг 4: счётчики/стопы — общие для пула. ──
   const counters = {
     downloaded: 0,
@@ -407,17 +891,113 @@ export async function runPipeline({ workDir, logger, ids = null }) {
     extracted: 0,
     ex_failed: 0,
   };
-  const runState = { totalSeen: 0 };
+  const runState = {
+    totalSeen: 0,
+    lastSuccessAt: Date.now(),     // обновляется на любом markPdfDownloaded
+    stuckWarned: false,            // чтобы не спамить warning'ом каждые 30с
+  };
   const shouldStop = () => stopRequested || (MAX_RUN > 0 && runState.totalSeen >= MAX_RUN);
+
+  // ── Heartbeat-метрики: read-only observability, не влияет на путь скачивания. ──
+  const metrics = new MetricsReporter();
+
+  // ── Шаг 3: shared-source актов (БД-батчи или явный список). ──
+  const explicitIds = Array.isArray(ids) && ids.length ? ids : null;
+  let explicitConsumed = false;
+  const source = new SharedActQueue({
+    fetchBatch: async () => {
+      if (explicitIds) {
+        if (explicitConsumed) return [];
+        explicitConsumed = true;
+        const batch = await _retryPgCall(
+          () => selectByIds(explicitIds),
+          "selectByIds",
+          log,
+          shouldStop,
+        );
+        log(`[pipe/claim] explicit ids: запрошено=${explicitIds.length}, найдено=${batch.length}`);
+        return batch;
+      }
+      return _retryPgCall(
+        () => selectPendingPdf(BATCH_SIZE),
+        "selectPendingPdf",
+        log,
+        shouldStop,
+      );
+    },
+    refillable: !explicitIds,
+    logger: log,
+  });
 
   // ── Шаг 5: extract-pool. ──
   const extractWorkers = Array.from({ length: EXTRACT_WORKERS }, (_, i) =>
-    _extractWorker({ id: i + 1, queue, log, counters }),
+    _extractWorker({ id: i + 1, queue, log, counters, metrics }),
   );
 
-  // ── Шаг 6: download-pool. ──
+  // ── Шаг 6a: heartbeat-метрики каждые HEARTBEAT_MS. ──
+  // Простой setInterval, без race с pool — на shutdown'е чистим в finally.
+  let heartbeatTimer = null;
+  if (HEARTBEAT_MS > 0) {
+    log(`[pipe] heartbeat: каждые ${HEARTBEAT_MS}ms ([pipe/metrics] ...)`);
+    heartbeatTimer = setInterval(() => {
+      if (shouldStop()) return;
+      let sessionSaved = 0;
+      for (const w of workers) {
+        const fn = w.downloader?.getSessionPdfSavedCount;
+        if (typeof fn === "function") {
+          try {
+            sessionSaved += Number(fn.call(w.downloader)) || 0;
+          } catch {}
+        }
+      }
+      const line = metrics.buildReport({
+        queueSize: queue.size,
+        queueCap: QUEUE_BUFFER,
+        sessionSaved,
+      });
+      log(line);
+    }, HEARTBEAT_MS);
+    if (heartbeatTimer.unref) heartbeatTimer.unref();
+  }
+
+  // ── Шаг 6: no-progress watchdog. ──
+  // Если PDF не идут — либо все воркеры в карантине надолго, либо что-то
+  // отвалилось тихо (прокси-сервер, kad.arbitr.ru, MP API). Мы хотим:
+  //   - после STUCK_TIMEOUT_MS залогировать warning (это сигнал supervisor'у/админу);
+  //   - после STUCK_FATAL_MS — кинуть исключение, supervisor в download-acts.js
+  //     закроет всё и перезапустит пайплайн с чистого листа.
+  // Если STUCK_TIMEOUT_MS=0 — watchdog отключён.
+  let watchdogReject = null;
+  const watchdogPromise = new Promise((_, rej) => {
+    watchdogReject = rej;
+  });
+  let watchdogTimer = null;
+  if (STUCK_TIMEOUT_MS > 0) {
+    watchdogTimer = setInterval(() => {
+      if (shouldStop()) return;
+      const since = Date.now() - runState.lastSuccessAt;
+      if (since >= STUCK_FATAL_MS) {
+        const msg =
+          `[pipe/watchdog] FATAL: нет успешных PDF за ${Math.round(since / 60_000)} мин ` +
+          `(STUCK_FATAL_MS=${STUCK_FATAL_MS}ms) — перезапускаю пайплайн`;
+        log(msg);
+        if (watchdogReject) watchdogReject(new Error("pipeline_stuck_fatal"));
+        return;
+      }
+      if (since >= STUCK_TIMEOUT_MS && !runState.stuckWarned) {
+        log(
+          `[pipe/watchdog] WARN: нет успешных PDF за ${Math.round(since / 60_000)} мин ` +
+            `(STUCK_TIMEOUT_MS=${STUCK_TIMEOUT_MS}ms) — продолжаю, fatal в ${Math.round(STUCK_FATAL_MS / 60_000)} мин`,
+        );
+        runState.stuckWarned = true;
+      }
+    }, 30_000);
+    if (watchdogTimer.unref) watchdogTimer.unref();
+  }
+
+  // ── Шаг 7: download-pool. Promise.allSettled + watchdog race. ──
   try {
-    await Promise.all(
+    const poolPromise = Promise.allSettled(
       workers.map((w) =>
         _downloadWorker({
           label: w.label,
@@ -431,10 +1011,35 @@ export async function runPipeline({ workDir, logger, ids = null }) {
           counters,
           runState,
           shouldStop,
+          metrics,
         }),
       ),
     );
+    const winner = await Promise.race([
+      poolPromise.then((r) => ({ kind: "pool", results: r })),
+      watchdogPromise, // отклонится только при stuck-fatal
+    ]);
+    // Pool отработал. Проверим, не упали ли ВСЕ воркеры — это значит, что
+    // пайплайн дальше работать не может, рестарт нужен.
+    if (winner && winner.kind === "pool") {
+      const results = winner.results;
+      const rejected = results.filter((r) => r.status === "rejected");
+      for (const r of rejected) {
+        log(`[pipe] worker rejected: ${r.reason && (r.reason.message ?? r.reason)}`);
+      }
+      if (results.length > 0 && rejected.length === results.length) {
+        throw new Error(
+          `all ${results.length} download workers crashed: ` +
+            rejected
+              .slice(0, 3)
+              .map((r) => String(r.reason?.message ?? r.reason).slice(0, 200))
+              .join(" | "),
+        );
+      }
+    }
   } finally {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     queue.close();
     await Promise.all(extractWorkers).catch((e) => log(`[pipe] extract pool error: ${e}`));
     try {
@@ -458,7 +1063,14 @@ export async function runPipeline({ workDir, logger, ids = null }) {
     }
   }
 
-  const stats1 = await pipelineStats();
+  // На финале БД может быть недоступна — не валим прогон из-за этого, лог-only.
+  let stats1;
+  try {
+    stats1 = await pipelineStats();
+  } catch (e) {
+    log(`[pipe] финальный pipelineStats упал: ${e && e.message} — лог без него`);
+    stats1 = { pdf_done: -1, text_done: -1, pending_pdf: -1, pending_text: -1, total_keep: -1 };
+  }
   log(
     `[pipe] финал: PDF за сессию=${counters.downloaded} (ошибок скачивания=${counters.dl_failed}, ` +
       `отложено=${counters.dl_deferred}), ` +
@@ -493,6 +1105,7 @@ async function _downloadWorker({
   counters,
   runState,
   shouldStop,
+  metrics,
 }) {
   const notifyQuarantineStateChange = () => {
     if (typeof announceAllSleepingIfApplicable === "function") {
@@ -512,15 +1125,38 @@ async function _downloadWorker({
    */
   let consecutiveInfraFails = 0;
   let wasQuarantined = false;
+  /**
+   * Ставится в true после успешного recover перед quarantine (`_attemptProxyRecoverBeforeQuarantine`
+   * для infra или `_attempt451ProxyRecoverBeforeQuarantine` для 451) —
+   * чтобы следующая итерация цикла пропустила проверку isQuarantined и дала
+   * воркеру шанс на свежем IP/гео, несмотря на установленный cooldown.
+   * Cooldown в registry остаётся; если recover не реально помог и пойдёт
+   * новый infra/451 — нового quarantine-входа не будет (entered=false при
+   * активном cooldown), но воркер продолжит попытки до естественного выхода.
+   */
+  let skipQuarantineCheckOnce = false;
+  /** Следующий шаг last-ditch recover при пороге 451: ip → rotateIp, geo → changeGeo. */
+  let next451RecoverAction = "ip";
+  /**
+   * Подряд неожиданных исключений в теле цикла (не штатный результат
+   * downloadAndSave, а throw из claimNext / markPdfDownloaded / etc).
+   * После порога считаем воркер сломанным и выходим — supervisor рестартанёт
+   * весь пайплайн.
+   */
+  const WORKER_UNEXPECTED_FAIL_LIMIT = 5;
+  let consecutiveUnexpectedFails = 0;
   while (true) {
     if (shouldStop()) {
       logWorkerEnd(`[${label}] стоп-сигнал — выхожу из download loop`);
       return;
     }
+    try {
     // Карантин: пока прокси на скамейке — спим прерываемыми чанками, очередь
     // не дёргаем. Здоровые воркеры тем временем разбирают общий буфер
     // (включая deferred-акты этого воркера).
-    if (quarantine && proxyKey && quarantine.isQuarantined(proxyKey)) {
+    if (skipQuarantineCheckOnce) {
+      skipQuarantineCheckOnce = false;
+    } else if (quarantine && proxyKey && quarantine.isQuarantined(proxyKey)) {
       wasQuarantined = true;
       const until = quarantine.getQuarantineUntil(proxyKey) ?? Date.now();
       const remaining = Math.max(0, until - Date.now());
@@ -550,8 +1186,10 @@ async function _downloadWorker({
       return;
     }
 
+    const metricsDlT0 = performance.now();
     const tDl0 = PDF_TIMING ? performance.now() : 0;
     const r = await downloader.downloadAndSave(act);
+    const metricsDlMs = performance.now() - metricsDlT0;
     if (!r.ok) {
       // Инфраструктурная ошибка (proxy tunnel / warmup / kad session) — НЕ markPdfFailed.
       // Возвращаем акт в хвост батча и тормозим этот воркер (backoff + breaker).
@@ -566,6 +1204,7 @@ async function _downloadWorker({
         }
         counters.infra_deferred += 1;
         counters.dl_deferred += 1;
+        if (metrics) metrics.noteDeferred();
         consecutiveInfraFails += 1;
         log(
           `[pdf/defer] id=${act.id} reason=infra_${reason} worker=${label} next=batch_later`,
@@ -584,6 +1223,22 @@ async function _downloadWorker({
             );
             counters.worker_paused += 1;
             notifyQuarantineStateChange();
+            // Last-ditch recover ПЕРЕД sleep: меняем гео (тяжелее IP, но
+            // для infra/туннеля чаще помогает). Если hard-cooldown — падаем
+            // в обычный quarantine sleep.
+            const recovered = await _attemptProxyRecoverBeforeQuarantine({
+              label,
+              downloader,
+              log,
+              reason: "infra",
+            });
+            if (recovered) {
+              counters.worker_restarts += 1;
+              consecutiveInfraFails = 0;
+              skipQuarantineCheckOnce = true;
+              continue;
+            }
+            log(`[pdf/quarantine] proxy_key_sleep reason=recover_failed_or_cooldown`);
             continue;
           }
         }
@@ -629,6 +1284,7 @@ async function _downloadWorker({
           log(`[${label}] deferAct: ${e}`);
         }
         counters.dl_deferred += 1;
+        if (metrics) metrics.noteDeferred();
         consecutiveInfraFails = 0;
         // 2) Если это 451 — записываем в реестр и при необходимости карантиним.
         if (quarantine && proxyKey && r.status === 451) {
@@ -642,6 +1298,23 @@ async function _downloadWorker({
             );
             counters.worker_paused += 1;
             notifyQuarantineStateChange();
+            // Last-ditch recover ПЕРЕД sleep: пробуем сменить IP. Если ок —
+            // restart Chromium и continue, обходя quarantine-sleep на этой
+            // итерации (флаг skipQuarantineCheckOnce). Cooldown в registry
+            // остаётся как safety-net.
+            const recovered = await _attempt451ProxyRecoverBeforeQuarantine({
+              label,
+              downloader,
+              log,
+              action: next451RecoverAction,
+            });
+            if (recovered) {
+              counters.worker_restarts += 1;
+              next451RecoverAction = next451RecoverAction === "ip" ? "geo" : "ip";
+              skipQuarantineCheckOnce = true;
+              continue;
+            }
+            log(`[pdf/quarantine] proxy_key_sleep reason=recover_failed_or_cooldown`);
             continue;
           }
         }
@@ -655,6 +1328,7 @@ async function _downloadWorker({
         continue;
       }
       counters.dl_failed += 1;
+      if (metrics) metrics.noteDlFailed();
       consecutiveInfraFails = 0;
       log(`[${label}] FAIL id=${act.id}: ${r.error} (status=${r.status ?? "?"})`);
       try {
@@ -671,29 +1345,40 @@ async function _downloadWorker({
     // между write и extract, чтобы при resume извлёкли уже скачанный.
     let dbMs = 0;
     let qMs = 0;
-    const tDb0 = PDF_TIMING ? performance.now() : 0;
+    const tDb0 = performance.now();
     try {
       await markPdfDownloaded(act.id, { pdfPath: r.pdfPath, pdfBytes: r.bytes });
     } catch (e) {
       log(`[${label}] markPdfDownloaded: ${e}`);
     }
-    if (PDF_TIMING) dbMs = performance.now() - tDb0;
+    dbMs = performance.now() - tDb0;
 
     counters.downloaded += 1;
+    runState.lastSuccessAt = Date.now();
+    runState.stuckWarned = false;
+    consecutiveUnexpectedFails = 0;
     if (quarantine && proxyKey) quarantine.recordSuccess(proxyKey);
 
     // Передаём в extract-pool. queue.push() блокируется, если буфер заполнен —
     // мягкий backpressure.
-    const tQ0 = PDF_TIMING ? performance.now() : 0;
+    const tQ0 = performance.now();
     try {
       await queue.push({ id: act.id, pdfPath: r.pdfPath });
     } catch (e) {
       logWorkerEnd(`[${label}] queue closed mid-push: ${e}`);
       return;
     }
-    if (PDF_TIMING) qMs = performance.now() - tQ0;
+    qMs = performance.now() - tQ0;
 
     const paceMs = await downloader.paceAfterSuccess();
+    if (metrics) {
+      metrics.noteDownloadOk({
+        downloadMs: metricsDlMs,
+        markMs: dbMs,
+        queueWaitMs: qMs,
+        paceMs,
+      });
+    }
     if (PDF_TIMING) {
       const pipeMs = performance.now() - tDl0;
       const t = r.timings;
@@ -706,26 +1391,48 @@ async function _downloadWorker({
           `pipe_total=${pipeMs.toFixed(0)}ms`,
       );
     }
+    } catch (e) {
+      // Неожиданное исключение В ТЕЛЕ цикла (не штатный r.ok=false из downloadAndSave).
+      // Чаще всего: PG потеряла соединение (markPdfDownloaded), Chromium умер вне
+      // _safeRewarmup, queue.push на закрытой очереди и т.п. НЕ паникуем, не
+      // помечаем акт как failed (источник причины может быть не в нём) —
+      // спим WORKER_UNEXPECTED_PAUSE_MS и идём дальше.
+      consecutiveUnexpectedFails += 1;
+      log(
+        `[${label}] неожиданное исключение в worker loop (#${consecutiveUnexpectedFails}/${WORKER_UNEXPECTED_FAIL_LIMIT}): ` +
+          `${e && (e.stack ?? e.message ?? e)}`,
+      );
+      if (consecutiveUnexpectedFails >= WORKER_UNEXPECTED_FAIL_LIMIT) {
+        log(
+          `[${label}] >= ${WORKER_UNEXPECTED_FAIL_LIMIT} неожиданных исключений подряд — выхожу, ` +
+            `supervisor рестартанёт пайплайн`,
+        );
+        throw e;
+      }
+      await _interruptibleSleep(WORKER_UNEXPECTED_PAUSE_MS, shouldStop);
+      continue;
+    }
   }
 }
 
-async function _extractWorker({ id, queue, log, counters }) {
+async function _extractWorker({ id, queue, log, counters, metrics }) {
   while (true) {
     const { done, value } = await queue.shift();
     if (done) return;
-    await _processOne(value, log, counters, `ex#${id}`);
+    await _processOne(value, log, counters, `ex#${id}`, metrics);
   }
 }
 
-async function _processOne({ id, pdfPath }, log, counters, who) {
-  const t0 = PDF_TIMING ? performance.now() : 0;
+async function _processOne({ id, pdfPath }, log, counters, who, metrics) {
+  const t0 = performance.now();
   const r = await extractPdfText(pdfPath);
+  const exMs = performance.now() - t0;
   if (PDF_TIMING) {
-    const exMs = performance.now() - t0;
     log(`[pipe/timing] ${who} id=${id} extract_pdftotext=${exMs.toFixed(0)}ms`);
   }
   if (!r.ok) {
     counters.ex_failed += 1;
+    if (metrics) metrics.noteExFailed();
     log(`[pipe/${who}] EXTRACT FAIL id=${id} code=${r.code}: ${r.error}`);
     try {
       await markExtractFailed(id, `${r.code}: ${r.error}`);
@@ -734,9 +1441,12 @@ async function _processOne({ id, pdfPath }, log, counters, who) {
     }
     return;
   }
+  const markT0 = performance.now();
   try {
     await markTextExtracted(id, r.text);
+    const markMs = performance.now() - markT0;
     counters.extracted += 1;
+    if (metrics) metrics.noteExtractOk({ extractMs: exMs, markMs });
     log(`[pipe/${who}] OK id=${id} bytes=${r.bytes}`);
   } catch (e) {
     log(`[pipe/${who}] markTextExtracted: ${e}`);
@@ -787,4 +1497,4 @@ async function _drainPendingTextFromDb(log) {
   if (drained > 0) log(`[pipe/resume] добил ${drained} актов`);
 }
 
-export const __test__ = { BoundedQueue, SharedActQueue, _downloadWorker };
+export const __test__ = { BoundedQueue, SharedActQueue, MetricsReporter, _downloadWorker };
