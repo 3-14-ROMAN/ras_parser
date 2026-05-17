@@ -1,213 +1,47 @@
+#!/usr/bin/env node
+/**
+ * scripts/index-acts-qdrant-fullact.js — CLI: одна пачка full-act индексации.
+ *
+ * Тонкая обёртка над embed/fullAct.js. Worker — `scripts/embed-worker.js`
+ * (бесконечный цикл); этот скрипт — для разового прогона / smoke / отладки.
+ *
+ * Запуск:
+ *   node --env-file=.env scripts/index-acts-qdrant-fullact.js [LIMIT]
+ *   npm run embed:fullact -- 10
+ */
 
-import { Pool } from 'pg';
+import process from "node:process";
 
-const PG_DSN =
-  process.env.RAS_PG_DSN ||
-  process.env.DATABASE_URL ||
-  'postgresql://ras:ras@127.0.0.1:5432/ras';
-
-const QDRANT_URL = process.env.QDRANT_URL || 'http://127.0.0.1:6333';
-const INFERENCE_URL = process.env.INFERENCE_URL || 'http://127.0.0.1:8000';
-const COLLECTION = process.env.QDRANT_COLLECTION || 'ras_acts';
+import { embedFullActBatch } from "../embed/fullAct.js";
+import { pipelineStats } from "../db/actsRepo.js";
+import { closePool } from "../db/pgClient.js";
 
 const LIMIT = Number(process.argv[2] || 3);
-const MAX_ACT_CHARS = Number(process.env.MAX_ACT_CHARS || 40000);
-const MAX_COLBERT_TOKENS = Number(process.env.MAX_COLBERT_TOKENS || 8000);
 
-const pool = new Pool({ connectionString: PG_DSN });
-
-async function postJson(url, body) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`${url} failed ${res.status}: ${text}`);
-  }
-
-  return JSON.parse(text);
-}
-
-async function putJson(url, body) {
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`${url} failed ${res.status}: ${text}`);
-  }
-
-  return JSON.parse(text);
-}
-
-async function embedAct(text) {
-  const data = await postJson(`${INFERENCE_URL}/embed`, {
-    texts: [text],
-    task: 'retrieval.passage',
-  });
-
-  const colbert = data.multivectors?.[0];
-  const muvera = data.muvera_vectors?.[0];
-
-  if (!Array.isArray(colbert) || !Array.isArray(colbert[0])) {
-    throw new Error('Bad embed response: multivectors[0] is missing');
-  }
-
-  if (!Array.isArray(muvera)) {
-    throw new Error('Bad embed response: muvera_vectors[0] is missing');
-  }
-
-  if (colbert[0].length !== 128) {
-    throw new Error(`Bad colbert dim: ${colbert[0].length}`);
-  }
-
-  if (muvera.length !== 10240) {
-    throw new Error(`Bad muvera dim: ${muvera.length}`);
-  }
-
-  return { colbert, muvera };
-}
-
-async function upsertActPoint(act, vectors) {
-  const point = {
-    id: act.id,
-    vector: {
-      muvera: vectors.muvera,
-      colbert: vectors.colbert,
-    },
-    payload: {
-      unit_type: "full_act",
-      has_colbert: true,
-      chunk_id: null,
-      act_id: act.id,
-      case_id: act.case_id,
-      case_number: act.case_number,
-      court: act.court,
-      registration_date: act.registration_date,
-      type_name: act.type_name,
-      true_instance_level: act.true_instance_level,
-      verdict_keep: act.verdict_keep,
-      verdict_action: act.verdict_action,
-      pdf_link: act.pdf_link,
-      pdf_path: act.pdf_path,
-      act_text: act.act_text,
-    },
-  };
-
-  return putJson(`${QDRANT_URL}/collections/${COLLECTION}/points?wait=true`, {
-    points: [point],
-  });
+function log(msg) {
+  process.stdout.write(`${msg}\n`);
 }
 
 async function main() {
-  console.log(`[setup] full-act indexer, limit=${LIMIT}`);
-  console.log(`[setup] max_act_chars=${MAX_ACT_CHARS}`);
-  console.log(`[setup] max_colbert_tokens=${MAX_COLBERT_TOKENS}`);
-  console.log(`[setup] inference=${INFERENCE_URL}`);
-  console.log(`[setup] qdrant=${QDRANT_URL}`);
-  console.log(`[setup] collection=${COLLECTION}`);
-
-  const { rows } = await pool.query(
-    `
-    SELECT
-      id,
-      case_id,
-      case_number,
-      court,
-      registration_date,
-      type_name,
-      true_instance_level,
-      verdict_keep,
-      verdict_action,
-      pdf_link,
-      pdf_path,
-      act_text
-    FROM acts
-    WHERE
-      act_text IS NOT NULL
-      AND length(act_text) > 1000
-      AND vector_indexed = FALSE
-      AND length(act_text) <= $2
-      AND (qdrant_point_id IS NULL OR qdrant_point_id NOT LIKE 'skip:%')
-    ORDER BY registration_date DESC NULLS LAST
-    LIMIT $1
-    `,
-    [LIMIT, MAX_ACT_CHARS],
+  log(`[fullact] limit=${LIMIT}`);
+  const before = await pipelineStats();
+  log(
+    `[fullact/before] pending=${before.embed_pending} indexed=${before.embed_indexed} error=${before.embed_error}`,
   );
 
-  console.log(`[setup] взял ${rows.length} актов из PG`);
+  const r = await embedFullActBatch(LIMIT, log);
 
-  let indexed = 0;
-
-  for (const act of rows) {
-    const textLen = act.act_text.length;
-    console.log(`\n[act ${act.id}] case=${act.case_number} court="${act.court}" len=${textLen}`);
-
-    const startedAt = Date.now();
-
-    try {
-      const vectors = await embedAct(act.act_text);
-
-      console.log(
-        `[embed] colbert_tokens=${vectors.colbert.length} colbert_dim=${vectors.colbert[0].length} muvera_dim=${vectors.muvera.length} in ${Date.now() - startedAt}ms`,
-      );
-
-      if (vectors.colbert.length > MAX_COLBERT_TOKENS) {
-        const reason = `skip:too_many_colbert_tokens:${vectors.colbert.length}`;
-        await pool.query(
-          `
-          UPDATE acts
-          SET
-            qdrant_point_id = $2,
-            vector_indexed_at = now()
-          WHERE id = $1
-          `,
-          [act.id, reason],
-        );
-
-        console.log(`[skip] ${reason} act=${act.id}`);
-        continue;
-      }
-
-      await upsertActPoint(act, vectors);
-
-      await pool.query(
-        `
-        UPDATE acts
-        SET
-          vector_indexed = TRUE,
-          vector_indexed_at = now(),
-          qdrant_point_id = $2
-        WHERE id = $1
-        `,
-        [act.id, act.id],
-      );
-
-      indexed += 1;
-      console.log(`[ok] indexed full act as one point: ${act.id}`);
-    } catch (err) {
-      console.error(`[error] act=${act.id} case=${act.case_number}`);
-      console.error(err);
-      throw err;
-    }
-  }
-
-  console.log(`\n[done] indexed_full_acts=${indexed}`);
+  const after = await pipelineStats();
+  log(
+    `[fullact/done] batch=${r.batchSize} indexed=${r.indexed} error=${r.errored} | pending=${after.embed_pending} indexed=${after.embed_indexed} error=${after.embed_error}`,
+  );
 }
 
 main()
-  .catch((err) => {
-    console.error('[fatal]', err);
+  .catch((e) => {
+    process.stderr.write(`[fatal] ${e?.stack ?? e?.message ?? e}\n`);
     process.exitCode = 1;
   })
   .finally(async () => {
-    await pool.end();
+    await closePool().catch(() => {});
   });

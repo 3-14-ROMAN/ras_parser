@@ -24,7 +24,13 @@
     "smoke:lease": "node --env-file=.env pdf/lease.smoke.mjs",
     "smoke:proxy-health": "node pdf/proxyHealth.smoke.mjs",
     "test:pdf-smoke": "node pdf/repeat451.smoke.mjs",
-    "test:quarantine-smoke": "node pdf/quarantine.smoke.mjs"
+    "test:quarantine-smoke": "node pdf/quarantine.smoke.mjs",
+    "embed:worker": "node --env-file=.env scripts/embed-worker.js",
+    "embed:fullact": "node --env-file=.env scripts/index-acts-qdrant-fullact.js",
+    "embed:chunk": "node --env-file=.env scripts/index-acts-qdrant.js",
+    "embed:search": "node --env-file=.env scripts/search-qdrant-rrf.js",
+    "embed:rerank": "node --env-file=.env scripts/search-qdrant-rerank.js",
+    "qdrant:rebuild": "node --env-file=.env scripts/qdrant-rebuild-collection.js"
   },
   "engines": {
     "node": ">=20"

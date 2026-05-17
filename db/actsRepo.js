@@ -17,7 +17,7 @@
  *     content_types*       = excluded.…                     — если RAS поменял
  *     type_*               = excluded.…                     — и категория тоже
  *
- *   Поля состояния RAG-pipeline (pdf_downloaded / act_text / vector_indexed / …)
+ *   Поля состояния RAG-pipeline (pdf_downloaded / act_text / vector_status / …)
  *   в upsert НЕ ОБНОВЛЯЮТСЯ: парсер ставит флаги один раз при инсерте, дальше
  *   их меняет downstream (PDF-loader / extractor / embedding-pipeline).
  *
@@ -83,7 +83,7 @@ const COLS = [
 ];
 
 // Колонки, которые upsert обновляет на excluded.* при конфликте по id.
-// pdf_downloaded / pdf_path / act_text / vector_indexed / qdrant_point_id и т.п.
+// pdf_downloaded / pdf_path / act_text / vector_status / vector_error и т.п.
 // сюда НЕ включены — их пишет downstream pipeline, парсеру их трогать не надо.
 const UPDATE_COLS = [
   "case_id",
@@ -360,18 +360,24 @@ export async function markPdfFailed(id, errorText) {
 /**
  * Записать извлечённый текст.
  *
+ * Помимо act_text ставим is_long_act по эвристике length > 32000 — чтобы
+ * embedding-pipeline сразу видел в очереди, какой кейс (full_act vs chunk).
+ * Реальный token_count перепишет индексер, увидев его в ответе инференса.
+ *
  * @param {string} id
  * @param {string} text
  */
 export async function markTextExtracted(id, text) {
   const pool = await getPool();
+  const s = String(text ?? "");
   await pool.query(
     `UPDATE acts
         SET act_text          = $2,
             text_extracted_at = NOW(),
-            pdf_error         = NULL
+            pdf_error         = NULL,
+            is_long_act       = (length($2) > 32000)
       WHERE id = $1::uuid`,
-    [id, String(text ?? "")],
+    [id, s],
   );
 }
 
@@ -398,10 +404,196 @@ export async function markExtractFailed(id, errorText) {
   );
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Очередь embedding-pipeline (act_text → Qdrant). State machine vector_status:
+//
+//   pending  ─selectPendingEmbed→  indexing  ─markEmbedded─→  indexed
+//                                       │
+//                                       └──markEmbedError─→  error
+//
+// Воркер берёт батч `selectPendingEmbed(limit)` (FOR UPDATE SKIP LOCKED), сразу
+// выставляет 'indexing' — в БД фактически делается одной транзакцией внутри
+// помощника. По итогу embedding'а зовёт markEmbedded / markEmbedError. Если
+// процесс умер с 'indexing' — recoverStaleEmbedding() сбросит застрявшие
+// строки обратно в 'pending' (TTL 1 час).
+//
+// Bump vector_version (bumpVectorVersionAll) инвалидирует уже indexed строки:
+// поднимаем глобально, всё indexed возвращается в pending. Используется при
+// пересборке коллекции Qdrant / смене embedding-модели.
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Снять очередную пачку pending-актов и атомарно перевести их в indexing.
+ * Возвращает строки, которые worker может начать индексировать.
+ *
+ * Параметр isLongAct:
+ *   null     — берём оба типа (full_act + chunk)
+ *   false    — только short (is_long_act = FALSE) для full-act индексера
+ *   true     — только long  (is_long_act = TRUE)  для chunk-индексера
+ *
+ * Используется FOR UPDATE SKIP LOCKED — два параллельных воркера на одни и
+ * те же строки не вцепятся.
+ *
+ * @param {number} limit
+ * @param {boolean|null} [isLongAct=null]
+ * @returns {Promise<Array<{ id: string, act_text: string, is_long_act: boolean }>>}
+ */
+export async function selectPendingEmbed(limit, isLongAct = null) {
+  const pool = await getPool();
+  const isLongCond =
+    isLongAct === null ? ""
+    : isLongAct === true  ? "AND is_long_act = TRUE"
+    : "AND is_long_act = FALSE";
+  const res = await pool.query(
+    `WITH picked AS (
+        SELECT id FROM acts
+         WHERE vector_status = 'pending'
+           AND act_text IS NOT NULL
+           AND act_text NOT LIKE '__EXTRACT_FAILED__%'
+           ${isLongCond}
+         ORDER BY registration_date DESC NULLS LAST, id
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1
+     )
+     UPDATE acts a
+        SET vector_status = 'indexing'
+       FROM picked
+      WHERE a.id = picked.id
+      RETURNING a.id::text AS id, a.act_text, a.is_long_act`,
+    [Math.max(1, limit | 0)],
+  );
+  return res.rows;
+}
+
+/**
+ * Пометить акт как успешно проиндексированный в Qdrant.
+ * Опционально записать реальный token_count, увиденный в ответе инференса.
+ *
+ * @param {string} id
+ * @param {{ tokenCount?: number, isLongAct?: boolean }} [info]
+ */
+export async function markEmbedded(id, info = {}) {
+  const pool = await getPool();
+  const tokenCount = Number.isInteger(info.tokenCount) ? info.tokenCount : null;
+  const isLongAct  = typeof info.isLongAct === "boolean" ? info.isLongAct : null;
+  await pool.query(
+    `UPDATE acts
+        SET vector_status = 'indexed',
+            indexed_at    = NOW(),
+            vector_error  = NULL,
+            token_count   = COALESCE($2, token_count),
+            is_long_act   = COALESCE($3, is_long_act)
+      WHERE id = $1::uuid`,
+    [id, tokenCount, isLongAct],
+  );
+}
+
+/**
+ * Пометить ошибку индексирования. Запись остаётся в error до bump'а
+ * vector_version, либо пока её вручную не сбросят в pending.
+ *
+ * @param {string} id
+ * @param {string} errorText
+ */
+export async function markEmbedError(id, errorText) {
+  const pool = await getPool();
+  await pool.query(
+    `UPDATE acts
+        SET vector_status = 'error',
+            vector_error  = LEFT($2, 2000)
+      WHERE id = $1::uuid`,
+    [id, String(errorText ?? "")],
+  );
+}
+
+/**
+ * Сбросить ВСЕ строки в статусе indexing обратно в pending. Используется на
+ * старте воркера как «hammer reset», поскольку отдельной метки времени старта
+ * индексирования сейчас нет (single-worker pipeline). Когда заведём
+ * параллелизм в Шаге 2 — добавим indexing_started_at и сделаем TTL-recovery.
+ *
+ * @returns {Promise<number>} число восстановленных строк
+ */
+export async function recoverStaleEmbedding() {
+  const pool = await getPool();
+  const res = await pool.query(
+    `UPDATE acts
+        SET vector_status = 'pending'
+      WHERE vector_status = 'indexing'`,
+  );
+  return res.rowCount ?? 0;
+}
+
+/**
+ * Bump vector_version глобально и сбросить indexed-строки в pending. Нужен
+ * при пересборке коллекции Qdrant или смене embedding-модели.
+ *
+ * Делается двумя UPDATE'ами в одной транзакции, потому что в PG обновить одну
+ * и ту же строку из двух data-modifying CTE — undefined behaviour.
+ *
+ * @returns {Promise<{ bumped: number, reset: number }>}
+ */
+export async function bumpVectorVersionAll() {
+  const pool = await getPool();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const reset = await client.query(
+      `UPDATE acts
+          SET vector_status = 'pending',
+              indexed_at    = NULL
+        WHERE vector_status = 'indexed'`,
+    );
+    const bumped = await client.query(
+      `UPDATE acts
+          SET vector_version = vector_version + 1`,
+    );
+    await client.query("COMMIT");
+    return {
+      bumped: bumped.rowCount ?? 0,
+      reset:  reset.rowCount  ?? 0,
+    };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Границы дат и количество актов в таблице. Используется интерактивным
+ * setup'ом parser.js, чтобы предложить «продолжить с прошлого прогона»
+ * (добрать свежие до сегодня, либо идти ещё дальше в прошлое).
+ *
+ * Даты возвращаются как 'YYYY-MM-DD' (то, что pg отдаёт для date::text).
+ *
+ * @returns {Promise<{ minDate: string|null, maxDate: string|null, total: number }>}
+ */
+export async function getActsDateBounds() {
+  const pool = await getPool();
+  const res = await pool.query(
+    `SELECT MIN(registration_date)::text AS min_date,
+            MAX(registration_date)::text AS max_date,
+            COUNT(*)::bigint              AS total
+       FROM acts
+      WHERE registration_date IS NOT NULL`,
+  );
+  const r = res.rows[0] || {};
+  return {
+    minDate: r.min_date || null,
+    maxDate: r.max_date || null,
+    total: Number(r.total ?? 0),
+  };
+}
+
 /**
  * Сводка прогресса pipeline (для CLI-логов).
  *
- * @returns {Promise<{ total_keep: number, pdf_done: number, text_done: number, pending_pdf: number, pending_text: number }>}
+ * @returns {Promise<{ total_keep: number, pdf_done: number, text_done: number,
+ *                     pending_pdf: number, pending_text: number,
+ *                     embed_pending: number, embed_indexing: number,
+ *                     embed_indexed: number, embed_error: number }>}
  */
 export async function pipelineStats() {
   const pool = await getPool();
@@ -413,17 +605,25 @@ export async function pipelineStats() {
                               AND act_text NOT LIKE '__EXTRACT_FAILED__%')                            AS text_done,
         COUNT(*) FILTER (WHERE verdict_keep IS TRUE AND pdf_downloaded = FALSE
                               AND pdf_attempts < $1)                                                  AS pending_pdf,
-        COUNT(*) FILTER (WHERE pdf_downloaded = TRUE AND act_text IS NULL)                            AS pending_text
+        COUNT(*) FILTER (WHERE pdf_downloaded = TRUE AND act_text IS NULL)                            AS pending_text,
+        COUNT(*) FILTER (WHERE vector_status = 'pending'  AND act_text IS NOT NULL)                   AS embed_pending,
+        COUNT(*) FILTER (WHERE vector_status = 'indexing')                                            AS embed_indexing,
+        COUNT(*) FILTER (WHERE vector_status = 'indexed')                                             AS embed_indexed,
+        COUNT(*) FILTER (WHERE vector_status = 'error')                                               AS embed_error
        FROM acts`,
     [MAX_PDF_ATTEMPTS],
   );
   const r = res.rows[0] || {};
   return {
-    total_keep:   Number(r.total_keep   ?? 0),
-    pdf_done:     Number(r.pdf_done     ?? 0),
-    text_done:    Number(r.text_done    ?? 0),
-    pending_pdf:  Number(r.pending_pdf  ?? 0),
-    pending_text: Number(r.pending_text ?? 0),
+    total_keep:    Number(r.total_keep    ?? 0),
+    pdf_done:      Number(r.pdf_done      ?? 0),
+    text_done:     Number(r.text_done     ?? 0),
+    pending_pdf:   Number(r.pending_pdf   ?? 0),
+    pending_text:  Number(r.pending_text  ?? 0),
+    embed_pending:  Number(r.embed_pending  ?? 0),
+    embed_indexing: Number(r.embed_indexing ?? 0),
+    embed_indexed:  Number(r.embed_indexed  ?? 0),
+    embed_error:    Number(r.embed_error    ?? 0),
   };
 }
 

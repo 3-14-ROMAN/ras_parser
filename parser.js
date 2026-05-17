@@ -44,7 +44,10 @@ import {
 import { RasProxyClient } from "./network/proxyClient.js";
 import { StealthBrowserManager } from "./stealthManager.js";
 import { closePool as _pgClosePool, isPgConfigured as _pgIsConfigured } from "./db/pgClient.js";
-import { upsertActs as _pgUpsertActs } from "./db/actsRepo.js";
+import {
+  upsertActs as _pgUpsertActs,
+  getActsDateBounds as _pgGetActsDateBounds,
+} from "./db/actsRepo.js";
 import {
   acquireSingleOrThrow as _leaseAcquire,
   releaseAll as _leaseReleaseAll,
@@ -66,6 +69,15 @@ const PROJECT_DIR = __dirname;
 const BASE_URL = "https://ras.arbitr.ru/";
 const PARSED_DATA_DIR = path.join(PROJECT_DIR, "parsed_data");
 const OUT_PATH = path.join(PARSED_DATA_DIR, "document_types.json");
+
+/**
+ * Чекпоинт текущей позиции окна (дата) на диск — чтобы после краша / SIGINT
+ * следующий запуск мог предложить «продолжить с того места».
+ * Резюмировать дату из MAX(registration_date) в БД нельзя: если в текущем
+ * окне ещё не успели сохраниться акты, или окно оказалось пустым (skip),
+ * MAX отстаёт от реального положения. Поэтому ведём отдельный файл.
+ */
+const PARSER_STATE_PATH = path.join(PARSED_DATA_DIR, "parser_state.json");
 
 const DEBUG_DIR = path.join(PROJECT_DIR, "debug");
 /**
@@ -3634,6 +3646,106 @@ function _parseDdMmYyyy(s) {
   return new Date(year, month - 1, day);
 }
 
+/** Парсит 'YYYY-MM-DD' (то, что отдаёт pg для date::text). */
+function _parseIsoDate(s) {
+  const m = String(s ?? "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Чекпоинт позиции окна парсера (parser_state.json)
+//
+// Зачем: парсер идёт окнами назад во времени. Если процесс упал в середине
+// прогона (Chrome повис, прокси разорвал TCP, машина перезагрузилась) —
+// в БД остались акты до момента сбоя, но «где мы сейчас» нигде не записано.
+// MAX(registration_date) в БД использовать нельзя: окно могло оказаться
+// пустым (skip), MAX тогда отстаёт. Поэтому ведём отдельный файл.
+//
+// Контракт state:
+//   nextEndDay  — DD.MM.YYYY, окно, которое ЕЩЁ НЕ обработано (или обработано
+//                 не полностью). Следующий запуск стартует с него.
+//   oldestDay   — DD.MM.YYYY | null, нижняя граница исходного прогона.
+//   updatedAt   — ISO timestamp последнего сохранения.
+//
+// Когда пишется:
+//   - При входе в цикл окон (initial state = endDay из setup).
+//   - После каждой смены outerEnd (окно завершено успешно, теперь edit shift).
+//   - При SIGINT (graceful Ctrl+C) — синхронно перед exit.
+//
+// Когда удаляется:
+//   - После успешного завершения цикла окон (break по oldestDay/autostop) —
+//     прогон закончился, ресюмить нечего.
+//   - По запросу пользователя в _promptSetup («нет, начать заново»).
+// ───────────────────────────────────────────────────────────────────────────
+
+let _currentParserState = null;
+let _parserStateSigintInstalled = false;
+
+function _loadParserState() {
+  try {
+    if (!fs.existsSync(PARSER_STATE_PATH)) return null;
+    const raw = fs.readFileSync(PARSER_STATE_PATH, "utf-8");
+    const j = JSON.parse(raw);
+    const nextEndDay = _parseDdMmYyyy(String(j.nextEndDay ?? ""));
+    if (!nextEndDay) return null;
+    let oldestDay = null;
+    if (j.oldestDay) {
+      const od = _parseDdMmYyyy(String(j.oldestDay));
+      if (od) oldestDay = _startOfDay(od);
+    }
+    return {
+      nextEndDay: _startOfDay(nextEndDay),
+      oldestDay,
+      updatedAt: String(j.updatedAt ?? ""),
+    };
+  } catch (e) {
+    log(`[state] не смог прочитать ${PARSER_STATE_PATH}: ${e && e.message}`);
+    return null;
+  }
+}
+
+function _saveParserState(state) {
+  if (!state || !state.nextEndDay) return;
+  try {
+    fs.mkdirSync(PARSED_DATA_DIR, { recursive: true });
+    const payload = {
+      nextEndDay: _formatDdMmYyyy(state.nextEndDay),
+      oldestDay: state.oldestDay ? _formatDdMmYyyy(state.oldestDay) : null,
+      updatedAt: new Date().toISOString(),
+    };
+    const tmp = PARSER_STATE_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf-8");
+    fs.renameSync(tmp, PARSER_STATE_PATH);
+  } catch (e) {
+    log(`[state] не смог записать ${PARSER_STATE_PATH}: ${e && e.message}`);
+  }
+}
+
+function _clearParserState() {
+  _currentParserState = null;
+  try {
+    if (fs.existsSync(PARSER_STATE_PATH)) fs.unlinkSync(PARSER_STATE_PATH);
+  } catch (e) {
+    log(`[state] не смог удалить ${PARSER_STATE_PATH}: ${e && e.message}`);
+  }
+}
+
+function _installParserStateSigintOnce() {
+  if (_parserStateSigintInstalled) return;
+  _parserStateSigintInstalled = true;
+  process.on("SIGINT", () => {
+    if (_currentParserState && _currentParserState.nextEndDay) {
+      _saveParserState(_currentParserState);
+      process.stderr.write(
+        `\n[state] SIGINT — позиция сохранена, продолжишь с ` +
+          `${_formatDdMmYyyy(_currentParserState.nextEndDay)}\n`,
+      );
+    }
+    process.exit(130);
+  });
+}
+
 /** Календарный день 00:00 локально — для сравнения границ диапазона. */
 function _startOfDay(d) {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -4002,8 +4114,139 @@ async function _promptSetup(headless) {
   }
   const targetTypeIds = [...DEFAULT_DECISION_TYPE_IDS];
 
+  // === Продолжить с прошлого прогона? ===
+  // Два уровня приоритета:
+  //
+  //   1. Чекпоинт parser_state.json (есть только если прошлый прогон не
+  //      завершился — упал, был убит SIGINT, или дошёл до oldestDay
+  //      без чистого `_clearParserState`). Это самое точное «откуда продолжить».
+  //
+  //   2. Если чекпоинта нет — смотрим границы дат в `acts` и предлагаем
+  //      готовые сценарии:
+  //        a) Свежие     — endDay = вчера, oldestDay = MAX(date) в БД
+  //                        (добрать хвост от последнего собранного дня до сегодня).
+  //        b) В прошлое  — endDay = MIN(date) - 1 день, oldestDay спросим
+  //                        отдельно (бесконечно назад по дефолту).
+  //        c) Вручную    — старое поведение.
+  //
+  // Всё это только в интерактивном режиме (TTY). Non-TTY (cron / API) —
+  // берёт даты из env (RAS_DATE_TO / RAS_DATE_FROM), state-файл игнорирует
+  // (cron всё равно знает, что хочет — env переопределяет).
+  let preEndDay = null;
+  let preOldestDay;
+
+  if (interactive) {
+    const state = _loadParserState();
+    if (state && state.nextEndDay) {
+      const updatedHuman = state.updatedAt
+        ? state.updatedAt.replace("T", " ").replace(/\..*Z$/, " UTC")
+        : "?";
+      while (true) {
+        const raw = (
+          await _ask(
+            `Найден незавершённый прогон: остановился на ${_formatDdMmYyyy(state.nextEndDay)} ` +
+              `(нижняя граница ${state.oldestDay === null ? "нет" : _formatDdMmYyyy(state.oldestDay)}, ` +
+              `сохранён ${updatedHuman}). Продолжить? [Enter=да, n=нет]: `,
+          )
+        ).trim().toLowerCase();
+        if (
+          raw === "" || raw === "y" || raw === "yes" ||
+          raw === "д" || raw === "да"
+        ) {
+          preEndDay = state.nextEndDay;
+          preOldestDay = state.oldestDay;
+          log(
+            `[setup] продолжаю незавершённый прогон: ` +
+              `дата_до=${_formatDdMmYyyy(preEndDay)}, ` +
+              `дата_с=${state.oldestDay === null ? "нет" : _formatDdMmYyyy(state.oldestDay)}`,
+          );
+          break;
+        }
+        if (raw === "n" || raw === "no" || raw === "нет" || raw === "н") {
+          _clearParserState();
+          log("[setup] чекпоинт удалён по запросу пользователя — начнём заново");
+          break;
+        }
+        process.stdout.write("Введи y/n или Enter (= да).\n");
+      }
+    }
+  }
+
+  if (preEndDay === null && preOldestDay === undefined && interactive && _pgIsConfigured()) {
+    let bounds = null;
+    try {
+      bounds = await _pgGetActsDateBounds();
+    } catch (e) {
+      log(`[setup] не смог запросить границы дат из БД (${e.message}) — спрошу даты с нуля`);
+    }
+    if (bounds && bounds.total > 0 && bounds.minDate && bounds.maxDate) {
+      const minD = _parseIsoDate(bounds.minDate);
+      const maxD = _parseIsoDate(bounds.maxDate);
+      const haveFreshGap = maxD && _startOfDay(maxD).getTime() < defaultEndDay.getTime();
+      log(
+        `[setup] в БД ${bounds.total} актов: ` +
+          `${_formatDdMmYyyy(minD)} → ${_formatDdMmYyyy(maxD)}` +
+          (haveFreshGap
+            ? ""
+            : ` (свежие до ${_formatDdMmYyyy(defaultEndDay)} уже есть, опция «добрать свежие» недоступна)`),
+      );
+      while (true) {
+        const freshLabel = haveFreshGap
+          ? `[1] добрать свежие (${_formatDdMmYyyy(maxD)} → ${_formatDdMmYyyy(defaultEndDay)}), `
+          : "";
+        const defaultHint = haveFreshGap ? "Enter = 1" : "Enter = 3";
+        const raw = (
+          await _ask(
+            `Продолжить с прошлого прогона? ` +
+              freshLabel +
+              `[2] идти назад от ${_formatDdMmYyyy(minD)} вглубь прошлого, ` +
+              `[3] задать даты вручную ` +
+              `[${defaultHint}]: `,
+          )
+        ).trim();
+        if ((raw === "" && haveFreshGap) || raw === "1") {
+          if (!haveFreshGap) {
+            process.stdout.write(
+              `В БД уже есть данные за ${_formatDdMmYyyy(defaultEndDay)} (последний акт — ` +
+                `${_formatDdMmYyyy(maxD)}). Нечего добирать. Выбери 2 или 3.\n`,
+            );
+            continue;
+          }
+          preEndDay = defaultEndDay;
+          preOldestDay = _startOfDay(maxD);
+          log(
+            `[setup] продолжаю свежие: дата_до=${_formatDdMmYyyy(preEndDay)}, ` +
+              `дата_с=${_formatDdMmYyyy(preOldestDay)} (= MAX(date) в БД, перепроверим день)`,
+          );
+          break;
+        }
+        if (raw === "2") {
+          const newEnd = new Date(
+            minD.getFullYear(),
+            minD.getMonth(),
+            minD.getDate() - 1,
+          );
+          preEndDay = _startOfDay(newEnd);
+          log(
+            `[setup] идём в прошлое: дата_до=${_formatDdMmYyyy(preEndDay)} ` +
+              `(день до самого раннего акта в БД ${_formatDdMmYyyy(minD)}). ` +
+              `Спрошу нижнюю границу отдельно.`,
+          );
+          break;
+        }
+        if (raw === "3" || (raw === "" && !haveFreshGap)) {
+          // Старое поведение: спросить обе даты руками.
+          break;
+        }
+        process.stdout.write(
+          `Введи ${haveFreshGap ? "1, " : ""}2, 3 или Enter (= ${haveFreshGap ? "1" : "3"}).\n`,
+        );
+      }
+    }
+  }
+
   const toRaw = interactive ? "" : (process.env.RAS_DATE_TO ?? "").trim();
-  let endDay = null;
+  let endDay = preEndDay;
   if (toRaw) {
     const parsed = _parseDdMmYyyy(toRaw);
     if (parsed === null) {
@@ -4042,7 +4285,7 @@ async function _promptSetup(headless) {
     }
   }
 
-  let oldestDay = undefined;
+  let oldestDay = preOldestDay;
   if (!interactive && process.env.RAS_DATE_FROM !== undefined) {
     oldestDay = _parseDateFromEnv(process.env.RAS_DATE_FROM, "RAS_DATE_FROM");
     if (oldestDay === undefined && String(process.env.RAS_DATE_FROM).trim() !== "") {
@@ -4700,6 +4943,15 @@ async function main() {
           linksSkippedCategory: 0,
         };
 
+        // Чекпоинт позиции окна: пишем при старте (если процесс упадёт сейчас,
+        // следующий запуск стартанёт с endDay), потом обновляем после каждой
+        // успешной смены outerEnd. SIGINT-handler сохранит текущее значение.
+        if (mode === MODE_DECISION_LINKS) {
+          _currentParserState = { nextEndDay: outerEnd, oldestDay };
+          _saveParserState(_currentParserState);
+          _installParserStateSigintOnce();
+        }
+
         _inWindowLoop = true;
         while (true) {
           if (pendingSubs.length === 0) {
@@ -4739,6 +4991,7 @@ async function main() {
                     `(RAS_EMPTY_WINDOW_STREAK_LIMIT=${RAS_EMPTY_WINDOW_STREAK_LIMIT}). ` +
                     `Чтобы убрать лимит: RAS_EMPTY_WINDOW_STREAK_LIMIT=0`,
                 );
+                if (mode === MODE_DECISION_LINKS) _clearParserState();
                 break;
               }
             }
@@ -4755,7 +5008,12 @@ async function main() {
                 `[range] следующий конец окна ${_formatDdMmYyyy(outerEnd)} раньше ` +
                   `нижней границы ${_formatDdMmYyyy(oldestDay)} — останавливаюсь`,
               );
+              if (mode === MODE_DECISION_LINKS) _clearParserState();
               break;
+            }
+            if (mode === MODE_DECISION_LINKS) {
+              _currentParserState = { nextEndDay: outerEnd, oldestDay };
+              _saveParserState(_currentParserState);
             }
             pendingSubs = [{ endDay: outerEnd, daysSpan: 1 }];
             outerHadItems = false;
