@@ -1,0 +1,223 @@
+#!/usr/bin/env node
+/**
+ * scripts/index-acts-qdrant.js — индексатор актов в Qdrant.
+ *
+ * Берёт из acts: act_text IS NOT NULL AND length(act_text) > 1000
+ *   AND vector_indexed = FALSE.
+ * Режет текст на чанки ~3500 символов с overlap 400, шлёт в /embed (jina v4
+ * через inference/app.py: возвращает multivectors + muvera_vectors), пишет
+ * в Qdrant ras_acts (named vectors muvera + colbert), отмечает строку в PG.
+ *
+ * Запуск (smoke):
+ *   node --env-file=.env scripts/index-acts-qdrant.js 5
+ */
+
+import { createHash } from "node:crypto";
+import process from "node:process";
+
+import { QdrantClient } from "@qdrant/js-client-rest";
+
+const DEFAULT_DSN = "postgresql://ras:ras@127.0.0.1:5432/ras";
+const INFERENCE_URL = process.env.RAS_INFERENCE_URL ?? "http://127.0.0.1:8000";
+const QDRANT_URL = process.env.RAS_QDRANT_URL ?? "http://127.0.0.1:6333";
+const COLLECTION = process.env.RAS_QDRANT_COLLECTION ?? "ras_acts";
+
+const CHUNK_SIZE = 3500;
+const CHUNK_OVERLAP = 400;
+const EMBED_SUB_BATCH = 4; // чанков за один POST /embed (V100 fp16 безопасно)
+
+// Фиксированный namespace для UUIDv5 — детерминированные id точек по (act_id,chunk).
+const QDRANT_ID_NAMESPACE = "b3f1c0a2-1e9d-4f7a-9b1d-7c3a2e4b8d0a";
+
+function log(msg) {
+  process.stdout.write(`${msg}\n`);
+}
+
+function uuidv5(name, namespaceUuid) {
+  const ns = Buffer.from(namespaceUuid.replace(/-/g, ""), "hex");
+  const hash = createHash("sha1").update(ns).update(name).digest();
+  const b = Buffer.from(hash.subarray(0, 16));
+  b[6] = (b[6] & 0x0f) | 0x50;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = b.toString("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
+  const stride = size - overlap;
+  if (stride <= 0) throw new Error("chunk overlap must be < size");
+  const out = [];
+  if (!text) return out;
+  for (let start = 0; start < text.length; start += stride) {
+    const end = Math.min(start + size, text.length);
+    out.push(text.slice(start, end));
+    if (end >= text.length) break;
+  }
+  return out;
+}
+
+async function embedBatch(texts) {
+  const resp = await fetch(`${INFERENCE_URL}/embed`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ texts, task: "retrieval.passage" }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`/embed ${resp.status}: ${body.slice(0, 500)}`);
+  }
+  const data = await resp.json();
+  if (
+    !Array.isArray(data.multivectors) ||
+    !Array.isArray(data.muvera_vectors) ||
+    data.multivectors.length !== texts.length ||
+    data.muvera_vectors.length !== texts.length
+  ) {
+    throw new Error(
+      `/embed bad shape: mv=${data.multivectors?.length} muv=${data.muvera_vectors?.length} expected=${texts.length}`,
+    );
+  }
+  return { multivectors: data.multivectors, muvera_vectors: data.muvera_vectors };
+}
+
+async function embedAllChunks(chunks) {
+  const multivectors = [];
+  const muvera_vectors = [];
+  for (let i = 0; i < chunks.length; i += EMBED_SUB_BATCH) {
+    const sub = chunks.slice(i, i + EMBED_SUB_BATCH);
+    const t0 = Date.now();
+    const out = await embedBatch(sub);
+    const ms = Date.now() - t0;
+    log(`    [embed] ${sub.length} chunks in ${ms}ms`);
+    multivectors.push(...out.multivectors);
+    muvera_vectors.push(...out.muvera_vectors);
+  }
+  return { multivectors, muvera_vectors };
+}
+
+function buildPoints(act, chunks, multivectors, muvera_vectors) {
+  return chunks.map((chunkText, idx) => ({
+    id: uuidv5(`${act.id}:${idx}`, QDRANT_ID_NAMESPACE),
+    vector: {
+      muvera: muvera_vectors[idx],
+      colbert: multivectors[idx],
+    },
+    payload: {
+      unit_type: "chunk",
+      has_colbert: true,
+      act_id: act.id,
+      case_id: act.case_id,
+      case_number: act.case_number,
+      chunk_id: idx,
+      chunk_index: idx,
+      chunk_text: chunkText,
+      court: act.court,
+      registration_date:
+        act.registration_date instanceof Date
+          ? act.registration_date.toISOString().slice(0, 10)
+          : act.registration_date,
+      type_name: act.type_name,
+      true_instance_level: act.true_instance_level,
+      verdict_keep: act.verdict_keep,
+      verdict_action: act.verdict_action,
+    },
+  }));
+}
+
+async function loadPg() {
+  const dsn =
+    process.env.RAS_PG_DSN ?? process.env.DATABASE_URL ?? DEFAULT_DSN;
+  const pg = await import("pg");
+  const Pool = pg.Pool ?? pg.default?.Pool;
+  const pool = new Pool({
+    connectionString: dsn,
+    max: 2,
+    idleTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 10_000,
+  });
+  await pool.query("SELECT 1");
+  return pool;
+}
+
+async function fetchActs(pool, limit) {
+  const { rows } = await pool.query(
+    `SELECT id, case_id, case_number, court, registration_date,
+            type_name, true_instance_level, verdict_keep, verdict_action,
+            act_text
+       FROM acts
+      WHERE act_text IS NOT NULL
+        AND length(act_text) > 1000
+        AND vector_indexed = FALSE
+      ORDER BY registration_date DESC NULLS LAST, id
+      LIMIT $1`,
+    [limit],
+  );
+  return rows;
+}
+
+async function markIndexed(pool, actId, firstPointId) {
+  await pool.query(
+    `UPDATE acts
+        SET vector_indexed = TRUE,
+            vector_indexed_at = NOW(),
+            qdrant_point_id = $2
+      WHERE id = $1`,
+    [actId, firstPointId],
+  );
+}
+
+async function main() {
+  const limitArg = Number.parseInt(process.argv[2] ?? "5", 10);
+  const limit = Number.isFinite(limitArg) && limitArg > 0 ? limitArg : 5;
+  log(`[setup] limit=${limit} inference=${INFERENCE_URL} qdrant=${QDRANT_URL} collection=${COLLECTION}`);
+
+  const pool = await loadPg();
+  const qdrant = new QdrantClient({ url: QDRANT_URL });
+
+  // sanity: коллекция существует
+  try {
+    const info = await qdrant.getCollection(COLLECTION);
+    log(
+      `[setup] qdrant collection ok: vectors=${Object.keys(info.config?.params?.vectors ?? {}).join(",")} points_count=${info.points_count}`,
+    );
+  } catch (e) {
+    throw new Error(`Qdrant коллекция ${COLLECTION} недоступна: ${e.message}`);
+  }
+
+  const acts = await fetchActs(pool, limit);
+  log(`[setup] взял ${acts.length} актов из PG`);
+
+  let okCount = 0;
+  let totalChunks = 0;
+  for (const act of acts) {
+    log(`\n[act ${act.id}] case=${act.case_number} type="${act.type_name}" il=${act.true_instance_level} len=${act.act_text.length}`);
+    try {
+      const chunks = chunkText(act.act_text);
+      log(`  [chunk] ${chunks.length} чанков по ~${CHUNK_SIZE} (overlap ${CHUNK_OVERLAP})`);
+
+      const { multivectors, muvera_vectors } = await embedAllChunks(chunks);
+      const points = buildPoints(act, chunks, multivectors, muvera_vectors);
+
+      const t0 = Date.now();
+      await qdrant.upsert(COLLECTION, { wait: true, points });
+      log(`  [qdrant] upsert ${points.length} points in ${Date.now() - t0}ms`);
+
+      await markIndexed(pool, act.id, points[0].id);
+      log(`  [pg] vector_indexed=TRUE qdrant_point_id=${points[0].id}`);
+
+      okCount += 1;
+      totalChunks += points.length;
+    } catch (e) {
+      process.stderr.write(`  [error] ${e.stack ?? e.message ?? e}\n`);
+    }
+  }
+
+  log(`\n[done] indexed ${okCount}/${acts.length} acts, ${totalChunks} chunks total`);
+
+  await pool.end().catch(() => {});
+}
+
+main().catch((e) => {
+  process.stderr.write(`[fatal] ${e.stack ?? e.message ?? e}\n`);
+  process.exit(1);
+});

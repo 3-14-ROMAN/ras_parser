@@ -43,6 +43,20 @@ import {
 } from "./network/escalator.js";
 import { RasProxyClient } from "./network/proxyClient.js";
 import { StealthBrowserManager } from "./stealthManager.js";
+import { closePool as _pgClosePool, isPgConfigured as _pgIsConfigured } from "./db/pgClient.js";
+import { upsertActs as _pgUpsertActs } from "./db/actsRepo.js";
+import {
+  acquireSingleOrThrow as _leaseAcquire,
+  releaseAll as _leaseReleaseAll,
+  releaseDeadLocalLeases as _leaseReleaseDeadLocal,
+  startHeartbeat as _leaseStartHeartbeat,
+} from "./db/proxyLeases.js";
+import {
+  attachRasAntiDetectToContext,
+  buildRasBrowserFingerprint,
+  getRasChromiumLaunchAntiDetect,
+} from "./network/rasBrowserProfile.js";
+import { classifyMetadataResponse } from "./network/metadataResponseDetect.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,10 +68,6 @@ const PARSED_DATA_DIR = path.join(PROJECT_DIR, "parsed_data");
 const OUT_PATH = path.join(PARSED_DATA_DIR, "document_types.json");
 
 const DEBUG_DIR = path.join(PROJECT_DIR, "debug");
-const LINKS_OUT_PATH = path.join(PARSED_DATA_DIR, "decision_links.json");
-const LINKS_FILE_BASENAME = "decision_links";
-const LINKS_CHUNK_SIZE = 3000;
-const LINKS_CHUNK_NAME_RE = /^decision_links_(\d{4})\.json$/;
 /**
  * Панель комбобокса «Категория спора» по заголовку секции.
  * Якорь XPath устойчивее `#caseCategory` при дубликатах id / смене разметки.
@@ -154,28 +164,189 @@ const WAIT_FOR_SEARCH_MS = Math.max(
   5_000,
   Number.parseInt(process.env.RAS_WAIT_SEARCH_MS ?? "60000", 10) || 60_000,
 );
+/**
+ * Дополнительная пауза после goto BASE_URL и `smartWait('warmup')` —
+ * pravocaptcha-JS на ras.arbitr.ru делает background challenge ПОСЛЕ
+ * DOMContentLoaded; без неё первый POST /Search на свежем IP может
+ * прилететь tokenFrom-HTML (видели в PDF-flow, см. PDF_PRAVO_WAIT_MS).
+ * 0 → отключено (старое поведение).
+ */
+const RAS_META_PRAVO_WAIT_MS = Math.max(
+  0,
+  Number.parseInt(process.env.RAS_META_PRAVO_WAIT_MS ?? "2500", 10) || 0,
+);
+/** Сколько antifraud_gate подряд переживаем до эскалации `_recoverFrom`. */
+const META_ANTIFRAUD_GATE_RECOVER_AFTER = Math.max(
+  1,
+  Number.parseInt(process.env.RAS_META_ANTIFRAUD_GATE_RECOVER_AFTER ?? "3", 10) || 3,
+);
+
+const _sleepMs = (ms) =>
+  ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 
 const DEFAULT_HEADLESS = (process.env.RAS_HEADLESS ?? "1") === "1";
 const XVFB_DISPLAY_NUM = String(process.env.RAS_DISPLAY_NUM ?? "99").trim() || "99";
 const XVFB_DISPLAY_ID = `:${XVFB_DISPLAY_NUM}`;
 const XVFB_SCREEN_GEOMETRY = process.env.RAS_SCREEN_GEOMETRY ?? "1920x1080x24";
 
-const USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36";
-const SEC_CH_UA =
-  '"Google Chrome";v="124", "Chromium";v="124", "Not.A/Brand";v="99"';
-const SEC_CH_UA_PLATFORM = '"Linux"';
-
 const documentTypes = {};
 const decisionLinks = new Map();
 const MODE_TYPES = "types";
 const MODE_DECISION_LINKS = "decision_links";
+/**
+ * «Специфичные» TypeId — три RAS-категории, у которых InstanceLevel и Court
+ * в метаданных всегда соответствуют документу. Это базовый набор для отбора
+ * итоговых мотивированных актов. Можно переопределить через RAS_TARGET_TYPE_IDS
+ * или CLI-промпт, но дефолт — именно эти три.
+ */
 const DEFAULT_DECISION_TYPE_IDS = [
-  "75babf17-1eef-40df-b51a-92957310aab7",
-  "edac92ae-4dbe-49d7-8412-2fc7f4d5e827",
-  "ae1a12e4-23b3-4f9a-9c26-3793218ea772",
+  "75babf17-1eef-40df-b51a-92957310aab7", // Решение (1-я инст.)
+  "edac92ae-4dbe-49d7-8412-2fc7f4d5e827", // Постановление апелляции
+  "ae1a12e4-23b3-4f9a-9c26-3793218ea772", // Постановление кассации
 ];
+
+/**
+ * Зонтичный TypeId «Решения и постановления» — служебная категория RAS, в
+ * которой смешаны и итоговые мотивированные акты, и резолютивки/судприказы.
+ * Внутри зонта различает реальный жанр первый GUID `ContentTypesString`.
+ *
+ * Правило выведено по выборке март 2024/2025/2026 (47 991 запись) и
+ * валидировано на 2-й неделе апреля 2022–2026 (20 144 raw → 8 131 KEEP).
+ */
+const UMBRELLA_DECISION_TYPE_ID = "23f4baa9-e7cc-407a-aba7-11dd8772aa3b";
+
+/** Жанры внутри umbrella, которые считаем итоговыми мотивированными актами. */
+const UMBRELLA_FINAL_GENRE_GUIDS = new Set([
+  "1c35af3f-06d5-4b90-b4be-5a3c4148d8be", // Решение суда первой инстанции
+  "08f888a2-83ad-4fdf-8985-f77fe2085f11", // Мотивированное решение упрощённого производства
+  "1d294878-a2f8-471d-a55b-faee3b33da53", // Постановление апелляции
+  "08cbe371-f82b-423b-9252-3211c4a3f52e", // Постановление апелляции (вариант, бывает IL=1)
+  "b74eecb7-28bd-470d-89bc-bc7fe46e8f6f", // Постановление апелляции по существу спора
+  "9d26156d-a770-43cf-81f9-def01baf3e77", // Постановление кассации
+  "171b5aca-eaa6-4e2b-b68c-42489b2e100c", // Постановление кассации (вариант, бывает IL=1)
+  "cfd700af-8d88-4171-99d5-7ed2008657c3", // Решение кассации (68-ФЗ, IL=1 — норма)
+  "db0af13c-2d10-4677-812e-c55e90a894bd", // Дополнительное решение
+  "8a67b151-5fb1-4fe0-9068-24a5895d41ba", // Дополнительное постановление
+]);
+
+/**
+ * Маппинг жанра umbrella в реальный InstanceLevel. Для umbrella-записей
+ * `InstanceLevel` отражает карточку дела, а не сам документ (пример: акты
+ * 17-го ААС часто приходят с Court="АС Пермского края" и IL=1). Истинная
+ * инстанция определяется по жанру.
+ */
+const GENRE_TO_INSTANCE_LEVEL = new Map([
+  ["1c35af3f-06d5-4b90-b4be-5a3c4148d8be", 1],
+  ["08f888a2-83ad-4fdf-8985-f77fe2085f11", 1],
+  ["db0af13c-2d10-4677-812e-c55e90a894bd", 1],
+  ["cfd700af-8d88-4171-99d5-7ed2008657c3", 1],
+  ["1d294878-a2f8-471d-a55b-faee3b33da53", 2],
+  ["08cbe371-f82b-423b-9252-3211c4a3f52e", 2],
+  ["b74eecb7-28bd-470d-89bc-bc7fe46e8f6f", 2],
+  ["8a67b151-5fb1-4fe0-9068-24a5895d41ba", 2],
+  ["9d26156d-a770-43cf-81f9-def01baf3e77", 3],
+  ["171b5aca-eaa6-4e2b-b68c-42489b2e100c", 3],
+]);
+
+const UMBRELLA_DECISION_TYPE_ID_NORMALIZED = UMBRELLA_DECISION_TYPE_ID; // hex-only — нормализуется в себя
+
+/**
+ * Специфичный TypeId → истинная инстанция документа. TypeId сам по себе фиксирует уровень
+ * (решение 1-й, постановление апелляции, постановление кассации), `item.InstanceLevel`
+ * для known TypeId мы НЕ используем — один источник правды (см. _resolveInstanceLevel).
+ */
+const SPECIFIC_TYPE_ID_TO_INSTANCE_LEVEL = new Map([
+  ["75babf17-1eef-40df-b51a-92957310aab7", 1],
+  ["edac92ae-4dbe-49d7-8412-2fc7f4d5e827", 2],
+  ["ae1a12e4-23b3-4f9a-9c26-3793218ea772", 3],
+]);
+
+/** Известный «мусор» внутри umbrella — отбрасывается без алёрта (см. CLAUDE.md). */
+const UMBRELLA_KNOWN_NOISE_GUIDS = new Set([
+  "c922ae18-151f-4fda-93d7-b442d4555a06", // резолютивка упрощёнки
+  "e6dd1e2a-d64e-44bb-8ef2-614d53e432a1", // судебный приказ
+  "e2bf364f-e3a2-4431-8d45-aaf7f5732679", // банкротство физлица
+]);
+
+/**
+ * Класс действия акта — для определения «качаем или параша» (verdict.keep).
+ * Полярность из `outcome_polarity.json` говорит «полезно ли это инициатору», а action —
+ * форма действия суда (что именно произошло), которая решает судьбу акта в RAG.
+ */
+const OUTCOME_ACTION = Object.freeze({
+  GRANT: "grant",                   // удовлетворить иск/требование (substantive)
+  DENY: "deny",                     // отказать в иске (substantive)
+  UPHOLD_LOWER: "uphold_lower",     // оставить без изменения — финал лежит ниже
+  CANCEL_NEW: "cancel_new",         // отменить + принять новый — этот акт ЕСТЬ финал
+  MODIFY: "modify",                 // изменить + (часто) принять новый
+  CANCEL_RESTORE_LOWER: "cancel_restore_lower", // касса отменила апелляцию, оставила в силе 1-ю
+  REMAND: "remand",                 // направить на новое рассмотрение
+  TERMINATE: "terminate",           // прекратить производство по делу/жалобе
+  LEAVE_UNCONSIDERED: "leave_unconsidered", // оставить без рассмотрения / возврат заявления
+  SETTLEMENT: "settlement",         // мировое соглашение
+  WITHDRAWAL: "withdrawal",         // принять отказ от иска
+  REOPEN: "reopen",                 // отменён по вновь открывшимся
+  BANKRUPTCY_GRANT: "bankruptcy_grant", // признать банкротом (substantive в банкротном)
+  PROCEDURAL: "procedural",         // расходы / пошлина / обеспечение — фон
+  UNKNOWN: "unknown",
+});
+
+/** Action'ы, которые означают «есть рассмотрение по существу / выводы по делу». */
+const SUBSTANTIVE_ACTIONS = new Set([
+  OUTCOME_ACTION.GRANT,
+  OUTCOME_ACTION.DENY,
+  OUTCOME_ACTION.CANCEL_NEW,
+  OUTCOME_ACTION.MODIFY,
+  OUTCOME_ACTION.BANKRUPTCY_GRANT,
+  OUTCOME_ACTION.UPHOLD_LOWER,
+  OUTCOME_ACTION.CANCEL_RESTORE_LOWER,
+]);
+
+/** Action'ы, при которых дело не завершено по существу (новое рассмотрение / прекращение). */
+const NON_RESOLVING_ACTIONS = new Set([
+  OUTCOME_ACTION.REMAND,
+  OUTCOME_ACTION.TERMINATE,
+  OUTCOME_ACTION.SETTLEMENT,
+  OUTCOME_ACTION.WITHDRAWAL,
+  OUTCOME_ACTION.LEAVE_UNCONSIDERED,
+  OUTCOME_ACTION.REOPEN,
+]);
+
+/** Action'ы, при которых акт точно НЕ финал по существу (per-act preliminary verdict). */
+const SKIP_ACTIONS = new Set([
+  OUTCOME_ACTION.REMAND,
+  OUTCOME_ACTION.TERMINATE,
+  OUTCOME_ACTION.SETTLEMENT,
+  OUTCOME_ACTION.WITHDRAWAL,
+  OUTCOME_ACTION.LEAVE_UNCONSIDERED,
+  OUTCOME_ACTION.REOPEN,
+  OUTCOME_ACTION.UPHOLD_LOWER,         // финал лежит на нижнем уровне
+  OUTCOME_ACTION.CANCEL_RESTORE_LOWER, // финал — нижестоящий восстановленный акт
+]);
+
+/**
+ * Приоритет при выборе ОДНОГО главного action из нескольких outcome-кодов одного акта.
+ * Высший — решающий. «Процессуальный путь» (remand/...) > «уход в силу нижнего» >
+ * «новый акт» > «удовлетворение по существу» > «фон».
+ */
+const ACTION_PRIORITY = Object.freeze({
+  [OUTCOME_ACTION.REMAND]: 100,
+  [OUTCOME_ACTION.TERMINATE]: 90,
+  [OUTCOME_ACTION.SETTLEMENT]: 85,
+  [OUTCOME_ACTION.WITHDRAWAL]: 85,
+  [OUTCOME_ACTION.LEAVE_UNCONSIDERED]: 80,
+  [OUTCOME_ACTION.REOPEN]: 75,
+  [OUTCOME_ACTION.CANCEL_RESTORE_LOWER]: 70,
+  [OUTCOME_ACTION.UPHOLD_LOWER]: 60,
+  [OUTCOME_ACTION.CANCEL_NEW]: 55,
+  [OUTCOME_ACTION.MODIFY]: 50,
+  [OUTCOME_ACTION.GRANT]: 40,
+  [OUTCOME_ACTION.DENY]: 35,
+  [OUTCOME_ACTION.BANKRUPTCY_GRANT]: 30,
+  [OUTCOME_ACTION.PROCEDURAL]: 5,
+  [OUTCOME_ACTION.UNKNOWN]: 0,
+});
+
 let _currentMode = MODE_TYPES;
 
 const _captured = {
@@ -253,7 +424,17 @@ function _sanitizeReplayHeaders(headers) {
   return h;
 }
 
+// Rolling buffer для последних N XHR-событий — для диагностического дампа в
+// `_dumpDebug` после первой сессии (см. ниже). Раньше был unbounded array,
+// рос всю жизнь процесса; на месячных прогонах съедал заметную память.
+const _RESPONSE_LOG_CAP = 200;
 const _responseLog = [];
+function _pushResponseLog(line) {
+  _responseLog.push(line);
+  if (_responseLog.length > _RESPONSE_LOG_CAP) {
+    _responseLog.splice(0, _responseLog.length - _RESPONSE_LOG_CAP);
+  }
+}
 let _firstItemLogged = false;
 let _searchDumpIdx = 0;
 
@@ -284,8 +465,27 @@ function log(msg) {
   process.stdout.write(`[${ts}] ${text}\n`);
 }
 
-function _dumpSearchResponse(_label, _body, _suffix = "json") {
-  return null;
+function _dumpSearchResponse(label, body, suffix = "json") {
+  if (!process.env.RAS_DUMP_SEARCH) return null;
+  try {
+    const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "debug");
+    fs.mkdirSync(dir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 80);
+    const file = path.join(dir, `search-${ts}-${safeLabel}.${suffix}`);
+    if (Buffer.isBuffer(body)) {
+      fs.writeFileSync(file, body);
+    } else if (typeof body === "string") {
+      fs.writeFileSync(file, body, "utf-8");
+    } else {
+      fs.writeFileSync(file, JSON.stringify(body, null, 2), "utf-8");
+    }
+    log(`[dump] ${file}`);
+    return file;
+  } catch (e) {
+    log(`[dump] ${label}: ${e}`);
+    return null;
+  }
 }
 
 function _detectChromiumExecutable() {
@@ -329,6 +529,7 @@ function _detectChromiumExecutable() {
 }
 
 function _launchKwargs() {
+  const anti = getRasChromiumLaunchAntiDetect();
   const kwargs = {
     headless: DEFAULT_HEADLESS,
     proxy: {
@@ -336,18 +537,28 @@ function _launchKwargs() {
       username: PROXY_USER,
       password: PROXY_PASS,
     },
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--window-size=1366,900",
-    ],
+    ignoreDefaultArgs: anti.ignoreDefaultArgs,
+    args: anti.args,
   };
   const exe = process.env.RAS_CHROME || _detectChromiumExecutable();
   if (exe) {
     kwargs.executablePath = exe;
   }
   return kwargs;
+}
+
+/** Временный профиль или фиксированный каталог (куки/LocalStorage между прогонами). */
+function _resolveParserBrowserUserDataDir() {
+  const persist = process.env.RAS_BROWSER_USER_DATA_DIR?.trim();
+  if (persist) {
+    const dir = path.resolve(persist);
+    fs.mkdirSync(dir, { recursive: true });
+    return { dir, persistent: true };
+  }
+  return {
+    dir: fs.mkdtempSync(path.join(os.tmpdir(), "ras_chromium_")),
+    persistent: false,
+  };
 }
 
 function _isSearchUrl(u) {
@@ -485,6 +696,8 @@ function _buildDecisionMetadata(item) {
 function _buildDecisionRecord(item, typeId, pdfUrl) {
   const [typeIdFromItem, typeName] = _extractDocType(item);
   const cardUrl = _buildCaseCardUrl(item);
+  const verdict = _classifyAct(item);
+  const decisionTypeIdRaw = item?.DecisionTypeId ?? null;
   return {
     link: pdfUrl,
     pdfLink: pdfUrl,
@@ -493,13 +706,103 @@ function _buildDecisionRecord(item, typeId, pdfUrl) {
     typeName: typeName != null ? String(typeName).trim() || null : null,
     id: item?.Id ?? null,
     caseId: item?.CaseId ?? null,
+    caseNumber: item?.CaseNumber ?? null,
+    instanceNumber: item?.InstanceNumber ?? null,
     fileName: item?.FileName ?? null,
     registrationDate: item?.RegistrationDate ?? null,
     displayDate: item?.DisplayDate ?? null,
+    court: item?.Court ?? null,
+    decisionTypeId: decisionTypeIdRaw ? _normalizeTypeIdValue(decisionTypeIdRaw) : null,
+    contentTypesString: item?.ContentTypesString ?? null,
+    contentTypes: Array.isArray(item?.ContentTypes) ? item.ContentTypes : null,
+    signatureInfo: item?.SignatureInfo ?? null,
+    sphinxId: Number.isFinite(item?.SphinxId) ? item.SphinxId : null,
+    documentCount: Number.isInteger(item?.DocumentCount) ? item.DocumentCount : null,
+    // Сырой `InstanceLevel` из /Search (как RAS отдал; для umbrella отражает
+    // уровень КАРТОЧКИ ДЕЛА, не самого документа — может расходиться с trueInstanceLevel).
+    rawInstanceLevel: Number.isInteger(item?.InstanceLevel) ? item.InstanceLevel : null,
+    // Истинный уровень инстанции документа: specific TypeId → жёсткая карта,
+    // umbrella → жанр (firstCts). По этому полю кросс-резолвер группирует акты дела.
+    trueInstanceLevel: verdict.realCourtLevel,
+    // Финальный вердикт «качаем (1) / параша (0)». До первого _saveDecisionLinks
+    // здесь стоит per-act preliminary значение; _resolveCaseVerdicts перед апсертом
+    // в PG пересчитает с учётом цепочки инстанций (4 ИСХОДа из спеки).
+    //   note=null      — простой случай (только 1-я инст. финал) либо не главный акт;
+    //   note="засилено …" — финал ниже, потому что вышестоящие оставили в силе;
+    //   note="отменено …" — финал на этом уровне;
+    //   note="новое рассмотрение" / "прекращение" — keep=0, нет финала по существу.
+    verdict: {
+      keep: verdict.keep,
+      note: null,
+      action: verdict.action,
+      outcomes: verdict.outcomes,
+    },
     metadata: _buildDecisionMetadata(item),
     // На случай редкого расхождения сырого и нормализованного id типа.
     sourceTypeId: typeIdFromItem ?? null,
   };
+}
+
+/** Первый GUID из `ContentTypesString` (или пустая строка). */
+function _firstContentTypesGuid(item) {
+  const raw = item?.ContentTypesString;
+  if (typeof raw !== "string" || !raw) return "";
+  const idx = raw.indexOf(",");
+  return (idx === -1 ? raw : raw.slice(0, idx)).trim();
+}
+
+/**
+ * Двухуровневый фильтр «итоговый мотивированный акт?» для одной /Search-записи.
+ *
+ *   final_motivated_act =
+ *     TypeId ∈ targetSpecificTids (нормализованный Set)
+ *     OR (TypeId == UMBRELLA_DECISION_TYPE_ID
+ *         AND firstGuid(ContentTypesString) ∈ UMBRELLA_FINAL_GENRE_GUIDS)
+ *
+ * Подробный разбор аномалий и обоснование — в CLAUDE.md, разделы
+ * «Главное правило отбора» и «Аномалии метаданных».
+ *
+ * @param {any} item raw /Search-item
+ * @param {Set<string>} targetSpecificTids нормализованные id «специфичных» TypeId
+ * @returns {boolean}
+ */
+function _isFinalMotivatedAct(item, targetSpecificTids) {
+  const tid = _extractDocumentTypeId(item);
+  if (!tid) return false;
+  if (targetSpecificTids && targetSpecificTids.has(tid)) return true;
+  if (tid !== UMBRELLA_DECISION_TYPE_ID_NORMALIZED) return false;
+  return UMBRELLA_FINAL_GENRE_GUIDS.has(_firstContentTypesGuid(item));
+}
+
+/**
+ * Истинный уровень инстанции документа — НЕ доверяет `item.InstanceLevel`:
+ *   1. Специфичный TypeId → SPECIFIC_TYPE_ID_TO_INSTANCE_LEVEL (TypeId сам фиксирует уровень).
+ *   2. Umbrella → первый GUID `ContentTypesString` (жанр) через GENRE_TO_INSTANCE_LEVEL.
+ *   3. Иначе (кастомный TypeId через RAS_TARGET_TYPE_IDS) → fallback на item.InstanceLevel.
+ *
+ * Зачем так: для umbrella `item.InstanceLevel` отражает карточку дела (например, IL=1
+ * при постановлении 17-го ААС с Court="АС Пермского края"). Для consistency и для
+ * specific TypeId тоже игнорируем `item.InstanceLevel` — один источник правды.
+ * Сырое значение сохраняется отдельно в record.rawInstanceLevel для отладки/анализа.
+ *
+ * @param {any} item raw /Search-item
+ * @param {string} [normalizedTid] заранее нормализованный TypeId (опционально, для скорости)
+ * @returns {number|null}
+ */
+function _resolveInstanceLevel(item, normalizedTid) {
+  const tid = normalizedTid ?? _extractDocumentTypeId(item);
+  if (!tid) {
+    const il = item?.InstanceLevel;
+    return Number.isInteger(il) ? il : null;
+  }
+  const specific = SPECIFIC_TYPE_ID_TO_INSTANCE_LEVEL.get(tid);
+  if (specific !== undefined) return specific;
+  if (tid === UMBRELLA_DECISION_TYPE_ID_NORMALIZED) {
+    const il = GENRE_TO_INSTANCE_LEVEL.get(_firstContentTypesGuid(item));
+    if (Number.isInteger(il)) return il;
+  }
+  const fallback = item?.InstanceLevel;
+  return Number.isInteger(fallback) ? fallback : null;
 }
 
 function _extractDocumentTypeId(item) {
@@ -512,59 +815,585 @@ function _extractDocumentTypeId(item) {
   return _normalizeTypeIdValue(raw);
 }
 
-function _saveDecisionLinks() {
-  const rows = [...decisionLinks.values()].map((row, idx) => ({
-    n: idx + 1,
-    ...row,
-  }));
-  const totalChunks = Math.max(1, Math.ceil(rows.length / LINKS_CHUNK_SIZE));
-  /** @type {Set<string>} */
-  const activeChunkNames = new Set();
+// ═════════════════════════════════════════════════════════════════════════════
+//   КЛАССИФИКАТОР ИСХОДОВ + PER-ACT VERDICT
+// ═════════════════════════════════════════════════════════════════════════════
 
-  for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx += 1) {
-    const from = chunkIdx * LINKS_CHUNK_SIZE;
-    const to = from + LINKS_CHUNK_SIZE;
-    const chunkRows = rows.slice(from, to);
-    const chunkName = `${LINKS_FILE_BASENAME}_${String(chunkIdx + 1).padStart(4, "0")}.json`;
-    const chunkPath = path.join(PARSED_DATA_DIR, chunkName);
-    const payload = {
-      summary: {
-        total: rows.length,
-        chunkIndex: chunkIdx + 1,
-        chunkTotal: totalChunks,
-        chunkSize: LINKS_CHUNK_SIZE,
-      },
-      results: chunkRows,
-    };
-    fs.writeFileSync(chunkPath, JSON.stringify(payload, null, 2), "utf-8");
-    activeChunkNames.add(chunkName);
+/**
+ * Классификация русского outcome-текста (полярность + action). Порядок regexp
+ * важен — специфичные паттерны идут раньше. Покрывает 100% всех 81 GUID из
+ * `outcome_polarity.json` и все 50 уникальных umbrella-текстов из выборки
+ * `parsed_data3/`. Возвращает `OUTCOME_ACTION.UNKNOWN` при отсутствии совпадений.
+ */
+function _classifyActionByText(rawText) {
+  const t = String(rawText ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t) return OUTCOME_ACTION.UNKNOWN;
+
+  // 1. Касса: отменить нижестоящее, оставить в силе ещё более нижнее (ст. 287 п.5 АПК)
+  if (/отменить.+оставить в силе/.test(t)) return OUTCOME_ACTION.CANCEL_RESTORE_LOWER;
+
+  // 2. Направление на новое рассмотрение (даже если перед этим отмена)
+  if (/(направить|передать).+(на новое рассмотрение|новый рассмотр)/.test(t)) {
+    return OUTCOME_ACTION.REMAND;
+  }
+  if (/направить вопрос на новое рассмотрение/.test(t)) return OUTCOME_ACTION.REMAND;
+
+  // 3. Мировое / отказ от иска
+  if (/(утвердить мировое|мировое соглашение)/.test(t)) return OUTCOME_ACTION.SETTLEMENT;
+  if (/принять отказ от иска/.test(t)) return OUTCOME_ACTION.WITHDRAWAL;
+
+  // 4. Прекращение производства
+  if (/прекратить производство по делу/.test(t)) return OUTCOME_ACTION.TERMINATE;
+  if (/прекратить производство по (апелляционной|кассационной|встречн)/.test(t)) {
+    return OUTCOME_ACTION.TERMINATE;
   }
 
-  let parsedEntries = [];
+  // 5. Оставить без рассмотрения / возвратить заявление
+  if (/оставить без рассмотрения/.test(t)) return OUTCOME_ACTION.LEAVE_UNCONSIDERED;
+  if (/возвратить заявление/.test(t)) return OUTCOME_ACTION.LEAVE_UNCONSIDERED;
+
+  // 6. Вновь открывшиеся / новые обстоятельства
+  if (/(вновь открывшимся|новым обстоятельствам)/.test(t)) return OUTCOME_ACTION.REOPEN;
+  if (/(назначить.+заседание|предварительное судебное заседание).+(вновь открывшимся|новым обстоятельствам)/.test(t)) {
+    return OUTCOME_ACTION.REOPEN;
+  }
+
+  // 7. Оставить без изменения — нижестоящий акт остаётся финалом.
+  //    Polarity: «Оставить без изменения <X>». Umbrella: «Оставить <X> без изменения, жалобу...».
+  if (/оставить(?:.{0,160}?)?без изменения/.test(t)) return OUTCOME_ACTION.UPHOLD_LOWER;
+
+  // 8. Отменить + принять новый / разрешить вопрос по существу — этот акт ЕСТЬ финал
+  if (/(отменить|изменить).+(принять новый|разрешить вопрос по существу|и принять по делу новый)/.test(t)) {
+    return /изменить/.test(t) ? OUTCOME_ACTION.MODIFY : OUTCOME_ACTION.CANCEL_NEW;
+  }
+
+  // 9. "Изменить решение/постановление/определение" — в polarity встречается
+  if (/^изменить (решение|постановление|определение)/.test(t)) return OUTCOME_ACTION.MODIFY;
+
+  // 10. "Отменить решение/постановление/определение [полностью|в части]" без сопутствующих —
+  //     самостоятельный финал.
+  if (/^отменить (полностью |в части )?(решение|постановление|определение|судебный акт)/.test(t)) {
+    return OUTCOME_ACTION.CANCEL_NEW;
+  }
+
+  // 11. Удовлетворение иска/требования/ходатайства/заявления
+  if (/(удовлетворить иск|иск удовлетворить|удовлетворить требование|удовлетворить (встречный иск|иное требование|ходатайство|заявление)|удовлетворить заявление)/.test(t)) {
+    if (/(фз о несостоятельности|банкрот|финансового управляющего)/.test(t)) {
+      return OUTCOME_ACTION.BANKRUPTCY_GRANT;
+    }
+    return OUTCOME_ACTION.GRANT;
+  }
+  if (/признать.+обоснованным.+банкрот/.test(t) || /признать.+гражданина банкротом/.test(t)) {
+    return OUTCOME_ACTION.BANKRUPTCY_GRANT;
+  }
+
+  // 12. Отказ в иске / в удовлетворении ходатайства / в признании акта незаконным
+  if (/(в иске отказать|отказать в иске|отказать во встречном иске)/.test(t)) {
+    return OUTCOME_ACTION.DENY;
+  }
+  if (/отказать в удовлетворении (заявления|ходатайства)/.test(t)) {
+    return OUTCOME_ACTION.DENY;
+  }
+  if (/отказать в признании/.test(t)) return OUTCOME_ACTION.DENY;
+  if (/признать.+(незаконн|недействительн)/.test(t)) return OUTCOME_ACTION.GRANT;
+
+  // 13. Процессуальные коды (расходы, пошлина, обеспечение, замена стороны, ...)
+  if (/восстановить срок/.test(t)) return OUTCOME_ACTION.PROCEDURAL;
+  if (/(судебные расходы|госпошлин|депозитного счета|правопреемник|обеспечительн|наложение ареста|отменить обеспечение|управляющ|веб-конференц|уменьшить размер госпошлины)/.test(t)) {
+    return OUTCOME_ACTION.PROCEDURAL;
+  }
+
+  return OUTCOME_ACTION.UNKNOWN;
+}
+
+/**
+ * Лениво загружает справочник полярности из `outcome_polarity.json`.
+ * Map: guid → { polarity, text, action }. action — из `_classifyActionByText(text)`.
+ */
+let _OUTCOME_POL_BY_GUID = null;
+function _getOutcomePolarityByGuid() {
+  if (_OUTCOME_POL_BY_GUID) return _OUTCOME_POL_BY_GUID;
+  _OUTCOME_POL_BY_GUID = new Map();
+  const polarityPath = path.join(PROJECT_DIR, "outcome_polarity.json");
+  let raw;
   try {
-    parsedEntries = fs.readdirSync(PARSED_DATA_DIR);
+    raw = fs.readFileSync(polarityPath, "utf-8");
   } catch (e) {
-    log(`[save] не прочитал папку ${PARSED_DATA_DIR} для очистки старых chunks: ${e}`);
-    return;
+    log(`[outcome] ⚠ ${polarityPath} не прочитан: ${e}. Verdict.action будет UNKNOWN для specific TypeId.`);
+    return _OUTCOME_POL_BY_GUID;
   }
-  for (const name of parsedEntries) {
-    if (!LINKS_CHUNK_NAME_RE.test(name)) continue;
-    if (activeChunkNames.has(name)) continue;
-    const stalePath = path.join(PARSED_DATA_DIR, name);
-    try {
-      fs.unlinkSync(stalePath);
-    } catch (e) {
-      log(`[save] не удалил старый chunk ${stalePath}: ${e}`);
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    log(`[outcome] ⚠ ${polarityPath} битый JSON: ${e}.`);
+    return _OUTCOME_POL_BY_GUID;
+  }
+  for (const polarity of ["positive", "negative", "neutral"]) {
+    const arr = Array.isArray(data?.[polarity]) ? data[polarity] : [];
+    for (const c of arr) {
+      const guid = _normalizeTypeIdValue(c?.guid);
+      if (!guid) continue;
+      const text = typeof c?.text === "string" ? c.text : "";
+      _OUTCOME_POL_BY_GUID.set(guid, {
+        polarity,
+        text,
+        action: _classifyActionByText(text),
+      });
+    }
+  }
+  log(`[outcome] загружено ${_OUTCOME_POL_BY_GUID.size} outcome-кодов из ${polarityPath}`);
+  return _OUTCOME_POL_BY_GUID;
+}
+
+/**
+ * Возвращает список outcome-ов одного акта.
+ * - specific TypeId: GUIDs из `ContentTypesString` (lookup по polarity dict);
+ *     если GUID не в polarity — text-fallback по соответствующему `ContentTypes[i]`.
+ * - umbrella TypeId: текст `ContentTypes[1]` (genre = ContentTypes[0] игнорируем).
+ *     У genre'ов 08f888a2 / db0af13c / 8a67b151 (упрощёнка / доп. решение / доп.
+ *     постановление) outcome в /Search отсутствует — список пуст, action верхнего уровня UNKNOWN.
+ */
+function _extractActOutcomes(item) {
+  const typeId = _extractDocumentTypeId(item);
+  const dict = _getOutcomePolarityByGuid();
+  /** @type {Array<{ guid: string|null, text: string, polarity: string|null, action: string }>} */
+  const out = [];
+
+  if (typeId === UMBRELLA_DECISION_TYPE_ID_NORMALIZED) {
+    const ct = Array.isArray(item?.ContentTypes) ? item.ContentTypes : [];
+    const outcomeText = (ct[1] ?? "").trim();
+    if (outcomeText) {
+      out.push({
+        guid: null,
+        text: outcomeText,
+        polarity: null,
+        action: _classifyActionByText(outcomeText),
+      });
+    }
+    return out;
+  }
+
+  // specific / кастомные TypeIds: outcome'ы — GUID'ы в ContentTypesString.
+  // Параллельный массив `item.ContentTypes` обычно содержит соответствующие тексты;
+  // используем как fallback, если GUID не в polarity (определения по обесп. мерам и т.п.).
+  const raw = item?.ContentTypesString;
+  if (typeof raw !== "string" || !raw) return out;
+  const ctTexts = Array.isArray(item?.ContentTypes) ? item.ContentTypes : [];
+  const guids = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  for (let i = 0; i < guids.length; i++) {
+    const guid = _normalizeTypeIdValue(guids[i]);
+    if (!guid) continue;
+    const meta = dict.get(guid);
+    if (meta) {
+      out.push({ guid, text: meta.text, polarity: meta.polarity, action: meta.action });
+      continue;
+    }
+    const fbText = typeof ctTexts[i] === "string" ? ctTexts[i].trim() : "";
+    const fbAction = fbText ? _classifyActionByText(fbText) : OUTCOME_ACTION.UNKNOWN;
+    out.push({ guid, text: fbText, polarity: null, action: fbAction });
+  }
+  return out;
+}
+
+/** Главный action из массива outcome'ов — по `ACTION_PRIORITY`. */
+function _pickPrimaryAction(outcomes) {
+  let best = OUTCOME_ACTION.UNKNOWN;
+  let bestP = -1;
+  for (const o of outcomes) {
+    const p = ACTION_PRIORITY[o.action] ?? 0;
+    if (p > bestP) {
+      bestP = p;
+      best = o.action;
+    }
+  }
+  return best;
+}
+
+/**
+ * Per-act preliminary вердикт «качаем или параша». Финальное значение проставит
+ * кросс-CaseId резолвер (_resolveCaseVerdicts) перед апсертом в Postgres.
+ *
+ *   keep=false:  REMAND/TERMINATE/SETTLEMENT/WITHDRAWAL/LEAVE_UNCONSIDERED/REOPEN
+ *                /UPHOLD_LOWER/CANCEL_RESTORE_LOWER/PROCEDURAL → точно НЕ финал.
+ *   keep=false:  unknown action с непустыми outcomes — нераспознанная шелуха.
+ *   keep=true:   umbrella + пустой ContentTypes[1] — это упрощёнка / доп. решение,
+ *                жанр уже substantive, outcome RAS просто не отдал. Финал по сути.
+ *   keep=true:   GRANT/DENY/CANCEL_NEW/MODIFY/BANKRUPTCY_GRANT.
+ *
+ * Кросс-резолвер далее пересчитает keep/note с учётом цепочки инстанций по делу.
+ */
+function _classifyAct(item) {
+  const realCourtLevel = _resolveInstanceLevel(item);
+  const outcomes = _extractActOutcomes(item);
+  const action = _pickPrimaryAction(outcomes);
+
+  let keep = true;
+  if (SKIP_ACTIONS.has(action)) {
+    keep = false;
+  } else if (action === OUTCOME_ACTION.UNKNOWN) {
+    keep =
+      outcomes.length === 0
+      && _extractDocumentTypeId(item) === UMBRELLA_DECISION_TYPE_ID_NORMALIZED;
+  } else if (action === OUTCOME_ACTION.PROCEDURAL) {
+    keep = false;
+  }
+
+  return { keep, action, realCourtLevel, outcomes };
+}
+
+/**
+ * Очередь несохранённых ключей `decisionLinks` (id строки). Постгрес-апсерт
+ * делаем инкрементально — на каждой странице /Search заливаем только новые
+ * записи, а не весь Map целиком. На больших окнах это экономит сотни мегабайт
+ * сетевого трафика и uppertime.
+ */
+const _pendingPgKeys = new Set();
+
+/** Помечает строку как «нужно залить в PG в ближайший _saveDecisionLinks». */
+function _markDecisionLinkPending(key) {
+  if (key) _pendingPgKeys.add(key);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//   КРОСС-CaseId РЕЗОЛВЕР (4 ИСХОДа из пользовательской спеки)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** "DD.MM.YYYY" → число YYYYMMDD для дешёвой сортировки. 0, если формат не тот. */
+function _dateKey(s) {
+  const m = String(s ?? "").match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  return m ? Number(m[3] + m[2] + m[1]) : 0;
+}
+
+/**
+ * Выбирает «главный» акт инстанции из набора актов одного дела одного уровня.
+ * Приоритет: substantive > non-resolving > procedural > unknown.
+ * Внутри одной категории — самый поздний по registrationDate.
+ */
+function _pickMainActOfLevel(acts) {
+  if (!acts || !acts.length) return null;
+  const bucket = (a) => {
+    const ac = a?.verdict?.action ?? OUTCOME_ACTION.UNKNOWN;
+    if (SUBSTANTIVE_ACTIONS.has(ac)) return 3;
+    if (NON_RESOLVING_ACTIONS.has(ac)) return 2;
+    if (ac === OUTCOME_ACTION.PROCEDURAL) return 1;
+    return 0;
+  };
+  let best = acts[0];
+  for (const a of acts) {
+    const bb = bucket(best);
+    const ba = bucket(a);
+    if (ba > bb) { best = a; continue; }
+    if (ba < bb) continue;
+    if (_dateKey(a.registrationDate) > _dateKey(best.registrationDate)) best = a;
+  }
+  return best;
+}
+
+/**
+ * Определяет финал дела по цепочке main1 → main2 → main3 (4 ИСХОДа из спеки).
+ * Возвращает { finalActId, notes } — id акта-финала и notes[actId] для комментариев.
+ *
+ *   ИСХОД 0:  любое NON_RESOLVING_ACTIONS на любом уровне → финала нет, все keep=0.
+ *   ИСХОД 1:  1-я финал. Варианты: А (нет апел./касс.) / Б (апел. uphold) /
+ *             В (апел.+касс. uphold) / Г (касс. cancel_restore_lower).
+ *   ИСХОД 2:  Апелляция финал. А (касс. нет) / Б (касс. uphold апелляцию).
+ *   ИСХОД 3:  Касс. финал (cancel_new / modify / grant / deny / bankruptcy_grant).
+ */
+function _resolveCaseFinal({ main1, main2, main3 }) {
+  /** @type {Object<string,string>} actId → note */
+  const notes = {};
+
+  // ИСХОД 0
+  for (const m of [main3, main2, main1]) {
+    if (m && NON_RESOLVING_ACTIONS.has(m.verdict.action)) {
+      return { finalActId: null, notes };
     }
   }
 
-  if (fs.existsSync(LINKS_OUT_PATH)) {
-    try {
-      fs.unlinkSync(LINKS_OUT_PATH);
-    } catch (e) {
-      log(`[save] не удалил legacy-файл ${LINKS_OUT_PATH}: ${e}`);
+  // Касса substantive
+  if (main3) {
+    const a3 = main3.verdict.action;
+    if (a3 === OUTCOME_ACTION.CANCEL_RESTORE_LOWER) {
+      // ИСХОД 1.Г
+      if (main1) {
+        notes[main1.id] = "отменено апелляцией, восстановлено кассацией";
+        return { finalActId: main1.id, notes };
+      }
+      return { finalActId: null, notes };
+    }
+    if (a3 === OUTCOME_ACTION.UPHOLD_LOWER) {
+      if (main2 && (main2.verdict.action === OUTCOME_ACTION.CANCEL_NEW
+                 || main2.verdict.action === OUTCOME_ACTION.MODIFY
+                 || main2.verdict.action === OUTCOME_ACTION.GRANT
+                 || main2.verdict.action === OUTCOME_ACTION.DENY)) {
+        // ИСХОД 2.Б
+        notes[main2.id] = "отменено решение 1-й инстанции, засилено кассацией";
+        return { finalActId: main2.id, notes };
+      }
+      if (main1) {
+        // ИСХОД 1.В (апел. + касс. uphold) или 1.Б+касс.
+        notes[main1.id] = (main2 && main2.verdict.action === OUTCOME_ACTION.UPHOLD_LOWER)
+          ? "засилено апелляцией и кассацией"
+          : "засилено кассацией";
+        return { finalActId: main1.id, notes };
+      }
+      return { finalActId: null, notes };
+    }
+    if (a3 === OUTCOME_ACTION.CANCEL_NEW
+     || a3 === OUTCOME_ACTION.MODIFY
+     || a3 === OUTCOME_ACTION.GRANT
+     || a3 === OUTCOME_ACTION.DENY
+     || a3 === OUTCOME_ACTION.BANKRUPTCY_GRANT) {
+      // ИСХОД 3
+      const hadSubstAppeal = main2 && (main2.verdict.action === OUTCOME_ACTION.CANCEL_NEW
+                                    || main2.verdict.action === OUTCOME_ACTION.MODIFY
+                                    || main2.verdict.action === OUTCOME_ACTION.GRANT
+                                    || main2.verdict.action === OUTCOME_ACTION.DENY);
+      notes[main3.id] = hadSubstAppeal
+        ? "отменено решение апелляции, новый акт принят кассацией"
+        : "отменено решение 1-й инстанции, новый акт принят кассацией";
+      return { finalActId: main3.id, notes };
+    }
+    // a3 = procedural / unknown — касса нерешающая, фоллбэк ниже
+  }
+
+  // Апелляция (без substantive кассации)
+  if (main2) {
+    const a2 = main2.verdict.action;
+    if (a2 === OUTCOME_ACTION.UPHOLD_LOWER) {
+      // ИСХОД 1.Б
+      if (main1) {
+        notes[main1.id] = "засилено апелляцией";
+        return { finalActId: main1.id, notes };
+      }
+      return { finalActId: null, notes };
+    }
+    if (a2 === OUTCOME_ACTION.CANCEL_NEW
+     || a2 === OUTCOME_ACTION.MODIFY
+     || a2 === OUTCOME_ACTION.GRANT
+     || a2 === OUTCOME_ACTION.DENY
+     || a2 === OUTCOME_ACTION.BANKRUPTCY_GRANT) {
+      // ИСХОД 2.А
+      notes[main2.id] = "отменено решение 1-й инстанции";
+      return { finalActId: main2.id, notes };
+    }
+    if (a2 === OUTCOME_ACTION.CANCEL_RESTORE_LOWER) {
+      if (main1) {
+        notes[main1.id] = "восстановлено апелляцией";
+        return { finalActId: main1.id, notes };
+      }
+      return { finalActId: null, notes };
     }
   }
+
+  // Только 1-я (ИСХОД 1.А)
+  if (main1) {
+    const a1 = main1.verdict.action;
+    if (a1 === OUTCOME_ACTION.GRANT
+     || a1 === OUTCOME_ACTION.DENY
+     || a1 === OUTCOME_ACTION.CANCEL_NEW
+     || a1 === OUTCOME_ACTION.MODIFY
+     || a1 === OUTCOME_ACTION.BANKRUPTCY_GRANT) {
+      return { finalActId: main1.id, notes };
+    }
+    if (a1 === OUTCOME_ACTION.UNKNOWN) {
+      // Только umbrella + пустой ContentTypes[1] (упрощёнка / доп. решение) → substantive финал.
+      const isUmbrellaEmptyOutcome =
+        (main1.verdict.outcomes?.length ?? 0) === 0
+        && main1.typeId === UMBRELLA_DECISION_TYPE_ID_NORMALIZED;
+      if (isUmbrellaEmptyOutcome) return { finalActId: main1.id, notes };
+      return { finalActId: null, notes };
+    }
+    return { finalActId: null, notes };
+  }
+
+  return { finalActId: null, notes };
+}
+
+/** Объяснение для keep=0 акта: почему этот акт — не финал в своём деле. */
+function _whyNotFinal(act, { main1, main2, main3, finalActId }) {
+  const a = act?.verdict?.action;
+  const sameLevelMain =
+    act.trueInstanceLevel === 1 ? main1
+    : act.trueInstanceLevel === 2 ? main2
+    : act.trueInstanceLevel === 3 ? main3
+    : null;
+  if (sameLevelMain && sameLevelMain.id !== act.id) {
+    return "вторичный акт инстанции (есть основной)";
+  }
+  if (finalActId == null) {
+    if (a === OUTCOME_ACTION.REMAND) return "дело направлено на новое рассмотрение";
+    if (a === OUTCOME_ACTION.TERMINATE) return "прекращение производства";
+    if (a === OUTCOME_ACTION.SETTLEMENT) return "мировое соглашение";
+    if (a === OUTCOME_ACTION.WITHDRAWAL) return "принят отказ от иска";
+    if (a === OUTCOME_ACTION.LEAVE_UNCONSIDERED) return "оставлено без рассмотрения";
+    if (a === OUTCOME_ACTION.REOPEN) return "пересмотр по новым/вновь открывшимся";
+    if (a === OUTCOME_ACTION.PROCEDURAL) return "процессуальный акт";
+    if (a === OUTCOME_ACTION.UPHOLD_LOWER) {
+      return act.trueInstanceLevel === 3
+        ? "кассация оставила в силе нижестоящее (нет нижестоящего в выгрузке)"
+        : "апелляция оставила в силе 1-ю (нет 1-й в выгрузке)";
+    }
+    if (a === OUTCOME_ACTION.CANCEL_RESTORE_LOWER) {
+      return "кассация вернула 1-ю в силу (нет 1-й в выгрузке)";
+    }
+    if (a === OUTCOME_ACTION.UNKNOWN) {
+      return "outcome не распознан (нет GUID в outcome_polarity.json)";
+    }
+    if (main3 && NON_RESOLVING_ACTIONS.has(main3.verdict.action)) return "не финал: кассация прекратила/направила";
+    if (main2 && NON_RESOLVING_ACTIONS.has(main2.verdict.action)) return "не финал: апелляция прекратила/направила";
+    return "не финал";
+  }
+  // Финал есть, но это не он
+  if (a === OUTCOME_ACTION.UPHOLD_LOWER) return "оставил в силе нижестоящее";
+  if (a === OUTCOME_ACTION.CANCEL_RESTORE_LOWER) return "восстановил нижестоящее";
+  if (act.trueInstanceLevel === 1) {
+    if (main3 && (main3.id === finalActId)) return "отменено кассацией";
+    if (main2 && (main2.id === finalActId)) return "отменено апелляцией";
+  }
+  if (act.trueInstanceLevel === 2) {
+    if (main3 && (main3.id === finalActId)) return "отменено кассацией";
+    if (main1 && (main1.id === finalActId)) return "1-я инстанция осталась финалом";
+  }
+  if (act.trueInstanceLevel === 3) {
+    if (main1 && (main1.id === finalActId)) return "кассация вернула 1-ю в силу";
+    if (main2 && (main2.id === finalActId)) return "кассация засилила апелляцию";
+  }
+  return "не финал";
+}
+
+/**
+ * Кросс-CaseId резолвер: пересчитывает verdict.keep и verdict.note для всех актов
+ * на основе цепочки инстанций каждого дела. Мутирует записи в `decisionLinksMap`.
+ *
+ * Идемпотентен: повторный вызов даст тот же результат. Безопасен к инкрементальному
+ * добавлению актов — каждый _saveDecisionLinks вызывает резолвер заново.
+ *
+ * Если verdict.keep или verdict.note у записи изменился относительно предыдущего
+ * состояния — `onChange(key)` помечает её как pending для свежего апсерта в PG.
+ * Это критично: когда в окно прилетает апелляция/кассация по делу, по которому 1-я
+ * инст. уже была залита в PG, мы должны обновить её verdict в БД.
+ *
+ * Видимость: резолвер видит только акты, уже в Map (записи, которые залиты в PG
+ * до перезапуска парсера, в Map не подгружаются — см. _loadExistingDecisionLinks).
+ *
+ * @param {Map<string,object>} decisionLinksMap
+ * @param {(key: string) => void} [onChange]
+ */
+function _resolveCaseVerdicts(decisionLinksMap, onChange) {
+  /** @type {Map<string, Array<{ key: string, row: object }>>} caseId → pairs */
+  const byCase = new Map();
+  /** @type {Array} acts без caseId — оставляем per-act preliminary verdict */
+  const orphans = [];
+  for (const [key, row] of decisionLinksMap.entries()) {
+    if (!row?.verdict) continue;
+    const caseId = row.caseId;
+    if (!caseId) { orphans.push({ key, row }); continue; }
+    if (!byCase.has(caseId)) byCase.set(caseId, []);
+    byCase.get(caseId).push({ key, row });
+  }
+
+  let keepCount = 0;
+  let skipCount = 0;
+  let casesWithFinal = 0;
+  let casesNoFinal = 0;
+  let changedCount = 0;
+
+  for (const [caseId, pairs] of byCase.entries()) {
+    const acts = pairs.map((p) => p.row);
+    const il1 = acts.filter((a) => a.trueInstanceLevel === 1);
+    const il2 = acts.filter((a) => a.trueInstanceLevel === 2);
+    const il3 = acts.filter((a) => a.trueInstanceLevel === 3);
+    const main1 = _pickMainActOfLevel(il1);
+    const main2 = _pickMainActOfLevel(il2);
+    const main3 = _pickMainActOfLevel(il3);
+    const { finalActId, notes } = _resolveCaseFinal({ main1, main2, main3 });
+
+    if (finalActId) casesWithFinal += 1; else casesNoFinal += 1;
+
+    for (const { key, row } of pairs) {
+      const isFinal = row.id != null && row.id === finalActId;
+      const newKeep = isFinal;
+      const newNote = isFinal
+        ? (notes[row.id] ?? null)
+        : _whyNotFinal(row, { main1, main2, main3, finalActId });
+      const prevKeep = row.verdict.keep;
+      const prevNote = row.verdict.note;
+      if (prevKeep !== newKeep || prevNote !== newNote) {
+        row.verdict.keep = newKeep;
+        row.verdict.note = newNote;
+        changedCount += 1;
+        if (onChange) onChange(key);
+      }
+      if (newKeep) keepCount += 1; else skipCount += 1;
+    }
+  }
+
+  for (const { row } of orphans) {
+    if (row.verdict.keep) keepCount += 1; else skipCount += 1;
+  }
+
+  log(
+    `[verdict] кросс-резолюция: дел=${byCase.size} ` +
+      `(с финалом=${casesWithFinal}, без=${casesNoFinal}), ` +
+      `keep=${keepCount}, skip=${skipCount}` +
+      (orphans.length ? `, без caseId=${orphans.length}` : "") +
+      (changedCount ? `, изменено=${changedCount}` : ""),
+  );
+}
+
+/**
+ * Записать накопившийся буфер decisionLinks в Postgres (upsert в таблицу `acts`).
+ *
+ * Раньше тут писались JSON-чанки в parsed_data/decision_links_NNNN.json,
+ * теперь канонический sink — таблица `acts` в PG (см. db/schema.sql).
+ * Если RAS_PG_DSN/DATABASE_URL не задан и есть что писать — фатальная ошибка.
+ *
+ * Перед апсертом — кросс-CaseId пересчёт verdict.keep/note. Если он меняет
+ * verdict ранее сохранённой записи (например, после апелляции по делу с уже
+ * залитой 1-й инст.), такая запись помечается pending и переапсертится.
+ *
+ * Returns: { inserted, updated, skipped } для логирования.
+ */
+async function _saveDecisionLinks() {
+  // Кросс-CaseId резолюция: мутирует verdict.keep/note по всему набору, помечает
+  // изменённые записи как pending через _markDecisionLinkPending — чтобы они
+  // тоже попали в текущий upsert, а не зависли в старом состоянии в PG.
+  _resolveCaseVerdicts(decisionLinks, _markDecisionLinkPending);
+
+  if (_pendingPgKeys.size === 0) {
+    return { inserted: 0, updated: 0, skipped: 0 };
+  }
+  if (!_pgIsConfigured()) {
+    throw new Error(
+      "[save] DSN не задан, а парсер собирается писать acts. " +
+        "Postgres теперь канонический sink (см. CLAUDE.md и db/schema.sql). " +
+        "Поставь RAS_PG_DSN или DATABASE_URL в .env, прокати миграцию " +
+        '`psql "$DSN" -f db/schema.sql` и запусти снова.',
+    );
+  }
+  const rowsToWrite = [];
+  for (const key of _pendingPgKeys) {
+    const row = decisionLinks.get(key);
+    if (row) rowsToWrite.push(row);
+  }
+  const t0 = performance.now();
+  const { inserted, updated } = await _pgUpsertActs(rowsToWrite);
+  const elapsed = (performance.now() - t0).toFixed(0);
+  _pendingPgKeys.clear();
+  // Счётчики по итогу кросс-резолюции (для оперативной видимости)
+  let keepInBatch = 0;
+  for (const r of rowsToWrite) if (r?.verdict?.keep) keepInBatch += 1;
+  log(
+    `[save/pg] acts: inserted=${inserted}, updated=${updated}, ` +
+      `буфер=${rowsToWrite.length} (keep=${keepInBatch}), ` +
+      `всего в Map=${decisionLinks.size}, ${elapsed}мс`,
+  );
+  return { inserted, updated, skipped: rowsToWrite.length - inserted - updated };
 }
 
 function _decisionLinkKeyFromRow(row) {
@@ -577,77 +1406,19 @@ function _decisionLinkKeyFromRow(row) {
   ].join("|");
 }
 
+/**
+ * Раньше тут загружались JSON-чанки `decision_links_NNNN.json`. С переходом
+ * на Postgres функция-стаб: канонический sink теперь PG, resume обеспечивается
+ * через `ON CONFLICT (id) DO UPDATE` в actsRepo. В Map
+ * остаются только записи, собранные в ТЕКУЩЕМ прогоне; счётчик «новых»
+ * в логе считается относительно этого.
+ *
+ * Если когда-то надо будет в Map подгружать уже существующие id
+ * (например, для in-memory dedup на resume) — сюда поселить
+ * `SELECT id, file_name, ... FROM acts`.
+ */
 function _loadExistingDecisionLinks() {
-  /** @type {Array<{ idx: number, path: string }>} */
-  const chunkFiles = [];
-  let parsedEntries = [];
-  try {
-    parsedEntries = fs.readdirSync(PARSED_DATA_DIR);
-  } catch {
-    parsedEntries = [];
-  }
-  for (const name of parsedEntries) {
-    const m = name.match(LINKS_CHUNK_NAME_RE);
-    if (!m) continue;
-    const sourcePath = path.join(PARSED_DATA_DIR, name);
-    const idx = parseInt(m[1], 10);
-    if (!Number.isFinite(idx)) continue;
-    chunkFiles.push({ idx, path: sourcePath });
-  }
-  chunkFiles.sort((a, b) => a.idx - b.idx);
-
-  /** @type {string[]} */
-  const sourcePaths = [];
-  if (chunkFiles.length > 0) {
-    for (const chunk of chunkFiles) sourcePaths.push(chunk.path);
-  } else if (fs.existsSync(LINKS_OUT_PATH) && fs.statSync(LINKS_OUT_PATH).isFile()) {
-    sourcePaths.push(LINKS_OUT_PATH);
-  }
-
-  if (!sourcePaths.length) {
-    log(
-      `[load] ${LINKS_OUT_PATH} / ${LINKS_FILE_BASENAME}_NNNN.json нет — стартуем с пустого набора decision_links`,
-    );
-    return;
-  }
-
-  let loaded = 0;
-  let totalRows = 0;
-  for (const sourcePath of sourcePaths) {
-    let raw;
-    try {
-      raw = fs.readFileSync(sourcePath, "utf-8");
-    } catch (e) {
-      log(`[load] не прочитал ${sourcePath}: ${e}`);
-      continue;
-    }
-    if (!raw.trim()) {
-      log(`[load] ${sourcePath} пустой — пропускаю`);
-      continue;
-    }
-
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch (e) {
-      log(`[load] ${sourcePath} битый JSON (${e}) — игнорирую содержимое`);
-      continue;
-    }
-
-    const rows = Array.isArray(data?.results) ? data.results : [];
-    totalRows += rows.length;
-    for (const row of rows) {
-      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
-      const key = _decisionLinkKeyFromRow(row);
-      if (!key || decisionLinks.has(key)) continue;
-      decisionLinks.set(key, row);
-      loaded += 1;
-    }
-  }
-
-  log(
-    `[load] из ${sourcePaths.length} file(s): строк results=${totalRows}, загружено=${loaded}`,
-  );
+  // no-op: см. комментарий выше + db/actsRepo.js (ON CONFLICT)
 }
 
 /**
@@ -665,10 +1436,11 @@ function _loadExistingDecisionLinks() {
  */
 function _collectDecisionLinks(items, targetTypeIdsSet) {
   let added = 0;
+  let umbrellaAdded = 0;
   for (const item of items) {
-    const documentTypeId = _extractDocumentTypeId(item);
-    if (!documentTypeId || !targetTypeIdsSet.has(documentTypeId)) continue;
+    if (!_isFinalMotivatedAct(item, targetTypeIdsSet)) continue;
 
+    const documentTypeId = _extractDocumentTypeId(item);
     const pdfUrl = _buildDecisionPdfUrl(item);
     if (!pdfUrl) continue;
 
@@ -678,9 +1450,11 @@ function _collectDecisionLinks(items, targetTypeIdsSet) {
     if (!key || decisionLinks.has(key)) continue;
 
     decisionLinks.set(key, _buildDecisionRecord(item, documentTypeId, pdfUrl));
+    _markDecisionLinkPending(key);
     added += 1;
+    if (documentTypeId === UMBRELLA_DECISION_TYPE_ID_NORMALIZED) umbrellaAdded += 1;
   }
-  return { added, skippedCategory: 0 };
+  return { added, umbrellaAdded, skippedCategory: 0 };
 }
 
 function _rebuildIdToKeyIndex() {
@@ -789,13 +1563,13 @@ function _onRequest(request) {
   }
   const rtype = request.resourceType();
   if (rtype === "xhr" || rtype === "fetch" || rtype === "document") {
-    _responseLog.push(`REQ ${request.method()} ${rtype} ${request.url()}`);
+    _pushResponseLog(`REQ ${request.method()} ${rtype} ${request.url()}`);
   }
 }
 
 function _onRequestFailed(request) {
   const failure = request.failure()?.errorText || "<no failure text>";
-  _responseLog.push(
+  _pushResponseLog(
     `FAIL ${request.method()} ${request.resourceType()} ${request.url()} :: ${failure}`,
   );
   if (_isSearchUrl(request.url())) {
@@ -807,7 +1581,7 @@ async function _onResponse(response) {
   const request = response.request();
   const rtype = request.resourceType();
   if (rtype === "xhr" || rtype === "fetch" || rtype === "document") {
-    _responseLog.push(
+    _pushResponseLog(
       `${response.status()} ${request.method()} ${rtype} ${response.url()}`,
     );
   }
@@ -932,11 +1706,34 @@ async function _awaitPostSearchJson(respPromise, dumpLabelPrefix, roundtripStart
   if (response.status() !== 200) {
     return { ok: false, reason: `status=${response.status()}` };
   }
+  let text = "";
   try {
-    const text =
+    text =
       raw !== null && raw !== undefined
         ? raw.toString("utf8")
         : await response.text();
+  } catch (e) {
+    return { ok: false, reason: `read-body: ${e}` };
+  }
+  const ct = response.headers()["content-type"] ?? "";
+  const cls = classifyMetadataResponse({
+    contentType: ct,
+    status: 200,
+    bodyText: text,
+  });
+  if (
+    cls.kind === "antifraud_gate" ||
+    cls.kind === "html_unknown" ||
+    cls.kind === "tiny"
+  ) {
+    log(
+      `[antifraud] /Search ${dumpLabelPrefix}: kind=${cls.kind} ` +
+        `markers=[${cls.markers.join(",")}] ct=${ct || "?"} bytes=${cls.bytes}`,
+    );
+    const tag = cls.markers.length ? cls.markers.join(",") : cls.kind;
+    return { ok: false, reason: `antifraud_gate: ${tag}` };
+  }
+  try {
     const parsed = JSON.parse(text);
     return { ok: true, parsed, roundtripMs };
   } catch (e) {
@@ -1243,26 +2040,35 @@ async function _categoryShowsSupply31(page) {
   }
 }
 
-async function _rakDocFilterTitleLooksComplete(page) {
+const RAK_TYPE_TITLE_NEEDLE = {
+  decision: "решение",
+  appeal: "апелляц",
+  cassation: "кассац",
+};
+
+async function _rakDocFilterTitleLooksComplete(page, requestedSet) {
+  if (!(requestedSet instanceof Set) || requestedSet.size === 0) return true;
   try {
     const toggle = page.locator(RAS_DOC_TYPE_FILTER_TOGGLE_XPATH).first();
     const t = (await toggle.innerText()).replace(/\s+/g, " ").toLowerCase();
-    return (
-      t.includes("решение") &&
-      t.includes("апелляц") &&
-      t.includes("кассац")
-    );
+    for (const key of requestedSet) {
+      const needle = RAK_TYPE_TITLE_NEEDLE[key];
+      if (!needle || !t.includes(needle)) return false;
+    }
+    return true;
   } catch {
     return false;
   }
 }
 
-async function _statusFilterTitleShowsFinished(page) {
+async function _statusFilterTitleMatches(page, mode) {
+  if (mode === null || mode === undefined) return true;
+  if (mode !== "finished") return false;
   try {
     const toggle = page.locator(RAS_STATUS_FILTER_TOGGLE_XPATH).first();
     const t = (await toggle.innerText()).replace(/\s+/g, " ").toLowerCase();
     if (t.includes("только заверш")) return true;
-    return t.includes("заверш") && !t.includes("не заверш");
+    return t.includes("заверш") && !t.includes("не заверш") && !t.includes("незаверш");
   } catch {
     return false;
   }
@@ -1281,25 +2087,28 @@ async function _statusFilterTitleShowsFinished(page) {
  */
 async function _verifyListingFiltersOrRepair(page, uiFilters, supplyFilter31 = false) {
   const {
-    rakDocumentTypeFilter = false,
-    statusFinishedOnly = false,
+    rakDocumentTypeFilter = null,
+    statusFinishedOnly = null,
   } = uiFilters;
 
+  const rakActive = rakDocumentTypeFilter instanceof Set && rakDocumentTypeFilter.size > 0;
   if (
-    rakDocumentTypeFilter &&
-    !(await _rakDocFilterTitleLooksComplete(page))
+    rakActive &&
+    !(await _rakDocFilterTitleLooksComplete(page, rakDocumentTypeFilter))
   ) {
     log("[filter-check] «Тип документа» по заголовку неполный — добиваю");
-    if (!(await _applyRakDocumentTypeFilter(page))) {
+    if (!(await _applyRakDocumentTypeFilter(page, rakDocumentTypeFilter))) {
       return { ok: false, listingRepairParsed: null };
     }
   }
   if (
     statusFinishedOnly &&
-    !(await _statusFilterTitleShowsFinished(page))
+    !(await _statusFilterTitleMatches(page, statusFinishedOnly))
   ) {
-    log("[filter-check] «Статус» по заголовку не «завершённые» — добиваю");
-    if (!(await _applyFinishedStatusFilter(page))) {
+    log(
+      `[filter-check] «Статус» по заголовку не «${statusFinishedOnly}» — добиваю`,
+    );
+    if (!(await _applyStatusFilter(page, statusFinishedOnly))) {
       return { ok: false, listingRepairParsed: null };
     }
   }
@@ -1542,13 +2351,30 @@ async function _clickFind(page, opts = {}) {
   return requireNewSearch ? false : anyClicked;
 }
 
+// «Только не завершённые» в JS-бандле RAS присутствует, но в коде НЕ поддержан:
+// интерактивный промпт throw'нёт раньше, чем сюда что-то долетит. Если когда-нибудь
+// понадобится — добавь сюда ветку not_finished + XPath на пункт.
+const STATUS_OPTION_BY_MODE = {
+  finished: {
+    xpath: RAS_STATUS_FINISHED_OPTION_XPATH,
+    label: "Только завершенные",
+    dumpSlug: "filter-status-finished",
+  },
+};
+
 /**
- * Раскрыть «Статус» и выбрать «Только завершенные» (без ожидания /Search).
- * Для setup см. `_applyFinishedStatusFilter`.
+ * Раскрыть «Статус» и подождать видимости нужного пункта (без ожидания /Search).
+ * Для setup см. `_applyStatusFilter`.
  *
+ * @param {"finished"} mode
  * @returns {Promise<boolean>}
  */
-async function _applyFinishedStatusFilterUntilPick(page) {
+async function _applyStatusFilterUntilPick(page, mode) {
+  const opt = STATUS_OPTION_BY_MODE[mode];
+  if (!opt) {
+    log(`[filter] неизвестный режим статуса: ${mode}`);
+    return false;
+  }
   log("[filter] верхний статус: раскрываю фильтр «Статус»…");
   const toggle = page.locator(RAS_STATUS_FILTER_TOGGLE_XPATH).first();
   try {
@@ -1566,19 +2392,21 @@ async function _applyFinishedStatusFilterUntilPick(page) {
     return false;
   }
 
-  const option = page.locator(RAS_STATUS_FINISHED_OPTION_XPATH).first();
+  const option = page.locator(opt.xpath).first();
   try {
     await option.waitFor({ state: "visible", timeout: 15_000 });
   } catch (e) {
-    log(`[filter] пункт «Только завершенные» не появился: ${e}`);
+    log(`[filter] пункт «${opt.label}» не появился: ${e}`);
     return false;
   }
 
   return true;
 }
 
-async function _applyFinishedStatusFilterPick(page) {
-  const option = page.locator(RAS_STATUS_FINISHED_OPTION_XPATH).first();
+async function _applyStatusFilterPick(page, mode) {
+  const opt = STATUS_OPTION_BY_MODE[mode];
+  if (!opt) return { ok: false, changed: false, parsed: null };
+  const option = page.locator(opt.xpath).first();
   let already = false;
   try {
     already = await option.evaluate((el) => {
@@ -1590,7 +2418,7 @@ async function _applyFinishedStatusFilterPick(page) {
     already = false;
   }
   if (already) {
-    log('[filter] «Только завершенные» уже отмечено — пропуск клика');
+    log(`[filter] «${opt.label}» уже отмечено — пропуск клика`);
     return { ok: true, changed: false, parsed: null };
   }
 
@@ -1598,22 +2426,18 @@ async function _applyFinishedStatusFilterPick(page) {
   const respPromise = page.waitForResponse(_searchPostResponsePredicate, {
     timeout: 120_000,
   });
-  const picked = await _stealth.click(RAS_STATUS_FINISHED_OPTION_XPATH, {
+  const picked = await _stealth.click(opt.xpath, {
     afterWait: "micro",
   });
   if (!picked) {
     void respPromise.catch(() => {});
-    log("[filter] не удалось выбрать «Только завершенные»");
+    log(`[filter] не удалось выбрать «${opt.label}»`);
     return { ok: false, changed: false, parsed: null };
   }
 
-  const ing = await _awaitPostSearchJson(
-    respPromise,
-    "filter-status-finished",
-    searchT0,
-  );
+  const ing = await _awaitPostSearchJson(respPromise, opt.dumpSlug, searchT0);
   if (!ing.ok) {
-    log(`[filter] после «Только завершенные» нет валидного /Search: ${ing.reason}`);
+    log(`[filter] после «${opt.label}» нет валидного /Search: ${ing.reason}`);
     return { ok: false, changed: false, parsed: null };
   }
   await _stealth.smartWait("click");
@@ -1626,14 +2450,17 @@ async function _applyFinishedStatusFilterPick(page) {
 }
 
 /**
- * UI выбора «Только завершённые» с verify+retry. После клика проверяем заголовок
- * через `_statusFilterTitleShowsFinished`; если не сошёлся — повторяем (до 3 попыток).
+ * UI выбора пункта «Статус» с verify+retry. После клика проверяем заголовок
+ * через `_statusFilterTitleMatches`; если не сошёлся — повторяем (до 3 попыток).
  *
+ * @param {"finished"} mode
  * @returns {Promise<{ ok: boolean, changed: boolean, parsed: object|null, searchRoundtripMs?: number }>}
  */
-async function _applyFinishedStatusFilterUi(page) {
-  if (await _statusFilterTitleShowsFinished(page)) {
-    log('[filter] статус «Только завершенные» уже по заголовку — пропуск');
+async function _applyStatusFilterUi(page, mode) {
+  const opt = STATUS_OPTION_BY_MODE[mode];
+  if (!opt) return { ok: false, changed: false, parsed: null };
+  if (await _statusFilterTitleMatches(page, mode)) {
+    log(`[filter] статус «${opt.label}» уже по заголовку — пропуск`);
     return { ok: true, changed: false, parsed: null };
   }
 
@@ -1643,12 +2470,12 @@ async function _applyFinishedStatusFilterUi(page) {
   let lastRoundtripMs;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    log(`[filter] статус: попытка ${attempt}/${MAX_ATTEMPTS}`);
-    if (!(await _applyFinishedStatusFilterUntilPick(page))) {
+    log(`[filter] статус (${mode}): попытка ${attempt}/${MAX_ATTEMPTS}`);
+    if (!(await _applyStatusFilterUntilPick(page, mode))) {
       log(`[filter] статус: не раскрыл фильтр (попытка ${attempt})`);
       continue;
     }
-    const pick = await _applyFinishedStatusFilterPick(page);
+    const pick = await _applyStatusFilterPick(page, mode);
     await _stealth.click(RAS_STATUS_FILTER_TOGGLE_XPATH, { afterWait: "click" });
     if (!pick.ok) {
       log(`[filter] статус: pick fail (попытка ${attempt})`);
@@ -1660,7 +2487,7 @@ async function _applyFinishedStatusFilterUi(page) {
       lastRoundtripMs = pick.searchRoundtripMs;
     }
     await _stealth.smartWait("click");
-    if (await _statusFilterTitleShowsFinished(page)) {
+    if (await _statusFilterTitleMatches(page, mode)) {
       log(`[filter] статус: применён успешно с попытки ${attempt}/${MAX_ATTEMPTS}`);
       return {
         ok: true,
@@ -1677,19 +2504,22 @@ async function _applyFinishedStatusFilterUi(page) {
 }
 
 /**
- * После первого поиска раскрыть верхний фильтр «Статус» и выбрать
- * «Только завершенные», затем перехватить новый POST `/Search`.
+ * После первого поиска раскрыть верхний фильтр «Статус» и выбрать пункт,
+ * соответствующий `mode` ("finished"); затем перехватить новый POST `/Search`.
  *
+ * @param {"finished"} mode
  * @returns {Promise<boolean>}
  */
-async function _applyFinishedStatusFilter(page) {
-  if (await _statusFilterTitleShowsFinished(page)) {
-    log("[filter] статус уже «Только завершенные» — новый /Search не жду");
+async function _applyStatusFilter(page, mode) {
+  const opt = STATUS_OPTION_BY_MODE[mode];
+  if (!opt) return false;
+  if (await _statusFilterTitleMatches(page, mode)) {
+    log(`[filter] статус уже «${opt.label}» — новый /Search не жду`);
     return true;
   }
-  if (!(await _applyFinishedStatusFilterUntilPick(page))) return false;
+  if (!(await _applyStatusFilterUntilPick(page, mode))) return false;
 
-  const pick = await _applyFinishedStatusFilterPick(page);
+  const pick = await _applyStatusFilterPick(page, mode);
   if (!pick.ok) return false;
   if (!pick.changed) {
     await _stealth.click(RAS_STATUS_FILTER_TOGGLE_XPATH, {
@@ -1699,7 +2529,7 @@ async function _applyFinishedStatusFilter(page) {
   }
 
   log(
-    "[filter] выбран статус «Только завершенные», ответ /Search обработан внутри клика",
+    `[filter] выбран статус «${opt.label}», ответ /Search обработан внутри клика`,
   );
   await _stealth.click(RAS_STATUS_FILTER_TOGGLE_XPATH, {
     afterWait: "click",
@@ -1708,21 +2538,33 @@ async function _applyFinishedStatusFilter(page) {
 }
 
 /**
- * РАК: 3 типа документа в UI с verify+retry. После применения проверяем заголовок
- * через `_rakDocFilterTitleLooksComplete`; если не сошёлся — повторяем (до 3 попыток).
+ * РАК: до 3 типов документа в UI с verify+retry. Принимает Set ключей
+ * ("decision" | "appeal" | "cassation") — кликаются только включённые.
+ * После применения проверяем заголовок через `_rakDocFilterTitleLooksComplete`;
+ * если не сошёлся — повторяем (до 3 попыток).
  *
+ * @param {Set<"decision"|"appeal"|"cassation">} requestedSet
  * @returns {Promise<{ ok: boolean, changed: boolean, parsed: object|null, searchRoundtripMs?: number }>}
  */
-async function _applyRakDocumentTypeFilterUi(page) {
-  if (await _rakDocFilterTitleLooksComplete(page)) {
-    log('[filter] РАК: по заголовку все три типа уже выбраны — пропуск');
+async function _applyRakDocumentTypeFilterUi(page, requestedSet) {
+  if (!(requestedSet instanceof Set) || requestedSet.size === 0) {
     return { ok: true, changed: false, parsed: null };
   }
-  const options = [
-    { xpath: RAS_DOC_TYPE_DECISION_OPTION_XPATH, label: "Решение", dumpSlug: "rak-decision" },
-    { xpath: RAS_DOC_TYPE_APPEAL_OPTION_XPATH, label: "Постановление апелляции", dumpSlug: "rak-appeal" },
-    { xpath: RAS_DOC_TYPE_CASSATION_OPTION_XPATH, label: "Постановление кассации", dumpSlug: "rak-cassation" },
+  if (await _rakDocFilterTitleLooksComplete(page, requestedSet)) {
+    log(
+      `[filter] РАК: по заголовку выбранный набор [${[...requestedSet].join(",")}] уже стоит — пропуск`,
+    );
+    return { ok: true, changed: false, parsed: null };
+  }
+  const allOptions = [
+    { key: "decision", xpath: RAS_DOC_TYPE_DECISION_OPTION_XPATH, label: "Решение", dumpSlug: "rak-decision" },
+    { key: "appeal", xpath: RAS_DOC_TYPE_APPEAL_OPTION_XPATH, label: "Постановление апелляции", dumpSlug: "rak-appeal" },
+    { key: "cassation", xpath: RAS_DOC_TYPE_CASSATION_OPTION_XPATH, label: "Постановление кассации", dumpSlug: "rak-cassation" },
   ];
+  const options = allOptions.filter((o) => requestedSet.has(o.key));
+  if (options.length === 0) {
+    return { ok: true, changed: false, parsed: null };
+  }
 
   const MAX_ATTEMPTS = 3;
   let lastParsed = null;
@@ -1800,7 +2642,7 @@ async function _applyRakDocumentTypeFilterUi(page) {
     }
 
     await _stealth.smartWait("click");
-    if (await _rakDocFilterTitleLooksComplete(page)) {
+    if (await _rakDocFilterTitleLooksComplete(page, requestedSet)) {
       log(`[filter] РАК: применён успешно с попытки ${attempt}/${MAX_ATTEMPTS}`);
       return {
         ok: true,
@@ -1817,16 +2659,15 @@ async function _applyRakDocumentTypeFilterUi(page) {
 }
 
 /**
- * После первого поиска раскрыть фильтр «Тип документа», выбрать:
- * - «Решение»
- * - «Постановление апелляции/апелляционной инстанции»
- * - «Постановление кассации/кассационной инстанции»
- * Затем перехватить новый POST `/Search`.
+ * После первого поиска раскрыть фильтр «Тип документа», выбрать пункты по
+ * `requestedSet` ⊆ {decision, appeal, cassation} и перехватить новый POST `/Search`.
  *
+ * @param {Set<"decision"|"appeal"|"cassation">} requestedSet
  * @returns {Promise<boolean>}
  */
-async function _applyRakDocumentTypeFilter(page) {
-  const ui = await _applyRakDocumentTypeFilterUi(page);
+async function _applyRakDocumentTypeFilter(page, requestedSet) {
+  if (!(requestedSet instanceof Set) || requestedSet.size === 0) return true;
+  const ui = await _applyRakDocumentTypeFilterUi(page, requestedSet);
   if (!ui.ok) return false;
   if (!ui.changed) {
     log("[filter] РАК: типы документов уже были в цели — новый /Search не жду");
@@ -1950,8 +2791,8 @@ function _searchPostResponsePredicate(r) {
  * Обновляет `_captured` из последнего актуального `/Search` (шаблон окна, Page=1).
  *
  * @param {object} [uiFilters]
- * @param {boolean} [uiFilters.rakDocumentTypeFilter=false]
- * @param {boolean} [uiFilters.statusFinishedOnly=false]
+ * @param {Set<"decision"|"appeal"|"cassation">|null} [uiFilters.rakDocumentTypeFilter=null]
+ * @param {"finished"|null} [uiFilters.statusFinishedOnly=null]
  * @param {boolean} [supplyFilter31=false] перед «Найти» выставить п. 3.1 (поставки), если ещё нет.
  * @returns {Promise<[number|null, object|null, string, number]>}
  */
@@ -1963,8 +2804,8 @@ async function _uiRunSearchFromForm(
   supplyFilter31 = false,
 ) {
   const {
-    rakDocumentTypeFilter = false,
-    statusFinishedOnly = false,
+    rakDocumentTypeFilter = null,
+    statusFinishedOnly = null,
   } = uiFilters;
 
   const t0 = performance.now();
@@ -1990,8 +2831,9 @@ async function _uiRunSearchFromForm(
   await _dismissPeriodDatePickerOverlay();
   await _stealth.smartWait("micro");
 
-  const usesRakUi = rakDocumentTypeFilter === true;
-  const usesStatusUi = statusFinishedOnly === true;
+  const usesRakUi =
+    rakDocumentTypeFilter instanceof Set && rakDocumentTypeFilter.size > 0;
+  const usesStatusUi = statusFinishedOnly === "finished";
 
   /** Latency последнего успешного POST `/Search` (как у пейджера), без набора дат и без последующего UI. */
   let searchRoundtripMs = 0;
@@ -2029,11 +2871,37 @@ async function _uiRunSearchFromForm(
     return [response.status(), null, `status=${response.status()}`, searchRoundtripMs];
   }
 
+  _syncCapturedFromSearchResponse(response);
+  let text = "";
+  try {
+    text =
+      raw !== null && raw !== undefined
+        ? raw.toString("utf8")
+        : await response.text();
+  } catch (e) {
+    return [response.status(), null, `read-body: ${e}`, searchRoundtripMs];
+  }
+  const ct = response.headers()["content-type"] ?? "";
+  const cls = classifyMetadataResponse({
+    contentType: ct,
+    status: 200,
+    bodyText: text,
+  });
+  if (
+    cls.kind === "antifraud_gate" ||
+    cls.kind === "html_unknown" ||
+    cls.kind === "tiny"
+  ) {
+    log(
+      `[antifraud] /Search ${label}: kind=${cls.kind} ` +
+        `markers=[${cls.markers.join(",")}] ct=${ct || "?"} bytes=${cls.bytes}`,
+    );
+    const tag = cls.markers.length ? cls.markers.join(",") : cls.kind;
+    return [200, null, `antifraud_gate: ${tag}`, searchRoundtripMs];
+  }
+
   let parsed;
   try {
-    _syncCapturedFromSearchResponse(response);
-    const text =
-      raw !== null && raw !== undefined ? raw.toString("utf8") : await response.text();
     parsed = JSON.parse(text);
   } catch (e) {
     return [response.status(), null, `json-decode: ${e}`, searchRoundtripMs];
@@ -2074,7 +2942,10 @@ async function _uiRunSearchFromForm(
 
   try {
     if (usesRakUi) {
-      const rakUi = await _applyRakDocumentTypeFilterUi(page);
+      const rakUi = await _applyRakDocumentTypeFilterUi(
+        page,
+        rakDocumentTypeFilter,
+      );
       if (!rakUi.ok) {
         return [null, null, "rak-filter-ui-failed", performance.now() - t0];
       }
@@ -2094,7 +2965,7 @@ async function _uiRunSearchFromForm(
       }
     }
     if (usesStatusUi) {
-      const stUi = await _applyFinishedStatusFilterUi(page);
+      const stUi = await _applyStatusFilterUi(page, statusFinishedOnly);
       if (!stUi.ok) {
         return [null, null, "status-filter-ui-failed", performance.now() - t0];
       }
@@ -2186,8 +3057,40 @@ async function _uiClickPagerNext(page, label, bodyObj, pageNum) {
     return [status, null, `status=${status}`, elapsed];
   }
 
+  let text = "";
   try {
-    const parsed = await response.json();
+    text = await response.text();
+  } catch (e) {
+    return [status, null, `read-body: ${e}`, elapsed];
+  }
+  const ct = (() => {
+    try {
+      const h = response.headers();
+      return h?.["content-type"] ?? "";
+    } catch {
+      return "";
+    }
+  })();
+  const cls = classifyMetadataResponse({
+    contentType: ct,
+    status: 200,
+    bodyText: text,
+  });
+  if (
+    cls.kind === "antifraud_gate" ||
+    cls.kind === "html_unknown" ||
+    cls.kind === "tiny"
+  ) {
+    log(
+      `[antifraud] /Search ${label}: kind=${cls.kind} ` +
+        `markers=[${cls.markers.join(",")}] ct=${ct || "?"} bytes=${cls.bytes}`,
+    );
+    const tag = cls.markers.length ? cls.markers.join(",") : cls.kind;
+    return [200, null, `antifraud_gate: ${tag}`, elapsed];
+  }
+
+  try {
+    const parsed = JSON.parse(text);
     return [200, parsed, "", elapsed];
   } catch (e) {
     return [status, null, `json-decode: ${e}`, elapsed];
@@ -2233,18 +3136,22 @@ async function _browseSearchPage(
   }
   const out = await _uiClickPagerNext(page, label, bodyObj, pageNum);
   const [st] = out;
+  const rakActive =
+    uiFilters.rakDocumentTypeFilter instanceof Set &&
+    uiFilters.rakDocumentTypeFilter.size > 0;
+  const statusActive = uiFilters.statusFinishedOnly === "finished";
   if (
     FILTER_PAGER_TITLE_RECHECK_EVERY > 0 &&
     st === 200 &&
     pageNum % FILTER_PAGER_TITLE_RECHECK_EVERY === 0 &&
-    (uiFilters.rakDocumentTypeFilter || uiFilters.statusFinishedOnly)
+    (rakActive || statusActive)
   ) {
     const rakOk =
-      !uiFilters.rakDocumentTypeFilter ||
-      (await _rakDocFilterTitleLooksComplete(page));
+      !rakActive ||
+      (await _rakDocFilterTitleLooksComplete(page, uiFilters.rakDocumentTypeFilter));
     const statOk =
-      !uiFilters.statusFinishedOnly ||
-      (await _statusFilterTitleShowsFinished(page));
+      !statusActive ||
+      (await _statusFilterTitleMatches(page, uiFilters.statusFinishedOnly));
     if (!rakOk || !statOk) {
       log(
         `[filter-check] ${label}: стр.${pageNum} — заголовки фильтров ` +
@@ -2283,6 +3190,13 @@ async function _recoverListingUiAfterFailedRound(
   );
   await _safeGoto(page, BASE_URL, { sentinelSelector: "#b-form-submit" });
   await _stealth.smartWait("warmup");
+  if (RAS_META_PRAVO_WAIT_MS > 0) {
+    log(
+      `[${labelPrefix}] UI-recovery: pravocaptcha pause ${RAS_META_PRAVO_WAIT_MS}мс ` +
+        "(cap-cookies ставятся после DOMContentLoaded)",
+    );
+    await _sleepMs(RAS_META_PRAVO_WAIT_MS);
+  }
   if (supplyFilter31) {
     const applied = await _applySupplyDisputeFilter31(page);
     if (!applied) {
@@ -2344,6 +3258,7 @@ async function _walkPagesForBody(
     added: 0,
     relabeled: 0,
     links_added: 0,
+    links_added_umbrella: 0,
     links_skipped_category: 0,
   };
 
@@ -2366,6 +3281,7 @@ async function _walkPagesForBody(
       let escalatedThisRound = false;
       let stuckStatus = null;
       let stuckStatusStreak = 0;
+      let antifraudGateStreak = 0;
 
       for (let attempt = 1; attempt <= maxPageAttempts; attempt += 1) {
         const [status, parsed, err, elapsedMs] = await _browseSearchPage(
@@ -2394,22 +3310,71 @@ async function _walkPagesForBody(
           stuckStatusStreak = 0;
         }
 
-        const isFlap = _isProxyTunnelFlap(err);
-        const rotate = !isFlap && _shouldRotateIp(err);
-        const tag = isFlap
-          ? ` [proxy/flap streak=${flapStreak + 1}]`
-          : rotate
-            ? _isRotatableNetworkError(err)
-              ? " [proxy/net]"
-              : " [banned]"
-            : "";
+        const isAntifraudGate =
+          typeof err === "string" && err.startsWith("antifraud_gate");
+        const isFlap = !isAntifraudGate && _isProxyTunnelFlap(err);
+        const rotate = !isAntifraudGate && !isFlap && _shouldRotateIp(err);
+        const tag = isAntifraudGate
+          ? ` [antifraud/gate streak=${antifraudGateStreak + 1}]`
+          : isFlap
+            ? ` [proxy/flap streak=${flapStreak + 1}]`
+            : rotate
+              ? _isRotatableNetworkError(err)
+                ? " [proxy/net]"
+                : " [banned]"
+              : "";
         log(
           `[${labelPrefix} p${pageNum} r${pageRound}] ` +
             `попытка ${attempt}/${maxPageAttempts}${tag}: ${err}`,
         );
         if (attempt >= maxPageAttempts) break;
 
-        if (isFlap) {
+        if (isAntifraudGate) {
+          // pravocaptcha/ddos-guard прислала HTML вместо JSON. ip-ротация
+          // не помогает (cap привязана к canvas-fingerprint, не к IP); даём
+          // pravocaptcha-JS пройти через полный UI-recovery (reload + warmup +
+          // pravocaptcha pause), он поставит cap-cookies на следующую попытку.
+          // Если так подряд META_ANTIFRAUD_GATE_RECOVER_AFTER раз — это уже
+          // похоже на бан IP/гео, эскалируем через _recoverFrom.
+          antifraudGateStreak += 1;
+          flapStreak = 0;
+          if (antifraudGateStreak >= META_ANTIFRAUD_GATE_RECOVER_AFTER) {
+            log(
+              `[${labelPrefix} p${pageNum} r${pageRound}] ` +
+                `antifraud_gate ${antifraudGateStreak}× подряд — эскалирую _recoverFrom ` +
+                `(возможен реальный бан IP/гео, не только cap)`,
+            );
+            const rotated = await _recoverFrom(
+              `${labelPrefix} p${pageNum} r${pageRound} antifraud-streak=${antifraudGateStreak}`,
+            );
+            escalatedThisRound = true;
+            antifraudGateStreak = 0;
+            if (!rotated) {
+              await _stealth.smartWait("ip_cooldown");
+            } else {
+              const uiOk = await _recoverListingUiAfterFailedRound(
+                page,
+                bodyObj,
+                pageNum,
+                `${labelPrefix}-p${pageNum}-r${pageRound}-post-esc-antifraud`,
+                uiFilters,
+                supplyFilter31,
+              );
+              if (!uiOk) await _stealth.smartWait("api_delay");
+            }
+          } else {
+            const uiOk = await _recoverListingUiAfterFailedRound(
+              page,
+              bodyObj,
+              pageNum,
+              `${labelPrefix}-p${pageNum}-r${pageRound}-antifraud`,
+              uiFilters,
+              supplyFilter31,
+            );
+            if (!uiOk) await _stealth.smartWait("api_delay");
+          }
+        } else if (isFlap) {
+          antifraudGateStreak = 0;
           flapStreak += 1;
           if (flapStreak >= PROXY_FLAP_ROTATE_AFTER) {
             log(
@@ -2449,6 +3414,7 @@ async function _walkPagesForBody(
           }
         } else if (rotate) {
           flapStreak = 0;
+          antifraudGateStreak = 0;
           const rotated = await _recoverFrom(
             `${labelPrefix} p${pageNum} r${pageRound} ${err}`,
           );
@@ -2478,6 +3444,7 @@ async function _walkPagesForBody(
           }
         } else {
           flapStreak = 0;
+          antifraudGateStreak = 0;
           if (
             typeof err === "string" &&
             (err === "pager-next-hidden" ||
@@ -2586,6 +3553,7 @@ async function _walkPagesForBody(
     let added = 0;
     let relabeled = 0;
     let linksAdded = 0;
+    let linksAddedUmbrellaPage = 0;
     let linksSkippedCategoryPage = 0;
     if (mode === MODE_TYPES) {
       const typeStats = _processItems(items);
@@ -2595,9 +3563,11 @@ async function _walkPagesForBody(
     } else {
       const linkOut = _collectDecisionLinks(items, targetTypeIdsSet);
       linksAdded = linkOut.added;
+      linksAddedUmbrellaPage = linkOut.umbrellaAdded ?? 0;
       linksSkippedCategoryPage = linkOut.skippedCategory;
       stats.links_skipped_category += linkOut.skippedCategory;
-      _saveDecisionLinks();
+      stats.links_added_umbrella += linksAddedUmbrellaPage;
+      await _saveDecisionLinks();
     }
     stats.pages_seen += 1;
     stats.items += items.length;
@@ -2614,7 +3584,8 @@ async function _walkPagesForBody(
     } else {
       log(
         `[${labelPrefix} p${pageNum}] items=${items.length}, ` +
-          `новых pdf-ссылок=${linksAdded}, пропуск по категории kad (стр)=${linksSkippedCategoryPage}, ` +
+          `новых pdf-ссылок=${linksAdded} (из umbrella=${linksAddedUmbrellaPage}), ` +
+          `пропуск по категории kad (стр)=${linksSkippedCategoryPage}, ` +
           `всего пропусков за окно=${stats.links_skipped_category}, ` +
           `всего ссылок=${decisionLinks.size}, ` +
           `latency=${lastSuccessElapsedMs.toFixed(0)}мс`,
@@ -2641,14 +3612,9 @@ async function _walkPagesForBody(
   return stats;
 }
 
-function _windowIso(endDay, windowDays) {
-  const startDay = new Date(
-    endDay.getFullYear(),
-    endDay.getMonth(),
-    endDay.getDate() - (windowDays - 1),
-  );
+function _windowIso(endDay) {
   const df =
-    `${startDay.getFullYear()}-${pad2(startDay.getMonth() + 1)}-${pad2(startDay.getDate())}T00:00:00`;
+    `${endDay.getFullYear()}-${pad2(endDay.getMonth() + 1)}-${pad2(endDay.getDate())}T00:00:00`;
   const dt =
     `${endDay.getFullYear()}-${pad2(endDay.getMonth() + 1)}-${pad2(endDay.getDate())}T23:59:59`;
   return [df, dt];
@@ -2765,11 +3731,6 @@ function _parseDateFromEnv(raw, label) {
   return _startOfDay(parsed);
 }
 
-/** @param {number} cycles конечное число или Infinity (без лимита циклов) */
-function _cyclesLabel(cycles) {
-  return cycles === Infinity ? "∞" : String(cycles);
-}
-
 /**
  * Первый интерактивный шаг: окно браузера или headless.
  * Вызывать до любых тяжёлых операций в `main()` (mkdir/debug и т.д.).
@@ -2785,6 +3746,17 @@ async function _resolveHeadlessFromEnvOrPrompt() {
     return headless;
   };
 
+  // TTY → всегда спрашиваем, env-defaults игнорируются (это режим для автозапуска/API).
+  if (process.stdin.isTTY) {
+    while (true) {
+      const raw = (await _ask("Показывать экран браузера? [1] да, [2] нет: ")).trim();
+      if (raw === "1") return normalizeHeadfulRequest(false, "интерактивный выбор");
+      if (raw === "2") return true;
+      process.stdout.write("Введи 1 или 2.\n");
+    }
+  }
+
+  // Не-TTY: автоматический режим. Берём из env, иначе DEFAULT_HEADLESS.
   if (process.env.RAS_HEADLESS !== undefined) {
     const headless = normalizeHeadfulRequest(DEFAULT_HEADLESS, "RAS_HEADLESS");
     process.stdout.write(
@@ -2793,25 +3765,37 @@ async function _resolveHeadlessFromEnvOrPrompt() {
     );
     return headless;
   }
-  if (!process.stdin.isTTY) {
-    process.stdout.write(
-      `[setup] stdin не интерактивный — вопрос про экран браузера пропущен, ` +
-        `RAS_HEADLESS по умолчанию (${DEFAULT_HEADLESS ? "headless" : "headful"})\n`,
-    );
-    return normalizeHeadfulRequest(DEFAULT_HEADLESS, "non-TTY stdin");
-  }
-  while (true) {
-    const raw = (await _ask("Показывать экран браузера? [1] да, [2] нет: ")).trim();
-    if (raw === "1") return normalizeHeadfulRequest(false, "интерактивный выбор");
-    if (raw === "2") return true;
-    process.stdout.write("Введи 1 или 2.\n");
-  }
+  process.stdout.write(
+    `[setup] stdin не интерактивный, RAS_HEADLESS не задан — ` +
+      `RAS_HEADLESS по умолчанию (${DEFAULT_HEADLESS ? "headless" : "headful"})\n`,
+  );
+  return normalizeHeadfulRequest(DEFAULT_HEADLESS, "non-TTY stdin");
 }
 
 /**
  * @param {boolean} headless — уже выбрано в начале `main()` или из `RAS_HEADLESS`.
  */
 async function _promptSetup(headless) {
+  // Контракт интерактивного режима:
+  //   TTY (terminal) → всегда спрашиваем всё, env-defaults игнорируются.
+  //     Это режим для человека за клавиатурой.
+  //   non-TTY (cron / API / pipe / CI) → читаем из env, иначе спросить
+  //     невозможно (нет stdin), упадём с понятной ошибкой / возьмём дефолт.
+  const interactive = Boolean(process.stdin.isTTY);
+  if (interactive) {
+    log(
+      "[setup] интерактивный режим (TTY): спрашиваю все параметры, " +
+        "env-defaults (RAS_DATE_*, RAS_SUPPLY_FILTER_31, RAS_DOC_FILTER_RAK, " +
+        "RAS_STATUS_FINISHED_ONLY) игнорируются",
+    );
+  } else {
+    log(
+      "[setup] неинтерактивный режим (non-TTY): беру параметры из env " +
+        "(RAS_DATE_*, RAS_SUPPLY_FILTER_31, RAS_DOC_FILTER_RAK, " +
+        "RAS_STATUS_FINISHED_ONLY)",
+    );
+  }
+
   const now = new Date();
   const todayDt = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const defaultEndDay = new Date(
@@ -2820,188 +3804,205 @@ async function _promptSetup(headless) {
     todayDt.getDate() - 1,
   );
 
-  const MAX_CYCLES_INTERACTIVE = 200;
+  // Режим всегда = acts -> Postgres. Справочник TypeId выпилен из интерактива
+  // (если когда-нибудь понадобится — будет отдельная утилита). MODE_TYPES-ветки
+  // в коде пока живы, как наследие, но недостижимы из промпта.
+  const mode = MODE_DECISION_LINKS;
 
-  const modeEnv = String(process.env.RAS_MODE ?? "").trim().toLowerCase();
-  let mode = null;
-  if (modeEnv === MODE_TYPES || modeEnv === "typeid" || modeEnv === "typeids") {
-    mode = MODE_TYPES;
-    log("[setup] режим=types (RAS_MODE)");
-  } else if (
-    modeEnv === MODE_DECISION_LINKS ||
-    modeEnv === "links" ||
-    modeEnv === "pdf_links"
-  ) {
-    mode = MODE_DECISION_LINKS;
-    log("[setup] режим=decision_links (RAS_MODE)");
-  } else if (modeEnv) {
-    log(`[setup] RAS_MODE='${modeEnv}' не распознан, спрошу в терминале`);
+  // === Категория спора ===
+  // Сейчас в коде захардкожен только XPath на «3.1 поставки». Другие категории —
+  // отдельная задача (нужно перебить UI-логику выбора). Любая другая категория →
+  // понятная ошибка.
+  let supplyFilter31;
+  if (interactive) {
+    while (true) {
+      const raw = (
+        await _ask("Введите категорию спора [Enter = 3.1 поставки]: ")
+      ).trim();
+      const norm = raw.toLowerCase().replace(/\s+/g, " ");
+      if (raw === "" || norm === "3.1" || norm.startsWith("3.1 ") || norm.startsWith("3.1.")) {
+        supplyFilter31 = true;
+        break;
+      }
+      if (norm === "off" || norm === "игнор" || norm === "0") {
+        // Скрытая лазейка для отладки — даём явно вырубить фильтр.
+        supplyFilter31 = false;
+        break;
+      }
+      throw new Error(
+        `[setup] категория '${raw}' пока не поддерживается. ` +
+          "Поддерживаемые: 3.1 (поставки). Жми Enter, чтобы выбрать её по умолчанию.",
+      );
+    }
+  } else {
+    const filterEnv = String(process.env.RAS_SUPPLY_FILTER_31 ?? "").trim().toLowerCase();
+    supplyFilter31 = !(filterEnv === "0" || filterEnv === "no" || filterEnv === "off");
+    log(
+      `[setup] фильтр категории 3.1 (поставки)=${supplyFilter31 ? "вкл" : "выкл"} ` +
+        `(RAS_SUPPLY_FILTER_31)`,
+    );
   }
-  if (mode === null) {
+
+  // === Тип акта (РАК) ===
+  // Per-option: 1=решения, 2=апелляции, 3=кассации, можно «1,3» и т.п.
+  // Enter / «рак» / «1,2,3» = полный РАК, 4 / «игнор» = выкл (null).
+  /** @type {Set<"decision"|"appeal"|"cassation">|null} */
+  let rakDocumentTypeFilter;
+  const RAK_DIGIT_TO_KEY = { 1: "decision", 2: "appeal", 3: "cassation" };
+  if (interactive) {
     while (true) {
       const raw = (
         await _ask(
-          "Что парсим? [1] справочник TypeId, [2] ссылки на решения [Enter = ссылки]: ",
+          "Тип акта: [1] решения, [2] апелляции, [3] кассации (через запятую), " +
+            "[4] игнор фильтра [Enter = РАК (все три)]: ",
         )
       ).trim();
-      if (raw === "" || raw === "2") {
-        mode = MODE_DECISION_LINKS;
+      const norm = raw.toLowerCase().replace(/\s+/g, "");
+      if (raw === "" || norm === "рак" || norm === "1,2,3") {
+        rakDocumentTypeFilter = new Set(["decision", "appeal", "cassation"]);
         break;
       }
-      if (raw === "1") {
-        mode = MODE_TYPES;
+      if (raw === "4" || norm === "игнор" || norm === "off") {
+        rakDocumentTypeFilter = null;
         break;
       }
-      process.stdout.write("Введи 1 (справочник), 2 (ссылки) или Enter (ссылки).\n");
-    }
-  }
-
-  const filterEnv = String(process.env.RAS_SUPPLY_FILTER_31 ?? "")
-    .trim()
-    .toLowerCase();
-  /** @type {boolean | null} */
-  let supplyFilter31 = null;
-  if (filterEnv === "1" || filterEnv === "yes" || filterEnv === "on") {
-    supplyFilter31 = true;
-    log("[setup] фильтр категории 3.1 (поставки)=вкл (RAS_SUPPLY_FILTER_31)");
-  } else if (
-    filterEnv === "0" ||
-    filterEnv === "no" ||
-    filterEnv === "off"
-  ) {
-    supplyFilter31 = false;
-    log("[setup] фильтр категории 3.1 (поставки)=выкл (RAS_SUPPLY_FILTER_31)");
-  }
-  if (supplyFilter31 === null) {
-    supplyFilter31 = await _askYesNoDefaultYes(
-      "Категория спора 3.1 (поставка)? да/нет [Enter = да]: ",
-    );
-  }
-
-  const rakEnv = String(process.env.RAS_DOC_FILTER_RAK ?? "")
-    .trim()
-    .toLowerCase();
-  /** @type {boolean | null} */
-  let rakDocumentTypeFilter = null;
-  if (rakEnv === "1" || rakEnv === "yes" || rakEnv === "on") {
-    rakDocumentTypeFilter = true;
-    log("[setup] фильтр РАК (Тип документа)=вкл (RAS_DOC_FILTER_RAK)");
-  } else if (rakEnv === "0" || rakEnv === "no" || rakEnv === "off") {
-    rakDocumentTypeFilter = false;
-    log("[setup] фильтр РАК (Тип документа)=выкл (RAS_DOC_FILTER_RAK)");
-  }
-  if (rakDocumentTypeFilter === null) {
-    rakDocumentTypeFilter = await _askYesNoDefaultYes(
-      "Тип документа РАК (Решение/Апелляция/Кассация)? да/нет [Enter = да]: ",
-    );
-  }
-
-  const finishedEnv = String(process.env.RAS_STATUS_FINISHED_ONLY ?? "")
-    .trim()
-    .toLowerCase();
-  /** @type {boolean | null} */
-  let statusFinishedOnly = null;
-  if (finishedEnv === "1" || finishedEnv === "yes" || finishedEnv === "on") {
-    statusFinishedOnly = true;
-    log("[setup] статус «только завершенные»=вкл (RAS_STATUS_FINISHED_ONLY)");
-  } else if (
-    finishedEnv === "0" ||
-    finishedEnv === "no" ||
-    finishedEnv === "off"
-  ) {
-    statusFinishedOnly = false;
-    log("[setup] статус «только завершенные»=выкл (RAS_STATUS_FINISHED_ONLY)");
-  }
-  if (statusFinishedOnly === null) {
-    statusFinishedOnly = await _askYesNoDefaultYes(
-      "Статус только завершённые? да/нет [Enter = да]: ",
-    );
-  }
-
-  let targetTypeIds = [];
-  if (mode === MODE_DECISION_LINKS) {
-    const envTypeIds = _normalizeTypeIdsInput(process.env.RAS_TARGET_TYPE_IDS);
-    if (envTypeIds.length > 0) {
-      targetTypeIds = envTypeIds;
-      log(`[setup] target TypeId: ${targetTypeIds.length} шт. (RAS_TARGET_TYPE_IDS)`);
-    } else {
-      while (true) {
-        const raw = (
-          await _ask(
-            "TypeId через запятую (Enter = дефолтные 3 DecisionTypeId): ",
-          )
-        ).trim();
-        if (raw === "") {
-          targetTypeIds = [...DEFAULT_DECISION_TYPE_IDS];
-          log("[setup] target TypeId: взял дефолтные 3 DecisionTypeId (Enter)");
+      const parts = norm.split(",").filter((p) => p.length > 0);
+      const keys = new Set();
+      let bad = false;
+      for (const p of parts) {
+        if (p === "4") {
+          bad = true;
           break;
         }
-        const ids = _normalizeTypeIdsInput(raw);
-        if (ids.length > 0) {
-          targetTypeIds = ids;
+        const k = RAK_DIGIT_TO_KEY[p];
+        if (!k) {
+          bad = true;
           break;
         }
-        process.stdout.write("Нужен хотя бы один TypeId.\n");
+        keys.add(k);
       }
-    }
-  }
-
-  const cyclesEnv = (process.env.RAS_CYCLES ?? "").trim();
-  let cycles = null;
-  if (cyclesEnv) {
-    const parsed = parseInt(cyclesEnv, 10);
-    if (!Number.isNaN(parsed)) {
-      if (parsed === 0) {
-        cycles = Infinity;
-        log(`[setup] cycles=∞ (RAS_CYCLES=0, без лимита)`);
-      } else if (parsed >= 1) {
-        cycles = parsed;
-        log(`[setup] cycles=${cycles} (RAS_CYCLES)`);
-      } else {
-        log(`[setup] RAS_CYCLES=${parsed} некорректно, спрошу руками`);
-      }
-    } else {
-      log(`[setup] RAS_CYCLES='${cyclesEnv}' не число, спрошу руками`);
-    }
-  }
-  if (cycles === null) {
-    while (true) {
-      const raw = (
-        await _ask(
-          `Сколько циклов (1–${MAX_CYCLES_INTERACTIVE}; ` +
-            `Enter или 0 = без лимита): `,
-        )
-      ).trim();
-      if (raw === "" || raw === "0") {
-        cycles = Infinity;
-        break;
-      }
-      const parsed = parseInt(raw, 10);
-      if (
-        !Number.isNaN(parsed) &&
-        parsed >= 1 &&
-        parsed <= MAX_CYCLES_INTERACTIVE
-      ) {
-        cycles = parsed;
+      if (!bad && keys.size > 0) {
+        rakDocumentTypeFilter = keys;
         break;
       }
       process.stdout.write(
-        `Нужно целое от 1 до ${MAX_CYCLES_INTERACTIVE}, или 0, или пустой ввод ` +
-          `(без лимита по числу циклов).\n`,
+        "Введи цифры 1/2/3 через запятую (например «1,3»), либо 4 (игнор), либо Enter (все три).\n",
       );
     }
+  } else {
+    const rakEnv = String(process.env.RAS_DOC_FILTER_RAK ?? "").trim().toLowerCase();
+    if (rakEnv === "0" || rakEnv === "no" || rakEnv === "off") {
+      rakDocumentTypeFilter = null;
+    } else if (rakEnv === "" || rakEnv === "1" || rakEnv === "yes" || rakEnv === "on") {
+      rakDocumentTypeFilter = new Set(["decision", "appeal", "cassation"]);
+    } else {
+      const keys = new Set();
+      for (const p of rakEnv.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const k = RAK_DIGIT_TO_KEY[p] ?? (["decision", "appeal", "cassation"].includes(p) ? p : null);
+        if (k) keys.add(k);
+      }
+      rakDocumentTypeFilter = keys.size > 0
+        ? keys
+        : new Set(["decision", "appeal", "cassation"]);
+    }
+    log(
+      `[setup] фильтр РАК (Тип документа)=` +
+        `${rakDocumentTypeFilter === null ? "выкл" : [...rakDocumentTypeFilter].join(",")} ` +
+        `(RAS_DOC_FILTER_RAK)`,
+    );
   }
 
-  const windowEnv = (process.env.RAS_WINDOW_DAYS ?? "").trim();
-  let windowDays = 1;
-  if (windowEnv) {
-    const parsed = parseInt(windowEnv, 10);
-    if (!Number.isNaN(parsed)) {
-      windowDays = Math.max(1, parsed);
+  // === Статус ===
+  // 1/Enter = «Только завершенные», 3 = игнор (null).
+  // 2 («Только не завершённые») — в коде не поддержано: бросаем понятный throw.
+  // Если когда-нибудь понадобится — XPath на пункт есть в JS-бандле RAS
+  // (`Только не завершённые`, с пробелом и через ё), плюс ветка `not_finished`
+  // в STATUS_OPTION_BY_MODE и в _statusFilterTitleMatches.
+  /** @type {"finished"|null} */
+  let statusFinishedOnly;
+  if (interactive) {
+    while (true) {
+      const raw = (
+        await _ask(
+          "Статус: [1] завершённые, [2] незавершённые, [3] игнор фильтра " +
+            "[Enter = завершённые]: ",
+        )
+      ).trim();
+      const norm = raw.toLowerCase();
+      if (raw === "" || raw === "1" || norm.startsWith("заверш")) {
+        statusFinishedOnly = "finished";
+        break;
+      }
+      if (raw === "3" || norm === "игнор" || norm === "off") {
+        statusFinishedOnly = null;
+        break;
+      }
+      if (raw === "2" || norm.startsWith("незаверш") || norm.startsWith("не заверш")) {
+        throw new Error(
+          "[setup] статус 'только незавершённые' пока не поддерживается. " +
+            "Поддерживаемые: Enter/1 (завершённые) или 3 (игнор).",
+        );
+      }
+      process.stdout.write("Введи 1, 3 или Enter (2 пока не поддерживается).\n");
+    }
+  } else {
+    const finishedEnv = String(process.env.RAS_STATUS_FINISHED_ONLY ?? "")
+      .trim()
+      .toLowerCase();
+    if (
+      finishedEnv === "0" ||
+      finishedEnv === "no" ||
+      finishedEnv === "off" ||
+      finishedEnv === "ignore" ||
+      finishedEnv === "игнор"
+    ) {
+      statusFinishedOnly = null;
+    } else if (
+      finishedEnv === "not_finished" ||
+      finishedEnv === "notfinished" ||
+      finishedEnv === "2" ||
+      finishedEnv === "незаверш" ||
+      finishedEnv === "незавершенные"
+    ) {
+      throw new Error(
+        "[setup] RAS_STATUS_FINISHED_ONLY='not_finished' пока не поддерживается. " +
+          "Допустимые значения: 1/yes/on (завершённые) или 0/no/off (игнор).",
+      );
+    } else {
+      statusFinishedOnly = "finished";
+    }
+    log(
+      `[setup] статус=${statusFinishedOnly === null ? "выкл" : statusFinishedOnly} ` +
+        `(RAS_STATUS_FINISHED_ONLY)`,
+    );
+  }
+
+  // === Мотивировка ===
+  // Канонический набор фильтров: 3 specific TypeId ∪ umbrella с allowlist жанров.
+  // «Все подряд» (без отсева резолютивок / судприказов) — пока не поддерживается,
+  // планируется отдельной БД. См. CLAUDE.md «Главное правило отбора актов».
+  if (interactive) {
+    while (true) {
+      const raw = (
+        await _ask(
+          "Тащим акты с мотивировочной частью или все подряд? " +
+            "[Enter = с мотивировкой]: ",
+        )
+      ).trim().toLowerCase();
+      if (raw === "" || raw.includes("мотив") || raw === "1") break;
+      if (raw.includes("все") || raw.includes("всё") || raw === "2") {
+        throw new Error(
+          "[setup] режим 'все подряд' (без фильтра мотивировки) пока не " +
+            "поддерживается. Под него планируется отдельная БД. " +
+            "Жми Enter, чтобы взять акты с мотивировочной частью.",
+        );
+      }
+      throw new Error(`[setup] выбор '${raw}' не распознан. Жми Enter или введи 'с мотивировкой'.`);
     }
   }
+  const targetTypeIds = [...DEFAULT_DECISION_TYPE_IDS];
 
-  const toRaw = (process.env.RAS_DATE_TO ?? "").trim();
+  const toRaw = interactive ? "" : (process.env.RAS_DATE_TO ?? "").trim();
   let endDay = null;
   if (toRaw) {
     const parsed = _parseDdMmYyyy(toRaw);
@@ -3042,7 +4043,7 @@ async function _promptSetup(headless) {
   }
 
   let oldestDay = undefined;
-  if (process.env.RAS_DATE_FROM !== undefined) {
+  if (!interactive && process.env.RAS_DATE_FROM !== undefined) {
     oldestDay = _parseDateFromEnv(process.env.RAS_DATE_FROM, "RAS_DATE_FROM");
     if (oldestDay === undefined && String(process.env.RAS_DATE_FROM).trim() !== "") {
       log(`[setup] RAS_DATE_FROM задан некорректно — спрошу в терминале`);
@@ -3065,7 +4066,7 @@ async function _promptSetup(headless) {
       const raw = (
         await _ask(
           `Дата «с» — не сдвигать окна дальше назад, если конец окна раньше этой даты ` +
-            `(DD.MM.YYYY; Enter = без нижней границы, только лимит циклов): `,
+            `(DD.MM.YYYY; Enter = без нижней границы, парсер идёт бесконечно назад): `,
         )
       ).trim();
       if (raw === "") {
@@ -3091,22 +4092,30 @@ async function _promptSetup(headless) {
     oldestDay = _startOfDay(t);
   }
 
+  const rakLabel =
+    rakDocumentTypeFilter === null
+      ? "off"
+      : `[${[...rakDocumentTypeFilter].join(",")}]`;
   log(
-    `[setup] mode=${mode}, show_browser=${!headless}, supply_filter_31=${supplyFilter31}, ` +
-      `status_finished_only=${statusFinishedOnly}, ` +
-      `rak_doc_type_filter=${rakDocumentTypeFilter}, ` +
-      `cycles=${_cyclesLabel(cycles)}, window_days=${windowDays}, ` +
+    `[setup] mode=acts (Postgres sink), show_browser=${!headless}, ` +
+      `supply_filter_31=${supplyFilter31}, ` +
+      `status_filter=${statusFinishedOnly ?? "off"}, ` +
+      `rak_doc_type_filter=${rakLabel}, ` +
       `дата_до=${_formatDdMmYyyy(endDay)}` +
       (oldestDay === null
-        ? ""
-        : `, дата_с=${_formatDdMmYyyy(oldestDay)} (стоп при сдвиге окна назад)`) +
-      ` (пустые дни пропускаются, не считаются за цикл)`,
+        ? ", дата_с=нет (идём бесконечно назад)"
+        : `, дата_с=${_formatDdMmYyyy(oldestDay)} (стоп при сдвиге окна за неё)`) +
+      ` (пустые дни пропускаются)`,
+  );
+  log(
+    `[setup] фильтр: specific TypeId (${targetTypeIds.length}) ∪ ` +
+      `umbrella ${UMBRELLA_DECISION_TYPE_ID} с allowlist жанров ` +
+      `(${UMBRELLA_FINAL_GENRE_GUIDS.size} GUID); verdict-резолвер кросс-CaseId ` +
+      `на каждый flush в acts`,
   );
   return [
     mode,
     targetTypeIds,
-    cycles,
-    windowDays,
     endDay,
     oldestDay,
     supplyFilter31,
@@ -3178,8 +4187,8 @@ async function _setupSearchSession(
   {
     maxAttempts = 5,
     supplyFilter31 = false,
-    statusFinishedOnly = false,
-    rakDocumentTypeFilter = false,
+    statusFinishedOnly = null,
+    rakDocumentTypeFilter = null,
     periodBody = null,
   } = {},
 ) {
@@ -3207,6 +4216,14 @@ async function _setupSearchSession(
         "JS/jQuery/fingerprint должны успеть проинициализироваться",
     );
     await _stealth.smartWait("warmup");
+    if (RAS_META_PRAVO_WAIT_MS > 0) {
+      log(
+        `[load] pravocaptcha pause ${RAS_META_PRAVO_WAIT_MS}мс — cap-cookies ` +
+          "ставятся background-JS после DOMContentLoaded; без этого первый " +
+          "POST /Search на свежем IP может вернуть tokenFrom-HTML",
+      );
+      await _sleepMs(RAS_META_PRAVO_WAIT_MS);
+    }
 
     try {
       const hasJq = await page.evaluate(
@@ -3323,8 +4340,13 @@ async function _setupSearchSession(
     }
 
     if (_captured.url !== null) {
-      if (rakDocumentTypeFilter) {
-        const filteredRak = await _applyRakDocumentTypeFilter(page);
+      const rakActive =
+        rakDocumentTypeFilter instanceof Set && rakDocumentTypeFilter.size > 0;
+      if (rakActive) {
+        const filteredRak = await _applyRakDocumentTypeFilter(
+          page,
+          rakDocumentTypeFilter,
+        );
         if (!filteredRak) {
           log(
             `[setup] попытка ${attempt}/${maxAttempts}: не удалось применить ` +
@@ -3333,12 +4355,12 @@ async function _setupSearchSession(
           continue;
         }
       }
-      if (statusFinishedOnly) {
-        const filtered = await _applyFinishedStatusFilter(page);
+      if (statusFinishedOnly === "finished") {
+        const filtered = await _applyStatusFilter(page, statusFinishedOnly);
         if (!filtered) {
           log(
             `[setup] попытка ${attempt}/${maxAttempts}: не удалось применить ` +
-              "статус «Только завершенные»",
+              `статус «${statusFinishedOnly}»`,
           );
           continue;
         }
@@ -3374,27 +4396,31 @@ async function main() {
   const headless = await _resolveHeadlessFromEnvOrPrompt();
 
   let mode = MODE_TYPES;
-  let cycles = 1;
-  let windowDays = 1;
   let endDay = _startOfDay(new Date());
   let oldestDay = null;
   let supplyFilter31 = false;
-  let statusFinishedOnly = false;
-  let rakDocumentTypeFilter = false;
+  /** @type {"finished"|null} */
+  let statusFinishedOnly = null;
+  /** @type {Set<"decision"|"appeal"|"cassation">|null} */
+  let rakDocumentTypeFilter = null;
   let targetTypeIdsSet = new Set();
 
   let context = null;
   let userDataDir = null;
+  /** Профиль из RAS_BROWSER_USER_DATA_DIR — не удаляем каталог при recycle. */
+  let userDataDirPersistent = false;
   let page = null;
   let mpProxyClient = null;
+  /** holder_id для proxy_leases — фиксируется на старте, освобождается в finally. */
+  let leaseHolderId = null;
+  /** stop()-callback для heartbeat. */
+  let leaseStopHeartbeat = null;
 
   // Все вопросы должны быть завершены до старта парсера и поднятия браузера.
   const setup = await _promptSetup(headless);
   [
     mode,
     ,
-    cycles,
-    windowDays,
     endDay,
     oldestDay,
     supplyFilter31,
@@ -3413,10 +4439,17 @@ async function main() {
   if (mode === MODE_TYPES) {
     _loadExisting();
   } else {
+    if (!_pgIsConfigured()) {
+      throw new Error(
+        "[setup] DSN не задан. Postgres теперь канонический sink для acts " +
+          "(см. CLAUDE.md и db/schema.sql). Поставь RAS_PG_DSN или DATABASE_URL в .env, " +
+          "прокати миграцию `psql \"$DSN\" -f db/schema.sql` и запусти снова.",
+      );
+    }
     _loadExistingDecisionLinks();
     log(
-      `[setup] сбор только PDF-ссылок по TypeId (${targetTypeIds.length} шт.) -> ` +
-        `${LINKS_FILE_BASENAME}_NNNN.json (по ${LINKS_CHUNK_SIZE} записей)`,
+      `[setup] сбор PDF-ссылок по TypeId (${targetTypeIds.length} специфичных + ` +
+        `umbrella ${UMBRELLA_DECISION_TYPE_ID} с allowlist жанров) -> Postgres table acts`,
     );
   }
 
@@ -3444,20 +4477,23 @@ async function main() {
         `proxy_auth=${PROXY_USER ? `${PROXY_USER}:***` : "none"}, ` +
         `executable=${launchKwargs.executablePath ?? "default"})`,
     );
-    userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ras_chromium_"));
+    const rasFp = buildRasBrowserFingerprint();
+    const udd = _resolveParserBrowserUserDataDir();
+    userDataDir = udd.dir;
+    userDataDirPersistent = udd.persistent;
+    log(
+      `[browser] userDataDir=${userDataDirPersistent ? `persistent (${userDataDir})` : "temp"}, ` +
+        `ua_Chrome=${rasFp.userAgent.match(/Chrome\/([\d.]+)/)?.[1] ?? "?"}`,
+    );
     context = await chromium.launchPersistentContext(userDataDir, {
       locale: "ru-RU",
       timezoneId: "Europe/Moscow",
-      userAgent: USER_AGENT,
+      userAgent: rasFp.userAgent,
       viewport: { width: 1366, height: 900 },
-      extraHTTPHeaders: {
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-      },
+      extraHTTPHeaders: rasFp.extraHTTPHeaders,
       ...launchKwargs,
     });
+    await attachRasAntiDetectToContext(context);
     log("[browser] persistent-context готов");
 
     const pages = context.pages();
@@ -3480,6 +4516,31 @@ async function main() {
       minGeoSwapGapSec: CHANGE_GEO_COOLDOWN_SEC,
       logger: log,
     });
+
+    // Координация прокси с pdf/downloader: занимаем MP_PROXY_KEY в proxy_leases.
+    // Если ключ занят качалкой PDF — падаем с понятным сообщением, чтобы не
+    // ловить хаос changeIp/cookie от обоих процессов на одном gateway.
+    const leaseCleanupOnStart =
+      (process.env.RAS_PDF_LEASE_CLEANUP_ON_START ?? "1").trim() !== "0";
+    if (leaseCleanupOnStart) {
+      try {
+        await _leaseReleaseDeadLocal({ logger: log });
+      } catch (e) {
+        log(`[lease] releaseDeadLocalLeases перед claim: ${e && e.message}`);
+      }
+    }
+    const leaseRes = await _leaseAcquire({
+      key: MP_PROXY_KEY,
+      role: "parser",
+      logger: log,
+    });
+    leaseHolderId = leaseRes.holderId;
+    if (leaseRes.leased) {
+      leaseStopHeartbeat = _leaseStartHeartbeat({
+        holderId: leaseHolderId,
+        logger: log,
+      });
+    }
     _escalator = new ProxyEscalator({
       proxyClient: mpProxyClient,
       stealth: _stealth,
@@ -3502,7 +4563,7 @@ async function main() {
         `captionRegex=${GEO_FILTERS.excludeCaptionRegex ? GEO_FILTERS.excludeCaptionRegex.source : "off"}`,
     );
 
-    const [initialSetupDf, initialSetupDt] = _windowIso(endDay, windowDays);
+    const [initialSetupDf, initialSetupDt] = _windowIso(endDay);
     const setupPeriodRef = {
       DateFrom: initialSetupDf,
       DateTo: initialSetupDt,
@@ -3525,25 +4586,24 @@ async function main() {
         }
       }
       context = null;
-      if (userDataDir) {
+      if (userDataDir && !userDataDirPersistent) {
         try {
           fs.rmSync(userDataDir, { recursive: true, force: true });
         } catch {}
       }
-      userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ras_chromium_"));
+      if (!userDataDirPersistent) {
+        userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ras_chromium_"));
+      }
+      const recycleFp = buildRasBrowserFingerprint();
       context = await chromium.launchPersistentContext(userDataDir, {
         locale: "ru-RU",
         timezoneId: "Europe/Moscow",
-        userAgent: USER_AGENT,
+        userAgent: recycleFp.userAgent,
         viewport: { width: 1366, height: 900 },
-        extraHTTPHeaders: {
-          "sec-ch-ua": SEC_CH_UA,
-          "sec-ch-ua-mobile": "?0",
-          "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-          "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        },
+        extraHTTPHeaders: recycleFp.extraHTTPHeaders,
         ...launchKwargs,
       });
+      await attachRasAntiDetectToContext(context);
       const freshPages = context.pages();
       page = freshPages.length ? freshPages[0] : await context.newPage();
       _stealth = await StealthBrowserManager.create(page, { logger: log });
@@ -3629,7 +4689,7 @@ async function main() {
         let cycle = 0;
         let emptyStreak = 0;
 
-        let pendingSubs = [{ endDay: outerEnd, daysSpan: windowDays }];
+        let pendingSubs = [{ endDay: outerEnd, daysSpan: 1 }];
         let outerHadItems = false;
         let outerStats = {
           totalItems: 0,
@@ -3641,14 +4701,14 @@ async function main() {
         };
 
         _inWindowLoop = true;
-        while (cycle < cycles) {
+        while (true) {
           if (pendingSubs.length === 0) {
             if (outerHadItems) {
               cycle += 1;
               emptyStreak = 0;
               log(
-                `=== цикл ${cycle}/${_cyclesLabel(cycles)} готов ` +
-                  `(${_formatDdMmYyyy(outerEnd)}, ${windowDays}д): ` +
+                `=== цикл ${cycle} готов ` +
+                  `(${_formatDdMmYyyy(outerEnd)}, 1д): ` +
                   `sub-окон=${outerStats.subsDone}, ` +
                   `страниц=${outerStats.pagesSeen}, ` +
                   `items=${outerStats.totalItems}, ` +
@@ -3682,11 +4742,10 @@ async function main() {
                 break;
               }
             }
-            if (cycle >= cycles) break;
             outerEnd = new Date(
               outerEnd.getFullYear(),
               outerEnd.getMonth(),
-              outerEnd.getDate() - windowDays,
+              outerEnd.getDate() - 1,
             );
             if (
               oldestDay !== null &&
@@ -3698,7 +4757,7 @@ async function main() {
               );
               break;
             }
-            pendingSubs = [{ endDay: outerEnd, daysSpan: windowDays }];
+            pendingSubs = [{ endDay: outerEnd, daysSpan: 1 }];
             outerHadItems = false;
             outerStats = {
               totalItems: 0,
@@ -3712,19 +4771,19 @@ async function main() {
           }
 
           const sub = pendingSubs.pop();
-          const [df, dt] = _windowIso(sub.endDay, sub.daysSpan);
+          const [df, dt] = _windowIso(sub.endDay);
           bodyTemplate.DateFrom = df;
           bodyTemplate.DateTo = dt;
           setupPeriodRef.DateFrom = df;
           setupPeriodRef.DateTo = dt;
           const cycleNumStr = String(cycle + 1).padStart(3, "0");
           const label =
-            sub.daysSpan === windowDays
+            sub.daysSpan === 1
               ? `c${cycleNumStr}`
               : `c${cycleNumStr}d${sub.daysSpan}`;
           log(
             `=== пробую окно ${_formatDdMmYyyy(sub.endDay)}/${sub.daysSpan}д ` +
-              `(${df}..${dt}); завершено циклов: ${cycle}/${_cyclesLabel(cycles)}, ` +
+              `(${df}..${dt}); завершено циклов: ${cycle}, ` +
               `в стеке ещё: ${pendingSubs.length} ===`,
           );
 
@@ -3803,10 +4862,10 @@ async function main() {
         `=== готово. DocumentType собрано: ${Object.keys(documentTypes).length} -> ${OUT_PATH} ===`,
       );
     } else {
-      _saveDecisionLinks();
+      await _saveDecisionLinks();
       log(
-        `=== готово. PDF-ссылки собраны: ${decisionLinks.size} -> ` +
-          `${LINKS_FILE_BASENAME}_NNNN.json (по ${LINKS_CHUNK_SIZE} записей) ===`,
+        `=== готово. PDF-ссылки собраны (в Postgres, таблица acts): ` +
+          `${decisionLinks.size} в Map за прогон ===`,
       );
     }
   } catch (e) {
@@ -3844,6 +4903,25 @@ async function main() {
         log(`[shutdown] Xvfb остановлен (pid=${_xvfbProcess.pid})`);
       } catch {}
       _xvfbProcess = null;
+    }
+    if (leaseStopHeartbeat) {
+      try {
+        leaseStopHeartbeat();
+      } catch {}
+      leaseStopHeartbeat = null;
+    }
+    if (leaseHolderId) {
+      try {
+        const n = await _leaseReleaseAll(leaseHolderId);
+        log(`[shutdown] proxy_leases освобождены: ${n}`);
+      } catch (e) {
+        log(`[shutdown] _leaseReleaseAll упал: ${e && e.message}`);
+      }
+    }
+    try {
+      await _pgClosePool();
+    } catch (e) {
+      log(`[shutdown] pg pool.end() упал: ${e}`);
     }
     log("[shutdown] всё, выход");
   }

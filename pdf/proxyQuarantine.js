@@ -166,6 +166,22 @@ export class ProxyQuarantineRegistry {
     this._451Events.delete(k);
   }
 
+  /**
+   * После успешного recover (changeGeo+probe ok / rotateIp+probe ok) прокси
+   * семантически «отремонтирован»: cooldown больше не нужен. Чистит и события,
+   * и cooldown — следующая итерация worker'а не уйдёт спать.
+   *
+   * Отличается от `recordSuccess`: последний оставляет cooldown как safety-net
+   * на случай флапов; этот же снимает его явно после подтверждённого
+   * восстановления прокси.
+   */
+  markRecovered(key) {
+    const k = this._key(key);
+    this._infraEvents.delete(k);
+    this._451Events.delete(k);
+    this._cooldown.delete(k);
+  }
+
   /** @returns {boolean} */
   isQuarantined(key) {
     const k = this._key(key);

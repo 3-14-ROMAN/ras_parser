@@ -40,7 +40,7 @@
 
 import fs from "node:fs";
 
-import { PDF_GEO_FILTERS } from "../network/config.js";
+import { MP_API_TOKEN, PDF_GEO_FILTERS } from "../network/config.js";
 import {
   markExtractFailed,
   markPdfDownloaded,
@@ -55,12 +55,24 @@ import {
   releaseAll as leaseReleaseAll,
   startHeartbeat as leaseStartHeartbeat,
 } from "../db/proxyLeases.js";
-import { createPdfPool, logPdfDownloadAggregateStats } from "./downloader.js";
+import {
+  createPdfPool,
+  isProbationRotateFirstTrigger,
+  logPdfDownloadAggregateStats,
+} from "./downloader.js";
 import { extractPdfText } from "./extractor.js";
 import {
   ProxyQuarantineRegistry,
   readQuarantineConfigFromEnv,
 } from "./proxyQuarantine.js";
+import {
+  BadGeoBlacklist,
+  readBadGeoBlacklistConfigFromEnv,
+} from "./badGeoBlacklist.js";
+import {
+  probeRecommendedCountriesCached,
+  readProbeOptsFromEnv,
+} from "./proxyHealth.js";
 
 const EXTRACT_WORKERS = Math.max(1, Number(process.env.RAS_PDF_EXTRACT_WORKERS ?? 6));
 const QUEUE_BUFFER = Math.max(1, Number(process.env.RAS_PDF_QUEUE_BUFFER ?? 32));
@@ -126,6 +138,29 @@ const INFRA_PAUSE_MAX_MS = Math.max(
 const HEARTBEAT_MS = Math.max(0, Number(process.env.RAS_PDF_HEARTBEAT_MS ?? 60_000));
 
 /**
+ * Сколько подряд `pravocaptcha_gate`-fails при `no_pdf_yet=1` нужно, чтобы
+ * сработал recover (fast-geo-loop). Дефолт 1 — на свежем worker'е первый же
+ * tokenFrom = bad-geo сигнал, не ждём второго (каждый act-warmup ~50с).
+ * Поднять до 2-3 если есть подозрение на транзиентные срабатывания.
+ */
+const PRAVOCAPTCHA_GATE_STREAK_THRESHOLD = Math.max(
+  1,
+  Number(process.env.RAS_PDF_PRAVOCAPTCHA_GATE_STREAK ?? 1),
+);
+
+/**
+ * Bad-geo fast recovery (см. pdf/downloader.js _recoverByGeoLoop):
+ * вместо долгого quarantine sleep (5-10 мин) — быстро перебираем geo через
+ * changeGeo, пока не найдём живой. Сожжённый geo попадает в in-memory blacklist
+ * на RAS_PDF_BAD_GEO_COOLDOWN_MS, и recovery его не выбирает повторно.
+ *
+ * RAS_PDF_BAD_GEO_RECOVERY=1 (default 1) — включён для всех воркеров.
+ * RAS_PDF_BAD_GEO_RECOVERY=0 → старое поведение (escalator+quarantine sleep).
+ */
+const BAD_GEO_RECOVERY_ENABLED =
+  String(process.env.RAS_PDF_BAD_GEO_RECOVERY ?? "1").trim() !== "0";
+
+/**
  * RAS_PDF_PARALLEL_DOWNLOADERS:
  *   - "auto" / пусто / 0 → использовать ВСЕ найденные через getMyProxy прокси
  *   - число N → ограничить пул до N воркеров (даже если прокси больше)
@@ -143,6 +178,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @param {{ raw?: any, task?: any }} r
  * @param {number} proxyId
  */
+/** [YYYY-MM-DD HH:MM:SS.mmm] для дефолтных fallback-логеров (только если caller не передал свой). */
+function _pipelineTs() {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, "0");
+  const p3 = (n) => String(n).padStart(3, "0");
+  return (
+    `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
+    `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${p3(d.getMilliseconds())}`
+  );
+}
+
 function _equipmentCheckedFalseForProxy(r, proxyId) {
   const idNum = Number(proxyId);
   if (!Number.isFinite(idNum)) return false;
@@ -295,18 +341,56 @@ async function _attemptWorkerRecovery({ label, downloader, log }) {
  * сменой IP/гео без жжения PDF_MAX_ATTEMPTS на уровне акта.
  *
  *   reason="infra" → changeGeo (туннель/warmup гнилые — меняем gateway/регион).
- *   451 → см. `_attempt451ProxyRecoverBeforeQuarantine` (чередование IP/гео на воркере).
+ *   451 → см. `_attempt451ProxyRecoverBeforeQuarantine` (changeGeo first для 451,
+ *         потому что rotateIp часто возвращает тот же IP).
  *
  * Возвращает true, если recover успел сменить IP/гео И surface перезапустился.
  * `ok=false` от прокси-API чаще всего значит hard-cooldown (например, 24ч
  * между changeGeo) — тогда падаем в обычный quarantine sleep.
  *
- * @param {{ label: string, downloader: any, log: (m: string) => void, reason: "infra" }} opts
+ * @param {{
+ *   label: string,
+ *   downloader: any,
+ *   log: (m: string) => void,
+ *   reason: string,
+ *   shouldStop?: () => boolean,
+ *   tryRotateFirst?: boolean,
+ *   loopUntilSuccess?: boolean,
+ * }} opts
  * @returns {Promise<boolean>}
  */
-async function _attemptProxyRecoverBeforeQuarantine({ label, downloader, log, reason }) {
+async function _attemptProxyRecoverBeforeQuarantine({
+  label,
+  downloader,
+  log,
+  reason,
+  shouldStop,
+  tryRotateFirst = false,
+  loopUntilSuccess = false,
+}) {
   const client = downloader.proxyClient;
   if (!client) return false;
+  // Fast bad-geo recovery: вместо одного changeGeo — крутим до RAS_PDF_RECOVER_MAX_ROUNDS
+  // в downloader._recoverByGeoLoop, помечая сожжённые geo в blacklist.
+  if (
+    BAD_GEO_RECOVERY_ENABLED &&
+    typeof downloader.hasFastGeoRecovery === "function" &&
+    downloader.hasFastGeoRecovery()
+  ) {
+    const r = await downloader._recoverByGeoLoop({
+      reason: `pdf-quarantine ${reason}`,
+      shouldStop,
+      tryRotateFirst,
+      loopUntilSuccess,
+    });
+    log(
+      `[pdf/proxy-recover] fast-geo-loop reason=${reason} ok=${r.ok}` +
+        (r.ok
+          ? ` mode=${r.mode ?? "?"} geo=${r.geoid ?? "?"} round=${r.round ?? r.attempt ?? "?"}`
+          : ` reason=${r.reason ?? "?"}`),
+    );
+    return r.ok === true;
+  }
   const action = "changeGeo";
   const apiName = "changeGeo";
   if (typeof client[apiName] !== "function") return false;
@@ -345,15 +429,53 @@ async function _attemptProxyRecoverBeforeQuarantine({ label, downloader, log, re
 }
 
 /**
- * Last-ditch 451 recover: чередование rotateIp / changeGeo на этом воркере
- * (next451RecoverAction снаружи). Тот же recoverReason, что и раньше для 451.
+ * Last-ditch 451 recover: при включённом BAD_GEO_RECOVERY_ENABLED → fast-geo-loop
+ * в downloader (rotateIp-first до первого PDF OK, changeGeo иначе, blacklist
+ * по geo+operator+IP, HTTP probe ras/kad до warmup, exhausted pause).
+ * При loopUntilSuccess=true (single-worker) — не выходит до успеха или stop.
+ * Иначе — старая логика чередования rotateIp/changeGeo (legacy fallback).
  *
- * @param {{ label: string, downloader: any, log: (m: string) => void, action: "ip"|"geo" }} opts
+ * @param {{
+ *   label: string,
+ *   downloader: any,
+ *   log: (m: string) => void,
+ *   action: "ip"|"geo",
+ *   shouldStop?: () => boolean,
+ *   tryRotateFirst?: boolean,
+ *   loopUntilSuccess?: boolean,
+ * }} opts
  * @returns {Promise<boolean>}
  */
-async function _attempt451ProxyRecoverBeforeQuarantine({ label, downloader, log, action }) {
+async function _attempt451ProxyRecoverBeforeQuarantine({
+  label,
+  downloader,
+  log,
+  action,
+  shouldStop,
+  tryRotateFirst = false,
+  loopUntilSuccess = false,
+}) {
   const client = downloader.proxyClient;
   if (!client) return false;
+  if (
+    BAD_GEO_RECOVERY_ENABLED &&
+    typeof downloader.hasFastGeoRecovery === "function" &&
+    downloader.hasFastGeoRecovery()
+  ) {
+    const r = await downloader._recoverByGeoLoop({
+      reason: "pdf-quarantine 451",
+      shouldStop,
+      tryRotateFirst,
+      loopUntilSuccess,
+    });
+    log(
+      `[pdf/proxy-recover] fast-geo-loop reason=451 ok=${r.ok}` +
+        (r.ok
+          ? ` mode=${r.mode ?? "?"} geo=${r.geoid ?? "?"} round=${r.round ?? r.attempt ?? "?"}`
+          : ` reason=${r.reason ?? "?"}`),
+    );
+    return r.ok === true;
+  }
   const recoverReason = "pdf-quarantine recover 451";
   let ok = false;
   let detail = "";
@@ -421,67 +543,162 @@ async function _resolveWorkerCountryId(worker) {
 }
 
 /**
- * Preflight: для каждого воркера, у которого стартовый прокси в РФ
- * (id_country=1), один раз сделать changeGeo в не-РФ (фильтр PDF_GEO_FILTERS
- * + safety-net excludeCountryIds=[1] из network/config.js). После успешного
- * changeGeo перезапускаем surface, чтобы Chromium перепогрел сессию с новым IP.
+ * Bad-country list: страны, в которых pravocaptcha бьёт 451 / отдаёт tokenFrom
+ * даже на свежих IP. Probe 2026-05: РФ-megafone, UA-Kyivstar/vodafone стабильно
+ * горят. KZ/BY/KG проходят 9/10.
  *
- * Не критично: changeGeo может упасть на cooldown / no-allowed-geo — просто
- * логируем и продолжаем. Воркер тогда поймает первый 451 и сработает обычный
- * L3 force-geo recovery.
+ * Дефолт `1,2` (RU, UA). Переопределение `RAS_PDF_BAD_COUNTRY_IDS=1,2,180`.
  *
- * @param {{ workers: any[], log: (m: string) => void }} opts
+ * @returns {Set<number>}
  */
-async function _preflightLeaveRussiaIfNeeded({ workers, log }) {
+function _readBadCountryIdsFromEnv() {
+  const raw = String(process.env.RAS_PDF_BAD_COUNTRY_IDS ?? "1,2").trim();
+  if (!raw) return new Set([1, 2]);
+  const ids = raw
+    .split(/[,\s]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return new Set(ids.length ? ids : [1, 2]);
+}
+
+/**
+ * Preflight: для каждого воркера, у которого стартовый прокси в стране из
+ * bad-country-листа (RU=1, UA=2 по дефолту), ДО старта worker-loop'а вызываем
+ * полноценный fast-geo-loop в downloader'e:
+ *
+ *   markBad текущий geo+operator+ip → changeGeo(requireCountryIds=22,82,145)
+ *   → HTTP probe ras/kad → restart surface. Если probe не ok — markBad новый
+ *   geo и идём дальше до RECOVER_MAX_ROUNDS. С `loopUntilSuccess=true` (это
+ *   старт, других воркеров нет) — после exhausted_pause продолжаем поиск.
+ *
+ * Это экономит ~100с per-worker (warmup ras→kad/Card ~50с × N=2 актов с
+ * tokenFrom → consecutivePravocaptchaGate триггерит то же самое позже).
+ *
+ * Не критично: если recover полностью провалился — продолжаем как есть, в
+ * worker loop'е сработает обычный bad-geo trigger.
+ *
+ * @param {{ workers: any[], log: (m: string) => void, shouldStop?: () => boolean }} opts
+ */
+/**
+ * @param {{
+ *   workers: any[],
+ *   log: (m: string) => void,
+ *   shouldStop?: () => boolean,
+ *   recommendedCountries?: number[]|null,
+ *   escapeFilters?: object|null,
+ * }} opts
+ */
+async function _preflightEscapeBadCountry({
+  workers,
+  log,
+  shouldStop,
+  recommendedCountries = null,
+  escapeFilters = null,
+}) {
+  const badCountries = _readBadCountryIdsFromEnv();
+  const hasRecommended =
+    Array.isArray(recommendedCountries) && recommendedCountries.length > 0;
+  const recommendedSet = hasRecommended ? new Set(recommendedCountries) : null;
+  const effectiveFilters = escapeFilters ?? PDF_GEO_FILTERS;
+  log(
+    `[pipe/preflight] bad_country_ids={${[...badCountries].join(",")}}, ` +
+      `target={${effectiveFilters.requireCountryIds?.join(",") || "any"}}` +
+      (hasRecommended ? ` recommended={${recommendedCountries.join(",")}}` : ""),
+  );
   for (const w of workers) {
+    if (typeof shouldStop === "function" && shouldStop()) return;
     const countryId = await _resolveWorkerCountryId(w);
-    if (countryId !== 1) {
-      log(`[pipe/preflight] ${w.label} country_id=${countryId ?? "?"} — пропускаю (не РФ)`);
+    if (countryId == null) {
+      log(`[pipe/preflight] ${w.label} country_id=? — пропускаю (не смог резолвнуть)`);
       continue;
+    }
+    // Решение «нужен escape?»:
+    //   - если probe вернул recommended-список и страна воркера в нём → OK, skip;
+    //   - если probe вернул recommended-список и страны воркера в нём НЕТ → escape;
+    //   - если probe не дал результата, fall back на статичный bad-list.
+    let needsEscape = false;
+    let escapeReason = "";
+    if (hasRecommended) {
+      if (recommendedSet.has(countryId)) {
+        log(
+          `[pipe/preflight] ${w.label} country_id=${countryId} IN recommended ` +
+            `{${recommendedCountries.join(",")}} — OK`,
+        );
+        continue;
+      }
+      needsEscape = true;
+      escapeReason = `country_id=${countryId} NOT in recommended {${recommendedCountries.join(",")}}`;
+    } else {
+      if (!badCountries.has(countryId)) {
+        log(
+          `[pipe/preflight] ${w.label} country_id=${countryId} OK (не в bad-list) — пропускаю`,
+        );
+        continue;
+      }
+      needsEscape = true;
+      escapeReason = `country_id=${countryId} in bad-list {${[...badCountries].join(",")}}`;
     }
     if (!w.proxyClient || typeof w.proxyClient.changeGeo !== "function") {
-      log(`[pipe/preflight] ${w.label} country_id=1 (РФ), но proxyClient/changeGeo нет — пропускаю`);
-      continue;
-    }
-    log(`[pipe/preflight] ${w.label} стартовый прокси в РФ — делаю changeGeo на не-РФ`);
-    let r;
-    try {
-      r = await w.proxyClient.changeGeo("pdf-preflight leave RU", {
-        filters: PDF_GEO_FILTERS,
-      });
-    } catch (e) {
-      log(`[pipe/preflight] ${w.label} changeGeo threw: ${e && e.message} — продолжаю как есть`);
-      continue;
-    }
-    if (!r?.ok) {
       log(
-        `[pipe/preflight] ${w.label} changeGeo не сработал (reason=${r?.reason ?? "?"}) — ` +
-          `продолжаю как есть, дальше сработает обычный force-geo recovery`,
+        `[pipe/preflight] ${w.label} ${escapeReason}, но proxyClient/changeGeo нет — пропускаю`,
       );
       continue;
     }
-    log(
-      `[pipe/preflight] ${w.label} changeGeo OK geo='${r.caption ?? "?"}' ` +
-        `country=${r.detail?.countryId ?? "?"} — рестарт Chromium surface`,
-    );
-    try {
-      const proxyId =
-        (typeof w.proxyClient.getResolvedProxyId === "function"
-          ? await w.proxyClient.getResolvedProxyId()
-          : null) ?? null;
-      const abuse = _extractIpGuardianAbuse(r, proxyId);
-      if (abuse?.found) {
-        log(
-          `[pipe/preflight] ${w.label} ВНИМАНИЕ: новый IP ${abuse.ip} в abuse-списках ` +
-            `(${abuse.sources.join(", ") || "?"}) — pravocaptcha kad.arbitr.ru скорее всего ` +
-            `отдаст 451. Если 451 продолжится — нужны другие/качественные прокси.`,
+    if (
+      typeof w.downloader?.hasFastGeoRecovery !== "function" ||
+      !w.downloader.hasFastGeoRecovery()
+    ) {
+      // Fallback: прямой changeGeo + restart, без probe и без blacklist.
+      log(
+        `[pipe/preflight] ${w.label} ${escapeReason} — fast-geo-loop недоступен, прямой changeGeo`,
+      );
+      try {
+        const r = await w.proxyClient.changeGeo(
+          "pdf-preflight escape (fallback)",
+          { filters: effectiveFilters },
         );
+        log(
+          `[pipe/preflight] ${w.label} changeGeo ok=${r?.ok === true} ` +
+            `reason=${r?.reason ?? "?"} caption='${r?.caption ?? "?"}'`,
+        );
+        if (r?.ok) {
+          await w.downloader._restartPdfSurface("preflight escape (fallback)");
+        }
+      } catch (e) {
+        log(`[pipe/preflight] ${w.label} fallback changeGeo threw: ${e && e.message}`);
       }
-    } catch {}
+      continue;
+    }
+    log(
+      `[pipe/preflight] ${w.label} ${escapeReason} — fast-geo-loop ` +
+        `(target=[${effectiveFilters.requireCountryIds?.join(",") || "any"}])`,
+    );
+    let r;
     try {
-      await w.downloader._restartPdfSurface("preflight leave RU");
+      r = await w.downloader._recoverByGeoLoop({
+        reason: hasRecommended
+          ? `preflight_not_recommended_${countryId}`
+          : `preflight_bad_country_${countryId}`,
+        shouldStop,
+        // Не пробуем rotateIp в текущем geo — мы знаем, что country целиком плох.
+        tryRotateFirst: false,
+        // На старте больше некому брать очередь — крутимся до успеха.
+        loopUntilSuccess: true,
+      });
     } catch (e) {
-      log(`[pipe/preflight] ${w.label} _restartPdfSurface failed: ${e && e.message}`);
+      log(`[pipe/preflight] ${w.label} fast-geo-loop threw: ${e && e.message} — продолжаю как есть`);
+      continue;
+    }
+    if (r?.ok) {
+      log(
+        `[pipe/preflight] ${w.label} escape OK mode=${r.mode ?? "?"} geo=${r.geoid ?? "?"} ` +
+          `round=${r.round ?? r.attempt ?? "?"}`,
+      );
+    } else {
+      log(
+        `[pipe/preflight] ${w.label} escape FAILED reason=${r?.reason ?? "?"} — ` +
+          `продолжаю как есть; обычный force-geo recovery сработает в worker loop`,
+      );
     }
   }
 }
@@ -788,7 +1005,7 @@ class SharedActQueue {
  * }} opts
  */
 export async function runPipeline({ workDir, logger, ids = null }) {
-  const log = logger ?? ((m) => process.stdout.write(`${m}\n`));
+  const log = logger ?? ((m) => process.stdout.write(`[${_pipelineTs()}] ${m}\n`));
   fs.mkdirSync(workDir, { recursive: true });
 
   // Startup PG-запросы прячем за тем же retry, что и worker'ные: если БД
@@ -821,6 +1038,18 @@ export async function runPipeline({ workDir, logger, ids = null }) {
       `→ cd=${quarantineCfg.fourFiftyOneCooldownMs}ms`,
   );
 
+  // Bad-geo blacklist: in-memory, общий на пайплайн. Recovery loop в
+  // downloader.js читает его, чтобы не возвращаться к сожжённым geo.
+  const badGeoCfg = readBadGeoBlacklistConfigFromEnv();
+  const badGeoBlacklist = new BadGeoBlacklist({
+    cooldownMs: badGeoCfg.cooldownMs,
+    logger: log,
+  });
+  log(
+    `[pipe] bad-geo recovery: enabled=${BAD_GEO_RECOVERY_ENABLED} ` +
+      `cooldown=${badGeoCfg.cooldownMs}ms`,
+  );
+
   // ── Шаг 0: до начала скачивания добиваем висящие в очереди экстракта. ──
   await _drainPendingTextFromDb(log);
 
@@ -832,17 +1061,112 @@ export async function runPipeline({ workDir, logger, ids = null }) {
     workDir,
     logger: log,
     maxWorkers: PARALLEL_MAX,
+    badGeoBlacklist,
   });
   log(`[pipe] download pool: ${workers.length} воркер(ов)`);
 
-  // Preflight: если стартовый прокси воркера в РФ (id_country=1), pravocaptcha
-  // на kad.arbitr.ru банит его 451 на первом же запросе. Лучше потратить
-  // одну changeGeo (≤180с cooldown) до старта, чем сжечь N актов на 451+defer
-  // и потом всё равно уйти в quarantine. Не блокирующее: если changeGeo не
-  // помог (cooldown/no-candidates) — продолжаем как раньше, в надежде на
-  // L3 force-geo по ходу работы.
-  if (String(process.env.RAS_PDF_PREFLIGHT_GEO_IF_RU ?? "0").trim() === "1") {
-    await _preflightLeaveRussiaIfNeeded({ workers, log });
+  // Preflight: до старта worker-loop'а решаем, нужно ли каждому воркеру
+  // changeGeo. Источник правды — anti-cloak probe ras.arbitr.ru через
+  // MobileProxy API (если есть MP_API_TOKEN и не отключён env'ом). Probe даёт
+  // recommended-страны; ниже мы override'им geoFilters воркеров на этот список,
+  // и _preflightEscapeBadCountry триггерит fast-geo-loop для тех, чья текущая
+  // страна не в recommended. Если probe вернул пусто или сломался — fall back
+  // на статичный RAS_PDF_BAD_COUNTRY_IDS bad-list (старое поведение).
+  //
+  // Если recovery полностью провалился — пайплайн всё равно стартует, в worker
+  // loop'е сработает обычный bad-geo trigger.
+  //
+  // Выключить весь preflight: RAS_PDF_PREFLIGHT_GEO=0
+  // Выключить только probe (оставить static bad-list): RAS_PDF_PREFLIGHT_PROBE=0
+  const preflightFlag = String(
+    process.env.RAS_PDF_PREFLIGHT_GEO ??
+      process.env.RAS_PDF_PREFLIGHT_GEO_IF_RU ??
+      "1",
+  ).trim();
+  if (preflightFlag !== "0" && preflightFlag.toLowerCase() !== "off") {
+    /** @type {number[]|null} */
+    let recommendedCountries = null;
+    /** @type {object|null} */
+    let escapeFilters = null;
+    const probeFlag = String(process.env.RAS_PDF_PREFLIGHT_PROBE ?? "1").trim();
+    const probeEnabled =
+      probeFlag !== "0" &&
+      probeFlag.toLowerCase() !== "off" &&
+      Boolean(MP_API_TOKEN);
+    if (!MP_API_TOKEN) {
+      log(`[pipe/preflight-probe] MP_API_TOKEN пуст — пропускаю anti-cloak probe`);
+    } else if (!probeEnabled) {
+      log(`[pipe/preflight-probe] RAS_PDF_PREFLIGHT_PROBE=0 — пропускаю anti-cloak probe`);
+    } else {
+      const probeOpts = readProbeOptsFromEnv();
+      // Reuse страны из workers'ов — createPdfPool только что дёргал getMyProxy,
+      // повторный raw fetch в proxyHealth поймает MP-rate-limit «Too many same
+      // requests, wait 3 seconds». Берём id_country, которые уже в workers,
+      // объединяем с target/probe candidates, передаём как candidatesOverride.
+      const workerCountries = workers
+        .map((w) => Number(w.countryId))
+        .filter((n) => Number.isFinite(n) && n > 0);
+      const candidatesSet = new Set(workerCountries);
+      for (const cid of probeOpts.targetCountryIds) {
+        if (Number.isFinite(cid) && cid > 0) candidatesSet.add(cid);
+      }
+      for (const cid of probeOpts.excludeCountryIds) {
+        candidatesSet.delete(cid);
+      }
+      const candidatesOverride = [...candidatesSet];
+      log(
+        `[pipe/preflight-probe] anti-cloak probe ${probeOpts.url} ` +
+          `worker_countries=[${workerCountries.join(",")}] ` +
+          `target={${probeOpts.targetCountryIds.join(",") || "—"}} ` +
+          `exclude={${probeOpts.excludeCountryIds.join(",")}} → ` +
+          `пробую [${candidatesOverride.join(",")}]`,
+      );
+      try {
+        const r = await probeRecommendedCountriesCached({
+          apiToken: MP_API_TOKEN,
+          ...probeOpts,
+          // Override: не вызывать get_my_proxy повторно (MP rate-limit 3с).
+          candidatesOverride: candidatesOverride.length ? candidatesOverride : null,
+          logger: log,
+        });
+        if (r.recommended.length > 0) {
+          recommendedCountries = r.recommended;
+          escapeFilters = {
+            ...PDF_GEO_FILTERS,
+            requireCountryIds: r.recommended.slice(),
+            requireCountryId: null,
+          };
+          // Override geoFilters на каждом воркере — следующие changeGeo (из
+          // preflight и из worker-loop'а) пойдут в recommended-страны.
+          for (const w of workers) {
+            if (w.downloader && typeof w.downloader.setGeoFilters === "function") {
+              w.downloader.setGeoFilters(escapeFilters);
+            }
+          }
+          log(
+            `[pipe/preflight-probe] установил geoFilters.requireCountryIds=` +
+              `[${r.recommended.join(",")}] для ${workers.length} воркеров`,
+          );
+        } else {
+          log(
+            `[pipe/preflight-probe] probe не нашёл recommended-стран — ` +
+              `использую статичный bad-list fallback`,
+          );
+        }
+      } catch (e) {
+        log(
+          `[pipe/preflight-probe] probe упал: ${e && e.message} — ` +
+            `использую статичный bad-list fallback`,
+        );
+      }
+    }
+    await _preflightEscapeBadCountry({
+      workers,
+      log,
+      shouldStop: () => false,
+      recommendedCountries,
+      escapeFilters,
+    });
   }
 
   // Общий стейт для лога «все воркеры в карантине». Один раз шумим, при
@@ -996,6 +1320,7 @@ export async function runPipeline({ workDir, logger, ids = null }) {
   }
 
   // ── Шаг 7: download-pool. Promise.allSettled + watchdog race. ──
+  const singleWorker = workers.length === 1;
   try {
     const poolPromise = Promise.allSettled(
       workers.map((w) =>
@@ -1012,6 +1337,7 @@ export async function runPipeline({ workDir, logger, ids = null }) {
           runState,
           shouldStop,
           metrics,
+          singleWorker,
         }),
       ),
     );
@@ -1106,6 +1432,7 @@ async function _downloadWorker({
   runState,
   shouldStop,
   metrics,
+  singleWorker = false,
 }) {
   const notifyQuarantineStateChange = () => {
     if (typeof announceAllSleepingIfApplicable === "function") {
@@ -1135,8 +1462,21 @@ async function _downloadWorker({
    * активном cooldown), но воркер продолжит попытки до естественного выхода.
    */
   let skipQuarantineCheckOnce = false;
-  /** Следующий шаг last-ditch recover при пороге 451: ip → rotateIp, geo → changeGeo. */
-  let next451RecoverAction = "ip";
+  /**
+   * Следующий шаг last-ditch recover при пороге 451: geo → changeGeo, ip → rotateIp.
+   * ВАЖНО: для 451 первым ходим в changeGeo (а не в rotateIp), потому что
+   * pravocaptcha банит IP+fingerprint, а rotateIp в пределах того же gateway
+   * часто возвращает тот же IP — это «recover», который не recover. Сразу geo.
+   * При BAD_GEO_RECOVERY_ENABLED действие игнорируется — fast-geo-loop сам всё рулит.
+   */
+  let next451RecoverAction = "geo";
+  /**
+   * Подряд событий pravocaptcha_gate без единого PDF OK за сессию воркера.
+   * Если getSessionPdfSavedCount()===0 и счётчик ≥ 2 — текущий geo/IP считается
+   * плохим и форсим changeGeo, не уходим по кругу defer и не ждём quarantine sleep.
+   * Сбрасывается на любом не-pravocaptcha исходе, на PDF OK и после самой смены geo.
+   */
+  let consecutivePravocaptchaGate = 0;
   /**
    * Подряд неожиданных исключений в теле цикла (не штатный результат
    * downloadAndSave, а throw из claimNext / markPdfDownloaded / etc).
@@ -1157,6 +1497,33 @@ async function _downloadWorker({
     if (skipQuarantineCheckOnce) {
       skipQuarantineCheckOnce = false;
     } else if (quarantine && proxyKey && quarantine.isQuarantined(proxyKey)) {
+      // Single-worker pre-first-PDF: пайплайн «не идёт», пока единственный
+      // воркер в карантинном sleep. Bypass'им sleep и крутим recovery loop
+      // с loopUntilSuccess=true. Если ок → markRecovered (cooldown снят),
+      // продолжаем; если shouldStop пришёл во время recovery → выход.
+      if (singleWorker && downloader.getSessionPdfSavedCount() === 0) {
+        log(
+          `[pdf/quarantine] proxy=${proxyTag} single-worker pre-first-OK — bypass sleep, recover-loop`,
+        );
+        const recovered = await _attempt451ProxyRecoverBeforeQuarantine({
+          label,
+          downloader,
+          log,
+          action: "geo",
+          shouldStop,
+          tryRotateFirst: true,
+          loopUntilSuccess: true,
+        });
+        if (recovered) {
+          counters.worker_restarts += 1;
+          quarantine.markRecovered(proxyKey);
+          consecutiveInfraFails = 0;
+          notifyQuarantineStateChange();
+          continue;
+        }
+        logWorkerEnd(`[${label}] стоп во время bypass recovery — выхожу`);
+        return;
+      }
       wasQuarantined = true;
       const until = quarantine.getQuarantineUntil(proxyKey) ?? Date.now();
       const remaining = Math.max(0, until - Date.now());
@@ -1206,9 +1573,41 @@ async function _downloadWorker({
         counters.dl_deferred += 1;
         if (metrics) metrics.noteDeferred();
         consecutiveInfraFails += 1;
+        consecutivePravocaptchaGate = 0;
         log(
           `[pdf/defer] id=${act.id} reason=infra_${reason} worker=${label} next=batch_later`,
         );
+        // До первого PDF OK за сессию воркера трактуем infra как bad-geo сигнал.
+        // Probation-логика: сначала пробуем rotateIp×N в текущем geo (см.
+        // _tryRotateInCurrentGeoFirst в downloader.js), и только если rotateIp
+        // не дал probe ok — markBad + changeGeo. Для single-worker заворачиваем
+        // в loopUntilSuccess: один-воркер пайплайн не может ждать, пока «другие»
+        // воркеры разгребут, других нет — recovery должен сам найти живой geo.
+        if (downloader.getSessionPdfSavedCount() === 0) {
+          log(
+            `[pdf/bad-geo] proxy=${proxyTag} reason=infra_${reason} no_pdf_yet=1 — recover (rotate-first)`,
+          );
+          // Pre-first-OK → loopUntilSuccess=true всегда (не только singleWorker):
+          // по спеке «процесс должен продолжать искать живой вариант, а не
+          // уходить в длинный quarantine sleep». В multi-worker этот воркер
+          // будет крутить recover, остальные продолжают своё.
+          const recovered = await _attemptProxyRecoverBeforeQuarantine({
+            label,
+            downloader,
+            log,
+            reason: `infra_${reason}_bad_geo`,
+            shouldStop,
+            tryRotateFirst: true,
+            loopUntilSuccess: true,
+          });
+          if (recovered) {
+            counters.worker_restarts += 1;
+            consecutiveInfraFails = 0;
+            skipQuarantineCheckOnce = true;
+            if (quarantine && proxyKey) quarantine.markRecovered(proxyKey);
+            continue;
+          }
+        }
         // 2) Зарегистрировать infra-фейл per proxy_key. Если порог в окне
         //    превышен — уводим прокси в карантин и СРАЗУ continue
         //    (следующая итерация уснёт в quarantine-loop'е выше).
@@ -1224,18 +1623,27 @@ async function _downloadWorker({
             counters.worker_paused += 1;
             notifyQuarantineStateChange();
             // Last-ditch recover ПЕРЕД sleep: меняем гео (тяжелее IP, но
-            // для infra/туннеля чаще помогает). Если hard-cooldown — падаем
-            // в обычный quarantine sleep.
+            // для infra/туннеля чаще помогает). При BAD_GEO_RECOVERY_ENABLED —
+            // быстрый changeGeo loop с blacklist (см. downloader._recoverByGeoLoop):
+            // не ждём 5-10 мин quarantine, перебираем geo пока не найдём живой.
+            // Single-worker → loopUntilSuccess: не уходим в sleep, других воркеров нет.
+            // Pre-first-OK → tryRotateFirst: до markBad geo пробуем rotateIp+probe.
+            const noPdfOkYet = downloader.getSessionPdfSavedCount() === 0;
             const recovered = await _attemptProxyRecoverBeforeQuarantine({
               label,
               downloader,
               log,
               reason: "infra",
+              shouldStop,
+              tryRotateFirst: noPdfOkYet,
+              // Pre-first-OK или single-worker → не уходим в quarantine sleep.
+              loopUntilSuccess: noPdfOkYet || singleWorker,
             });
             if (recovered) {
               counters.worker_restarts += 1;
               consecutiveInfraFails = 0;
               skipQuarantineCheckOnce = true;
+              if (quarantine && proxyKey) quarantine.markRecovered(proxyKey);
               continue;
             }
             log(`[pdf/quarantine] proxy_key_sleep reason=recover_failed_or_cooldown`);
@@ -1286,6 +1694,80 @@ async function _downloadWorker({
         counters.dl_deferred += 1;
         if (metrics) metrics.noteDeferred();
         consecutiveInfraFails = 0;
+
+        const noPdfOkInSession = downloader.getSessionPdfSavedCount() === 0;
+
+        // pravocaptcha_gate без единого PDF OK — bad-geo сигнал. На втором
+        // подряд событии форсим recover: пробуем сначала rotateIp×N в текущем
+        // geo, потом changeGeo (см. downloader._recoverByGeoLoop). Если PDF OK
+        // уже был — счётчик сбрасываем (gate скорее всего транзиентный).
+        if (r.reason === "pravocaptcha_gate") {
+          if (noPdfOkInSession) {
+            consecutivePravocaptchaGate += 1;
+            if (consecutivePravocaptchaGate >= PRAVOCAPTCHA_GATE_STREAK_THRESHOLD) {
+              log(
+                `[pdf/bad-geo] proxy=${proxyTag} reason=pravocaptcha_gate ` +
+                  `streak=${consecutivePravocaptchaGate} no_pdf_yet=1 — recover (rotate-first)`,
+              );
+              const recovered = await _attemptProxyRecoverBeforeQuarantine({
+                label,
+                downloader,
+                log,
+                reason: "pravocaptcha_gate_bad_geo",
+                shouldStop,
+                tryRotateFirst: true,
+                // Pre-first-OK → не уходим в quarantine sleep ни в каком случае.
+                loopUntilSuccess: true,
+              });
+              consecutivePravocaptchaGate = 0;
+              if (recovered) {
+                counters.worker_restarts += 1;
+                skipQuarantineCheckOnce = true;
+                if (quarantine && proxyKey) quarantine.markRecovered(proxyKey);
+                continue;
+              }
+            }
+          } else {
+            consecutivePravocaptchaGate = 0;
+          }
+        } else {
+          consecutivePravocaptchaGate = 0;
+        }
+
+        // 451 без единого PDF OK — recover loop с rotate-first (по plan'у юзера:
+        // pravocaptcha-fingerprint иногда отвязывается ВМЕСТЕ с IP в пределах
+        // того же gateway; до markBad geo пробуем rotateIp+probe). Не ждём
+        // quarantine threshold. Если recover удался — пропускаем запись в
+        // реестр на этой итерации. Single-worker → loopUntilSuccess.
+        if (
+          quarantine &&
+          proxyKey &&
+          r.status === 451 &&
+          noPdfOkInSession
+        ) {
+          log(
+            `[pdf/bad-geo] proxy=${proxyTag} reason=451 no_pdf_yet=1 — recover (rotate-first)`,
+          );
+          const recovered = await _attempt451ProxyRecoverBeforeQuarantine({
+            label,
+            downloader,
+            log,
+            action: "geo",
+            shouldStop,
+            tryRotateFirst: true,
+            // Pre-first-OK → не уходим в quarantine sleep ни в каком случае.
+            loopUntilSuccess: true,
+          });
+          if (recovered) {
+            counters.worker_restarts += 1;
+            // next451RecoverAction оставляем "geo" — пока pre-first-OK
+            // альтернация на rotateIp бессмысленна.
+            skipQuarantineCheckOnce = true;
+            if (quarantine && proxyKey) quarantine.markRecovered(proxyKey);
+            continue;
+          }
+        }
+
         // 2) Если это 451 — записываем в реестр и при необходимости карантиним.
         if (quarantine && proxyKey && r.status === 451) {
           const q = quarantine.record451(proxyKey);
@@ -1298,20 +1780,33 @@ async function _downloadWorker({
             );
             counters.worker_paused += 1;
             notifyQuarantineStateChange();
-            // Last-ditch recover ПЕРЕД sleep: пробуем сменить IP. Если ок —
-            // restart Chromium и continue, обходя quarantine-sleep на этой
-            // итерации (флаг skipQuarantineCheckOnce). Cooldown в registry
-            // остаётся как safety-net.
+            // Last-ditch recover ПЕРЕД sleep:
+            // - BAD_GEO_RECOVERY_ENABLED: fast-geo-loop с blacklist + probe + rotate-first.
+            //   До первого PDF OK rotateIp×N в текущем geo перед markBad+changeGeo
+            //   (pravocaptcha-fingerprint иногда отвязывается с IP в том же gateway).
+            //   После PDF OK rotateIp-first выключен (probation_clear=true).
+            // - иначе: чередование geo/ip (legacy fallback).
+            // Single-worker → loopUntilSuccess (нет смысла ждать «других» воркеров,
+            // их нет — recovery loop сам найдёт живой geo).
+            const action = noPdfOkInSession ? "geo" : next451RecoverAction;
             const recovered = await _attempt451ProxyRecoverBeforeQuarantine({
               label,
               downloader,
               log,
-              action: next451RecoverAction,
+              action,
+              shouldStop,
+              tryRotateFirst: noPdfOkInSession,
+              // Pre-first-OK или single-worker → не уходим в quarantine sleep.
+              loopUntilSuccess: noPdfOkInSession || singleWorker,
             });
             if (recovered) {
               counters.worker_restarts += 1;
-              next451RecoverAction = next451RecoverAction === "ip" ? "geo" : "ip";
+              if (!noPdfOkInSession) {
+                next451RecoverAction =
+                  next451RecoverAction === "geo" ? "ip" : "geo";
+              }
               skipQuarantineCheckOnce = true;
+              if (quarantine && proxyKey) quarantine.markRecovered(proxyKey);
               continue;
             }
             log(`[pdf/quarantine] proxy_key_sleep reason=recover_failed_or_cooldown`);
@@ -1322,6 +1817,51 @@ async function _downloadWorker({
         continue;
       }
       if (r.recoverable) {
+        // По спеке пункт 7: до первого PDF OK триггеры вроде evaluate timeout,
+        // ERR_HTTP2_*, execution context destroyed, chrome-error, empty
+        // response — это bad-geo сигнал, а не «акт виноват». Вместо тихого
+        // paceAfterFailure запускаем тот же recovery loop, что для 451/infra:
+        // rotateIp×N в текущем geo, дальше changeGeo.
+        const noPdfOkInSession = downloader.getSessionPdfSavedCount() === 0;
+        if (
+          noPdfOkInSession &&
+          isProbationRotateFirstTrigger({
+            status: r.status ?? null,
+            error: r.error ?? null,
+            reason: r.reason ?? null,
+          })
+        ) {
+          // Возвращаем акт в общий пул — другой воркер может его подобрать,
+          // пока этот крутит recover. (Если pool пустой / single-worker —
+          // он же его потом и заберёт после recover.)
+          try {
+            source.deferAct(act);
+          } catch (e) {
+            log(`[${label}] deferAct: ${e}`);
+          }
+          counters.dl_deferred += 1;
+          if (metrics) metrics.noteDeferred();
+          log(
+            `[pdf/bad-geo] proxy=${proxyTag} recoverable=${r.error ?? r.reason ?? "?"} ` +
+              `status=${r.status ?? "?"} no_pdf_yet=1 — recover (rotate-first)`,
+          );
+          const recovered = await _attemptProxyRecoverBeforeQuarantine({
+            label,
+            downloader,
+            log,
+            reason: `recoverable_${String(r.reason ?? r.error ?? "trigger").slice(0, 40)}`,
+            shouldStop,
+            tryRotateFirst: true,
+            loopUntilSuccess: true,
+          });
+          if (recovered) {
+            counters.worker_restarts += 1;
+            consecutiveInfraFails = 0;
+            skipQuarantineCheckOnce = true;
+            if (quarantine && proxyKey) quarantine.markRecovered(proxyKey);
+          }
+          continue;
+        }
         log(`[${label}] recoverable skip id=${act.id}: ${r.error} (status=${r.status ?? "?"})`);
         consecutiveInfraFails = 0;
         await downloader.paceAfterFailure();
@@ -1357,6 +1897,7 @@ async function _downloadWorker({
     runState.lastSuccessAt = Date.now();
     runState.stuckWarned = false;
     consecutiveUnexpectedFails = 0;
+    consecutivePravocaptchaGate = 0;
     if (quarantine && proxyKey) quarantine.recordSuccess(proxyKey);
 
     // Передаём в extract-pool. queue.push() блокируется, если буфер заполнен —

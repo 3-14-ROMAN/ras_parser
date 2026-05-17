@@ -87,6 +87,15 @@ export class ProxyEscalator {
     this.lastAction = null;
   }
 
+  /**
+   * Заменить geoFilters в runtime. Используется preflight'ом pipeline.js: после
+   * anti-cloak probe мы знаем «работающие» страны и сужаем фильтры под них
+   * (changeGeo на L3 будет выбирать только из этого списка).
+   */
+  setGeoFilters(filters) {
+    this.geoFilters = filters;
+  }
+
   summary() {
     return {
       consecutiveIpRotations: this.consecutiveIpRotations,

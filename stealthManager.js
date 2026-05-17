@@ -6,6 +6,9 @@
  * rate-limit на IP, а не по тому, как «по-человечески» движется мышь —
  * поэтому весь этот обвес был пустым жжением времени.
  *
+ * Маркер автоматизации и рассинхрон UA/Client-Hints закрываются на уровне
+ * контекста в `network/rasBrowserProfile.js` (ignoreDefaultArgs, init-script).
+ *
  * Сохраняем тот же API (smartWait/click/type/pressKey/clickBelow/downloadPdf),
  * но реализуем через стандартные Playwright-методы и короткие фикс-паузы.
  */

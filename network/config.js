@@ -67,8 +67,10 @@ export const WINDOW_MIN_DAYS = Math.max(
  * Geo-фильтры для эскалатора (ProxyEscalator → RasProxyClient.changeGeo).
  *
  * Работают при штатной L3 changeGeo.
- * Текущая политика: РФ не используем вообще, приоритет на страны СНГ
- * (Беларусь, Казахстан, Кыргызстан, Узбекистан, Грузия и т.д.).
+ * Текущая политика (2026-05-15 после probe-geo): СТРОГО Казахстан / Беларусь /
+ * Киргизия. РФ-мегафон и UA-Kyivstar → 451 на pravocaptcha даже с чистого IP,
+ * KZ tele2 → 9/10 OK. Остальная СНГ (UZ/GE/AM/AZ/TJ/MD) — не проверена,
+ * по умолчанию НЕ берём, чтобы не нарваться на тот же 451.
  *
  * - GEO_RU_ONLY=1     — берём только id_country=1 (Россия).
  * - GEO_BLOCK_CITY_IDS — список id_city через запятую. По дефолту
@@ -82,7 +84,8 @@ export const WINDOW_MIN_DAYS = Math.max(
  */
 export const GEO_RU_ONLY = (process.env.GEO_RU_ONLY ?? "0") === "1";
 export const GEO_CIS_ONLY = (process.env.GEO_CIS_ONLY ?? "1") === "1";
-const _DEFAULT_EXCLUDE_COUNTRY_IDS = [1];
+// По умолчанию режем РФ (id=1) и Украину (id=2) — оба дают 451 на pravocaptcha.
+const _DEFAULT_EXCLUDE_COUNTRY_IDS = [1, 2];
 export const GEO_EXCLUDE_COUNTRY_IDS = (process.env.GEO_EXCLUDE_COUNTRY_IDS ?? "")
   .split(",")
   .map((s) => Number(s.trim()))
@@ -92,9 +95,12 @@ if (GEO_EXCLUDE_COUNTRY_IDS.length === 0) {
 }
 export const GEO_CIS_CAPTION_REGEX = (() => {
   if (!GEO_CIS_ONLY) return null;
+  // Whitelist КЗ/БЛ/КГ. Если расширяешь до UZ/GE/AM/AZ/TJ/MD — переопредели
+  // GEO_CIS_CAPTION_REGEX в .env на свою (и не забудь убрать страну из
+  // GEO_EXCLUDE_COUNTRY_IDS, если она там).
   const src =
     process.env.GEO_CIS_CAPTION_REGEX ??
-    "(?:Беларус|Казахстан|Киргиз|Кыргыз|Узбекистан|Грузи|Армени|Азербайджан|Таджикистан|Молдова|Kazakhstan|Kyrgyz|Kyrgyzstan|Belarus|Uzbekistan|Georgia|Armenia|Azerbaijan|Tajikistan|Moldova)";
+    "(?:Беларус|Казахстан|Киргиз|Кыргыз|Kazakhstan|Kyrgyz|Kyrgyzstan|Belarus)";
   if (!src) return null;
   try {
     return new RegExp(src, "iu");
@@ -147,3 +153,98 @@ export const GEO_FILTERS = Object.freeze({
   excludeCityIds: GEO_BLOCK_CITY_IDS.slice(),
   excludeCaptionRegex: GEO_BLOCK_CAPTION_REGEX,
 });
+
+/**
+ * PDF-пул (discover getMyProxy): фильтр по id_country купленных линий.
+ * (Россия=1, Беларусь=22, Казахстан=82, Киргизия=145 — см. ответ API.)
+ *
+ * RAS_PDF_POOL_COUNTRY_IDS=22,82,145 (CSV). Пустая строка = дефолт ниже.
+ * all или * — все активные proxy_id без фильтра по стране (Украина/Таиланд и т.д. тоже в пуле).
+ *
+ * Дефолт: только КЗ/БЛ/КГ — все остальные (РФ/UA/etc) у нас по probe 2026-05
+ * уходят в 451 на pravocaptcha и тратят cooldowns впустую. Если докупаешь
+ * новые гео — добавь в RAS_PDF_POOL_COUNTRY_IDS=22,82,145,<новый>.
+ *
+ * Смена региона (changeGeo) — отдельно: RAS_PDF_TARGET_COUNTRY_IDS.
+ */
+const _DEFAULT_PDF_POOL_COUNTRY_IDS = Object.freeze([22, 82, 145]);
+function _parsePdfPoolCountryIds() {
+  const raw = (process.env.RAS_PDF_POOL_COUNTRY_IDS ?? "").trim();
+  if (!raw) return [..._DEFAULT_PDF_POOL_COUNTRY_IDS];
+  const lowered = raw.toLowerCase();
+  if (lowered === "all" || lowered === "*") return [];
+  const ids = raw
+    .split(/[,\s]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return ids.length ? ids : [..._DEFAULT_PDF_POOL_COUNTRY_IDS];
+}
+
+const _pdfPoolParsed = _parsePdfPoolCountryIds();
+export const PDF_POOL_COUNTRY_IDS = Object.freeze(_pdfPoolParsed);
+
+/**
+ * Страны, в которые разрешён changeGeo (L3) для PDF-эскалатора / RasProxyClient.changeGeo.
+ * Не влияет на состав пула — только на выбор нового geo из getAvailableEquipment.
+ *
+ * RAS_PDF_TARGET_COUNTRY_IDS=22,82,145 (CSV). all|* — без ограничения по стране при смене гео.
+ * Если переменная не задана: копируем ограниченный пул (если он не all), иначе дефолт KZ/BY/KG
+ * (отказались от РФ-таргета — pravocaptcha банит мобильные РФ-IP 451'ом).
+ *
+ * RAS_PDF_TARGET_COUNTRY_IDS_OVERRIDE имеет приоритет над RAS_PDF_TARGET_COUNTRY_IDS
+ * (нужно, чтобы `npm run download:acts` мог быть переопределён без правки package.json:
+ * жёсткий env в script-строке npm перекрывает обычный export, а *_OVERRIDE — нет).
+ */
+const _DEFAULT_PDF_TARGET_COUNTRY_IDS = Object.freeze([22, 82, 145]);
+/**
+ * @returns {{ ids: number[], source: 'override' | 'env' | 'pool' | 'default' | 'all' }}
+ */
+function _parsePdfTargetCountryIds(poolIds) {
+  const overrideRaw = (process.env.RAS_PDF_TARGET_COUNTRY_IDS_OVERRIDE ?? "").trim();
+  if (overrideRaw) {
+    const lowered = overrideRaw.toLowerCase();
+    if (lowered === "all" || lowered === "*") return { ids: [], source: "all" };
+    const ids = overrideRaw
+      .split(/[,\s]+/)
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (ids.length) return { ids, source: "override" };
+  }
+  const raw = (process.env.RAS_PDF_TARGET_COUNTRY_IDS ?? "").trim();
+  if (raw) {
+    const lowered = raw.toLowerCase();
+    if (lowered === "all" || lowered === "*") return { ids: [], source: "all" };
+    const ids = raw
+      .split(/[,\s]+/)
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (ids.length) return { ids, source: "env" };
+    return { ids: [..._DEFAULT_PDF_TARGET_COUNTRY_IDS], source: "default" };
+  }
+  if (poolIds.length) return { ids: [...poolIds], source: "pool" };
+  return { ids: [..._DEFAULT_PDF_TARGET_COUNTRY_IDS], source: "default" };
+}
+
+const _pdfTargetParsed = _parsePdfTargetCountryIds([..._pdfPoolParsed]);
+export const PDF_TARGET_COUNTRY_IDS = Object.freeze(_pdfTargetParsed.ids);
+export const PDF_TARGET_COUNTRY_IDS_SOURCE = _pdfTargetParsed.source;
+/** Экспортирован для тестов: позволяет проверить override без перезапуска процесса. */
+export { _parsePdfTargetCountryIds };
+
+/** Фильтры changeGeo для PDF-эскалатора: RAS_PDF_TARGET_COUNTRY_IDS (не пул).
+ *  excludeCityIds / excludeCaptionRegex берём те же, что у эскалатора парсера —
+ *  иначе при разрешённом id_country=1 (РФ) downloader полезет в Москву/Питер,
+ *  где у мобильных операторов есть участки без реального интернета или с
+ *  жёстким ACL pravocaptcha. */
+export const PDF_GEO_FILTERS = Object.freeze({
+  requireCountryId: null,
+  requireCountryIds: PDF_TARGET_COUNTRY_IDS.slice(),
+  excludeCountryIds: [],
+  includeCaptionRegex: null,
+  excludeCityIds: GEO_BLOCK_CITY_IDS.slice(),
+  excludeCaptionRegex: GEO_BLOCK_CAPTION_REGEX,
+});
+
+/** Fallback countryId для auto-buy, если нет RAS_AUTO_BUY_COUNTRY_ID и не вывели из существующих прокси. */
+export const PDF_AUTO_BUY_DEFAULT_COUNTRY_ID =
+  PDF_TARGET_COUNTRY_IDS[0] ?? PDF_POOL_COUNTRY_IDS[0] ?? 1;

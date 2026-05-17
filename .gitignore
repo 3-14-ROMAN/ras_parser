@@ -7,3 +7,28 @@ npm-debug.log*
 .DS_Store
 .idea/
 .vscode/
+.cursor/
+.claude/
+
+# Снапшоты выгрузок RAS — выходы парсера в `parsed_data/document_types.json`
+# (режим types) безопасны для коммита, но всё остальное в этой папке транзитное.
+parsed_data/*.bak
+parsed_data.bak.*/
+/*.json
+!package.json
+!package-lock.json
+!outcome_polarity.json
+!mobileproxy_doc.json
+
+# Inference service — только исходники, не venv/логи/бэкапы
+inference/venv/
+inference/__pycache__/
+inference/*.log
+inference/*.bak*
+inference/app.py.before-*
+
+# Локальный debug и бэкапы
+debug_act_55k.txt
+*.bak
+docker-compose.yml.authfix.bak
+scripts/*.bak*
