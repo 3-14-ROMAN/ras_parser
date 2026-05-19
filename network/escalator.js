@@ -167,8 +167,19 @@ export class ProxyEscalator {
       this.totalOperatorSwaps += 1;
       this.consecutiveIpRotations = 0;
       this.lastAction = ESC_LEVELS.OPERATOR;
-      await this._settle(ESC_LEVELS.OPERATOR);
-      return { level: ESC_LEVELS.OPERATOR, detail: res };
+      // L2 fail — типично «нет альтернативного оператора в текущем гео».
+      // Не возвращаем fail с reset'ом L1 (это запустит вечный цикл L1×8 → L2 fail
+      // → L1×8 опять, не дойдя до L3 changeGeo минут за 30). Сразу эскалируем на
+      // L3 в этом же recoverFrom, чтобы реально сменить страну.
+      if (!res || res.ok === false) {
+        this.log(
+          `[esc] L2 fail — сразу эскалирую на L3 changeGeo без отката счётчиков`,
+        );
+        // fall through к L3 ниже
+      } else {
+        await this._settle(ESC_LEVELS.OPERATOR);
+        return { level: ESC_LEVELS.OPERATOR, detail: res };
+      }
     }
 
     // L3: changeGeo. У провайдера операция бесплатна, ограничение только по

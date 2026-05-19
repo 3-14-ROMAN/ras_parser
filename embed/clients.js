@@ -33,7 +33,6 @@ export const MAX_COLBERT_TOKENS = Number(process.env.MAX_COLBERT_TOKENS ?? 8000)
 
 // Char-based chunking (token-aware вариант — Шаг 3).
 export const CHUNK_SIZE    = Number(process.env.RAS_EMBED_CHUNK_SIZE    ?? 3500);
-export const CHUNK_OVERLAP = Number(process.env.RAS_EMBED_CHUNK_OVERLAP ?? 400);
 
 // Сколько чанков отдавать в один POST /embed (ограничено VRAM V100 fp16).
 export const EMBED_SUB_BATCH = Number(process.env.RAS_EMBED_SUB_BATCH ?? 4);
@@ -115,49 +114,102 @@ export async function embedTexts(texts, opts = {}) {
 }
 
 /**
- * Late chunking через /embed_late_chunks. Возвращает dense_late (128-dim
- * mean-pool multivectors per chunk) + sparse + token_counts. ОДИН forward
- * pass на акт, чанки берут long-range context.
+ * Late chunking через /embed_late_chunks.
  *
- * @param {string[]} chunks  тексты чанков (последовательно)
- * @param {{ task?: string, maxLength?: number, separator?: string, returnSparse?: boolean }} [opts]
+ * Контракт (fix 2026-05-18): на сервер шлём **оригинальный** `fullText` + spans
+ * чанков `[{chunk_id, start_char, end_char}]`. Сервер тоkенизирует именно
+ * `fullText`, один forward pass,
+ * mean-pool токенов в спане каждого чанка → 128-dim dense_late. Sparse
+ * считается на slice оригинала `fullText[start:end]`.
+ *
+ * @param {string} fullText
+ *   Полный текст акта (act.act_text целиком).
+ * @param {Array<{ chunk_id: number, start_char: number, end_char: number }>} chunkSpans
+ *   Уже посчитанные на Node-стороне (chunkText) спаны.
+ * @param {{ task?: string, maxLength?: number, returnSparse?: boolean }} [opts]
  * @returns {Promise<{
  *   dense_late_vectors: number[][],
  *   sparse_vectors: { indices: number[], values: number[] }[] | null,
  *   token_counts: number[],
- *   spans: number[][],
  *   full_tokens: number,
+ *   full_chars: number,
  * }>}
+ *
+ * Бросает Error, если сервер вернул error-поле (too_long_for_late_chunking,
+ * bad_chunk_span, token_alignment_mismatch и пр.).
  */
-export async function embedLateChunks(chunks, opts = {}) {
-  const task         = opts.task         ?? "retrieval.passage";
-  const maxLength    = opts.maxLength    ?? 32768;
-  const separator    = opts.separator    ?? "\n\n";
-  const returnSparse = opts.returnSparse ?? true;
-  if (!Array.isArray(chunks) || chunks.length === 0) {
-    throw new Error("embedLateChunks: empty chunks");
+export async function embedLateChunks(fullText, chunkSpans = null, opts = {}) {
+  const task              = opts.task              ?? "retrieval.passage";
+  const maxLength         = opts.maxLength         ?? 32768;
+  const returnSparse      = opts.returnSparse      ?? true;
+  const targetChunkTokens = opts.targetChunkTokens ?? 2000;
+
+  if (typeof fullText !== "string" || fullText.length === 0) {
+    throw new Error("embedLateChunks: empty fullText");
   }
-  const data = await inferencePost("/embed_late_chunks", {
-    chunks,
+
+  const hasExplicitSpans = Array.isArray(chunkSpans) && chunkSpans.length > 0;
+
+  const body = {
+    full_text: fullText,
     task,
     max_length: maxLength,
-    separator,
     return_sparse: returnSparse,
-  });
-  if (data.error) {
-    throw new Error(`/embed_late_chunks error: ${data.error} (${JSON.stringify(data).slice(0, 200)})`);
+    target_chunk_tokens: targetChunkTokens,
+  };
+
+  if (hasExplicitSpans) {
+    body.chunks = chunkSpans.map((c) => ({
+      chunk_id:   c.chunk_id ?? c.id,
+      start_char: c.start_char ?? c.start,
+      end_char:   c.end_char ?? c.end,
+    }));
   }
+
+  const data = await inferencePost("/embed_late_chunks", body);
+
+  if (data.error) {
+    throw new Error(`/embed_late_chunks error: ${data.error} (${JSON.stringify(data).slice(0, 500)})`);
+  }
+
+  const chunks = Array.isArray(data.chunks)
+    ? data.chunks.map((c) => ({
+        id:         Number(c.chunk_id),
+        chunk_id:   Number(c.chunk_id),
+        start:      Number(c.start_char),
+        end:        Number(c.end_char),
+        start_char: Number(c.start_char),
+        end_char:   Number(c.end_char),
+      }))
+    : (hasExplicitSpans ? body.chunks.map((c) => ({
+        id:         Number(c.chunk_id),
+        chunk_id:   Number(c.chunk_id),
+        start:      Number(c.start_char),
+        end:        Number(c.end_char),
+        start_char: Number(c.start_char),
+        end_char:   Number(c.end_char),
+      })) : []);
+
   if (!Array.isArray(data.dense_late_vectors) || data.dense_late_vectors.length !== chunks.length) {
     throw new Error(
-      `late_chunks bad shape: dense_late=${data.dense_late_vectors?.length} expected=${chunks.length}`,
+      `late_chunks bad shape: dense_late=${data.dense_late_vectors?.length} chunks=${chunks.length}`,
     );
   }
+
+  const tokenCounts = (data.token_counts ?? []).map((n) => Number(n) || 0);
+  if (tokenCounts.length !== chunks.length) {
+    throw new Error(`late_chunks bad token_counts: ${tokenCounts.length} chunks=${chunks.length}`);
+  }
+
   return {
     dense_late_vectors: data.dense_late_vectors,
     sparse_vectors:     Array.isArray(data.sparse_vectors) ? data.sparse_vectors : null,
-    token_counts:       (data.token_counts ?? []).map((n) => Number(n) || 0),
-    spans:              data.spans ?? [],
+    token_counts:       tokenCounts,
     full_tokens:        Number(data.full_tokens) || 0,
+    full_chars:         Number(data.full_chars) || 0,
+    chunk_mode:         data.chunk_mode ?? (hasExplicitSpans ? "explicit" : "token_auto"),
+    target_chunk_tokens: Number(data.target_chunk_tokens ?? targetChunkTokens),
+    chunks,
   };
 }
 
@@ -203,12 +255,11 @@ export function chunkPointId(actId, chunkId) {
 }
 
 /**
- * Char-based чанкование с overlap. Возвращает массив { id, text, start, end }.
+ * Char-based чанкование. Возвращает массив { id, text, start, end }.
  * id — последовательный chunk_id (0..N-1).
  */
-export function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
-  const stride = size - overlap;
-  if (stride <= 0) throw new Error("chunk overlap must be < size");
+export function chunkText(text, size = CHUNK_SIZE) {
+  const stride = size;
   const out = [];
   if (!text) return out;
   let id = 0;

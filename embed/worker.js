@@ -27,6 +27,10 @@
  */
 
 import { recoverStaleEmbedding, pipelineStats } from "../db/actsRepo.js";
+import {
+  cleanupExpiredRuntimeFlags,
+  isRuntimeFlagActive,
+} from "../db/runtimeFlags.js";
 
 import { embedFullActBatch } from "./fullAct.js";
 import { embedChunkActBatch } from "./chunk.js";
@@ -36,15 +40,57 @@ function defaultLog(msg) {
   process.stdout.write(`[${ts}] ${msg}\n`);
 }
 
+const SEARCH_PRIORITY_FLAG = process.env.RAS_SEARCH_PRIORITY_FLAG ?? "search_active";
+const SEARCH_PAUSE_SLEEP_MS = Number(process.env.RAS_SEARCH_PAUSE_SLEEP_MS ?? 1000);
+
 function sleep(ms, signal) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(t);
+
+    let done = false;
+    let t = null;
+
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (t) clearTimeout(t);
+      signal?.removeEventListener?.("abort", onAbort);
       resolve();
-    }, { once: true });
+    };
+
+    const onAbort = () => finish();
+
+    t = setTimeout(finish, ms);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
   });
+}
+
+async function waitForSearchPriority({ signal, log, phase }) {
+  let logged = false;
+
+  while (!(signal?.aborted)) {
+    await cleanupExpiredRuntimeFlags().catch(() => 0);
+
+    const active = await isRuntimeFlagActive(SEARCH_PRIORITY_FLAG).catch((e) => {
+      log(`[worker/pause] flag check failed, continue embedding: ${e?.message ?? e}`);
+      return false;
+    });
+
+    if (!active) {
+      if (logged) log(`[worker/resume] ${SEARCH_PRIORITY_FLAG} cleared, continue embedding`);
+      return;
+    }
+
+    if (!logged) {
+      log(
+        `[worker/pause] ${phase}: ${SEARCH_PRIORITY_FLAG} active, ` +
+        `waiting before next embedding batch`,
+      );
+      logged = true;
+    }
+
+    await sleep(SEARCH_PAUSE_SLEEP_MS, signal);
+  }
 }
 
 /**
@@ -90,18 +136,32 @@ export async function runWorker(opts = {}) {
     const iterStart = Date.now();
     let didWork = false;
 
+    await waitForSearchPriority({ signal, log, phase: `iter ${iter}/before_full` });
+    if (signal?.aborted) break;
+
     try {
       const fr = await embedFullActBatch(batchSizeFull, log);
-      if (fr.batchSize > 0) {
+      // rerouted_pre / missing_marked — это repair-проход. Даже если batchSize=0
+      // (selectPendingEmbed ничего не вернул), сам repair мог изменить
+      // десятки строк — логируем такой шаг, иначе backlog «исчезает» молча.
+      const repaired = (fr.rerouted_pre ?? 0) + (fr.missing_marked ?? 0);
+      if (fr.batchSize > 0 || repaired > 0) {
         didWork = true;
         totalIndexed += fr.indexed;
         totalErrored += fr.errored;
-        log(`[iter ${iter}/full] processed=${fr.batchSize} indexed=${fr.indexed} rerouted=${fr.rerouted} error=${fr.errored}`);
+        log(
+          `[iter ${iter}/full] processed=${fr.batchSize} indexed=${fr.indexed} ` +
+          `rerouted=${fr.rerouted} error=${fr.errored} ` +
+          `rerouted_pre=${fr.rerouted_pre ?? 0} missing_marked=${fr.missing_marked ?? 0}`,
+        );
       }
     } catch (e) {
       log(`[iter ${iter}/full] FATAL ${e?.stack ?? e?.message ?? e}`);
     }
 
+    if (signal?.aborted) break;
+
+    await waitForSearchPriority({ signal, log, phase: `iter ${iter}/before_chunk` });
     if (signal?.aborted) break;
 
     try {

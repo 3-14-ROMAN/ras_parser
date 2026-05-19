@@ -9,9 +9,9 @@
  *   node --env-file=.env scripts/index-acts-qdrant.js [LIMIT]
  *   npm run embed:chunk -- 2
  *
- * ВНИМАНИЕ (Шаг 2): чанки сейчас индексируются БЕЗ настоящего late chunking
- * (каждый чанк через /embed независимо). Корректный late chunking + sparse —
- * Шаг 3 (новый эндпоинт /embed_late_chunks с pooling per chunk).
+ * ВАЖНО: chunk-индексация использует только REAL late chunking:
+ * полный act.act_text + spans -> /embed_late_chunks -> dense_late vectors.
+ * Старый режим /embed по независимым чанкам запрещён и удалён из активного кода.
  */
 
 import process from "node:process";

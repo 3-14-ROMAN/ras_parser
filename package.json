@@ -5,7 +5,7 @@
   "type": "module",
   "main": "parser.js",
   "scripts": {
-    "start": "node --env-file=.env parser.js",
+    "start": "bash scripts/run-parser-supervised.sh",
     "db:migrate": "docker exec -i ras_pg psql -U ras -d ras < db/schema.sql",
     "download:acts": "RAS_PDF_PARALLEL_DOWNLOADERS=auto RAS_PDF_POOL_COUNTRY_IDS=all RAS_PDF_TARGET_COUNTRY_IDS=82,100,22,15,61,72,122,147,148,152,180 RAS_PDF_BAD_COUNTRY_IDS=1,2 RAS_PDF_PREFLIGHT_GEO=1 RAS_PDF_MAX_WORKERS=0 RAS_PDF_LEASE_CLEANUP_ON_START=1 HTTP_CONCURRENCY=1 HTTP_RETRIES=1 HTTP_TIMEOUT_MS=20000 RAS_PDF_QUARANTINE_INFRA_THRESHOLD=3 RAS_PDF_QUARANTINE_451_THRESHOLD=3 RAS_PDF_QUARANTINE_WINDOW_MS=180000 RAS_PDF_QUARANTINE_MS=300000 RAS_PDF_QUARANTINE_451_MS=600000 RAS_PDF_SUPERVISOR_MAX_RESTARTS=200 RAS_PDF_STUCK_TIMEOUT_MS=1800000 RAS_PDF_STUCK_FATAL_MS=5400000 RAS_PDF_PRAVOCAPTCHA_GATE_STREAK=1 xvfb-run -a --server-args='-screen 0 1366x900x24' node --env-file=.env scripts/download-acts.js",
     "probe:geo": "xvfb-run -a --server-args='-screen 0 1366x900x24' node --env-file=.env scripts/probe-geo.js",
@@ -25,22 +25,28 @@
     "smoke:proxy-health": "node pdf/proxyHealth.smoke.mjs",
     "test:pdf-smoke": "node pdf/repeat451.smoke.mjs",
     "test:quarantine-smoke": "node pdf/quarantine.smoke.mjs",
+    "test:cleanup-smoke": "node --env-file=.env db/cleanupInvalidActs.smoke.mjs",
+    "test:rerank-budget": "node embed/rerank.budget.smoke.mjs",
     "embed:worker": "node --env-file=.env scripts/embed-worker.js",
     "embed:fullact": "node --env-file=.env scripts/index-acts-qdrant-fullact.js",
     "embed:chunk": "node --env-file=.env scripts/index-acts-qdrant.js",
     "embed:search": "node --env-file=.env scripts/search-qdrant-rrf.js",
     "embed:rerank": "node --env-file=.env scripts/search-qdrant-rerank.js",
-    "qdrant:rebuild": "node --env-file=.env scripts/qdrant-rebuild-collection.js"
+    "qdrant:rebuild": "node --env-file=.env scripts/qdrant-rebuild-collection.js",
+    "cleanup:invalid": "node --env-file=.env scripts/cleanup-invalid-acts.js",
+    "search:api": "node --env-file=.env scripts/search-api.js",
+    "telegram:bot": "node --env-file=.env scripts/telegram-bot.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "undici": "^6.25.0",
     "@mobileproxy/sdk": "^1.0.0",
     "@qdrant/js-client-rest": "^1.18.0",
     "ghost-cursor-playwright": "^2.1.0",
     "pg": "^8.20.0",
-    "playwright": "^1.49.0"
+    "playwright": "^1.49.0",
+    "socks-proxy-agent": "^10.0.0",
+    "undici": "^6.25.0"
   }
 }

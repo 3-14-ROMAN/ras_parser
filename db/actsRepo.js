@@ -310,6 +310,7 @@ export async function selectPendingText(limit) {
       WHERE pdf_downloaded = TRUE
         AND pdf_path       IS NOT NULL
         AND act_text       IS NULL
+        AND verdict_keep   IS TRUE
       ORDER BY registration_date DESC NULLS LAST, id
       LIMIT $1`,
     [Math.max(1, limit | 0)],
@@ -364,20 +365,32 @@ export async function markPdfFailed(id, errorText) {
  * embedding-pipeline сразу видел в очереди, какой кейс (full_act vs chunk).
  * Реальный token_count перепишет индексер, увидев его в ответе инференса.
  *
+ * Опциональный `opts.tokensJinaV3` — счёт токенов через jina-reranker-v3
+ * (Qwen3) tokenizer, считается в pdf/pipeline.js на этапе extract.
+ * Если передано null/undefined — существующее значение в колонке НЕ
+ * затирается (COALESCE), чтобы повторный extract при resume не убил
+ * значение, посчитанное в прошлом прогоне.
+ *
  * @param {string} id
  * @param {string} text
+ * @param {{ tokensJinaV3?: number|null }} [opts]
  */
-export async function markTextExtracted(id, text) {
+export async function markTextExtracted(id, text, opts = {}) {
   const pool = await getPool();
   const s = String(text ?? "");
+  const tokensJinaV3 =
+    opts.tokensJinaV3 == null || !Number.isFinite(Number(opts.tokensJinaV3))
+      ? null
+      : Math.max(0, Math.floor(Number(opts.tokensJinaV3)));
   await pool.query(
     `UPDATE acts
         SET act_text          = $2,
             text_extracted_at = NOW(),
             pdf_error         = NULL,
-            is_long_act       = (length($2) > 32000)
+            is_long_act       = (length($2) > 32000),
+            tokens_jina_v3    = COALESCE($3::INTEGER, tokens_jina_v3)
       WHERE id = $1::uuid`,
-    [id, s],
+    [id, s, tokensJinaV3],
   );
 }
 
@@ -422,6 +435,98 @@ export async function markExtractFailed(id, errorText) {
 // пересборке коллекции Qdrant / смене embedding-модели.
 // ───────────────────────────────────────────────────────────────────────────
 
+// ───────────────────────────────────────────────────────────────────────────
+// Repair-хелперы для short-очереди (см. embed/fullAct.js::embedFullActBatch).
+//
+// Контекст:
+//   selectPendingEmbed(false) — short-селектор — фильтрует
+//     `is_long_act=FALSE AND tokens_jina_v3 IS NOT NULL AND tokens_jina_v3 <= $`.
+//   Это значит, что pending-строки с `is_long_act=FALSE` НО `tokens_jina_v3`
+//   выше gate'а ИЛИ NULL не подбираются ни одним воркером (long-селектор
+//   требует `is_long_act=TRUE`). Без репеир-шага они зависают навсегда.
+//
+// Важно про сам токенизатор:
+//   tokens_jina_v3 — счёт через tokenizer jina-reranker-v3 (Qwen3). Это НЕ
+//   embedding-токенизатор Jina v4. Поэтому tokens_jina_v3 — только консервативный
+//   прокси «акт длинный» для приоритезации. Финальное решение «>32k embedding
+//   context» принимает /embed_late_chunks по реальному v4-токенайзеру.
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Перевести pending short-акты, у которых tokens_jina_v3 превышает gate, в
+ * long-очередь. Vector_status остаётся 'pending' — chunk-индексер (или late
+ * chunking) разберёт их в свою смену. vector_error содержит сигнал маршрута.
+ *
+ * @param {number} maxTokens порог reranker-токенов для short-очереди
+ * @param {number} [limit=200] максимум строк за один вызов
+ * @returns {Promise<{ count: number, rows: Array<{ id: string, tokens_jina_v3: number }> }>}
+ */
+export async function reroutePendingShortOverTokenGate(maxTokens, limit = 200) {
+  const pool = await getPool();
+  const cap = Math.max(1, Math.floor(maxTokens));
+  const lim = Math.max(1, Math.floor(limit));
+  const res = await pool.query(
+    `WITH picked AS (
+        SELECT id FROM acts
+         WHERE vector_status = 'pending'
+           AND is_long_act = FALSE
+           AND tokens_jina_v3 IS NOT NULL
+           AND tokens_jina_v3 > $1
+           AND act_text IS NOT NULL
+           AND act_text NOT LIKE '__EXTRACT_FAILED__%'
+           AND verdict_keep IS TRUE
+         ORDER BY registration_date DESC NULLS LAST, id
+         FOR UPDATE SKIP LOCKED
+         LIMIT $2
+     )
+     UPDATE acts a
+        SET is_long_act  = TRUE,
+            vector_error = 'pending_late_chunking:reranker_token_gate'
+       FROM picked
+      WHERE a.id = picked.id
+      RETURNING a.id::text AS id, a.tokens_jina_v3`,
+    [cap, lim],
+  );
+  return { count: res.rowCount ?? 0, rows: res.rows };
+}
+
+/**
+ * Пометить pending short-акты с NULL tokens_jina_v3 как error со внятным
+ * vector_error. Без счёта токенов мы не можем доверенно отнести акт ни к
+ * short (gate), ни к long (chunking без знания длины — слепой). Перепосчёт
+ * tokens_jina_v3 — задача отдельного pipeline (pdf/pipeline.js считает на
+ * этапе extract; старые строки до фичи остаются с NULL).
+ *
+ * @param {number} [limit=200]
+ * @returns {Promise<{ count: number, rows: Array<{ id: string }> }>}
+ */
+export async function markMissingRerankerTokensForEmbedding(limit = 200) {
+  const pool = await getPool();
+  const lim = Math.max(1, Math.floor(limit));
+  const res = await pool.query(
+    `WITH picked AS (
+        SELECT id FROM acts
+         WHERE vector_status = 'pending'
+           AND is_long_act = FALSE
+           AND tokens_jina_v3 IS NULL
+           AND act_text IS NOT NULL
+           AND act_text NOT LIKE '__EXTRACT_FAILED__%'
+           AND verdict_keep IS TRUE
+         ORDER BY registration_date DESC NULLS LAST, id
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1
+     )
+     UPDATE acts a
+        SET vector_status = 'error',
+            vector_error  = 'skip:missing_tokens_jina_v3'
+       FROM picked
+      WHERE a.id = picked.id
+      RETURNING a.id::text AS id`,
+    [lim],
+  );
+  return { count: res.rowCount ?? 0, rows: res.rows };
+}
+
 /**
  * Снять очередную пачку pending-актов и атомарно перевести их в indexing.
  * Возвращает строки, которые worker может начать индексировать.
@@ -436,20 +541,26 @@ export async function markExtractFailed(id, errorText) {
  *
  * @param {number} limit
  * @param {boolean|null} [isLongAct=null]
- * @returns {Promise<Array<{ id: string, act_text: string, is_long_act: boolean }>>}
+ * @returns {Promise<Array<{ id: string, act_text: string, is_long_act: boolean, token_count: number|null }>>}
  */
 export async function selectPendingEmbed(limit, isLongAct = null) {
   const pool = await getPool();
+  const shortMaxTokens = Number(process.env.RAS_EMBED_SHORT_MAX_TOKENS ?? 8000);
   const isLongCond =
     isLongAct === null ? ""
     : isLongAct === true  ? "AND is_long_act = TRUE"
-    : "AND is_long_act = FALSE";
+    : "AND is_long_act = FALSE AND tokens_jina_v3 IS NOT NULL AND tokens_jina_v3 <= $2";
+  const params = isLongAct === false
+    ? [Math.max(1, limit | 0), shortMaxTokens]
+    : [Math.max(1, limit | 0)];
+
   const res = await pool.query(
     `WITH picked AS (
         SELECT id FROM acts
          WHERE vector_status = 'pending'
            AND act_text IS NOT NULL
            AND act_text NOT LIKE '__EXTRACT_FAILED__%'
+           AND verdict_keep IS TRUE
            ${isLongCond}
          ORDER BY registration_date DESC NULLS LAST, id
          FOR UPDATE SKIP LOCKED
@@ -459,10 +570,33 @@ export async function selectPendingEmbed(limit, isLongAct = null) {
         SET vector_status = 'indexing'
        FROM picked
       WHERE a.id = picked.id
-      RETURNING a.id::text AS id, a.act_text, a.is_long_act`,
-    [Math.max(1, limit | 0)],
+      RETURNING a.id::text AS id, a.act_text, a.is_long_act, a.token_count, a.tokens_jina_v3`,
+    params,
   );
   return res.rows;
+}
+
+/**
+ * Read verdict_keep для одного акта. Используется embed/fullAct и embed/chunk
+ * как pre-upsert guard: между selectPendingEmbed (которое снэпшотит pending→indexing
+ * + проверяет verdict_keep IS TRUE) и upsertPoints в Qdrant проходит 13-17с GPU-времени;
+ * за это окно резолвер parser.js мог флипнуть verdict_keep в FALSE по факту
+ * новой апелляции/кассации. Если так — отменяем upsert, акт отдадим cleanup'у.
+ *
+ * Возвращает TRUE / FALSE / null (если акт не найден).
+ *
+ * @param {string} id UUID акта
+ * @returns {Promise<boolean|null>}
+ */
+export async function isActVerdictKeep(id) {
+  const pool = await getPool();
+  const res = await pool.query(
+    `SELECT verdict_keep FROM acts WHERE id = $1::uuid`,
+    [id],
+  );
+  if (res.rows.length === 0) return null;
+  const v = res.rows[0].verdict_keep;
+  return v === true ? true : v === false ? false : null;
 }
 
 /**

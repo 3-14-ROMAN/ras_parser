@@ -48,6 +48,7 @@ import {
   upsertActs as _pgUpsertActs,
   getActsDateBounds as _pgGetActsDateBounds,
 } from "./db/actsRepo.js";
+import { cleanupInvalidActs as _cleanupInvalidActs } from "./db/cleanupInvalidActs.js";
 import {
   acquireSingleOrThrow as _leaseAcquire,
   releaseAll as _leaseReleaseAll,
@@ -60,6 +61,7 @@ import {
   getRasChromiumLaunchAntiDetect,
 } from "./network/rasBrowserProfile.js";
 import { classifyMetadataResponse } from "./network/metadataResponseDetect.js";
+import { probeRasViaProxy } from "./network/proxyPreflight.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -146,9 +148,12 @@ const RECYCLE_BROWSER_AFTER_BANNED_L1 =
   (process.env.RAS_RECYCLE_BROWSER_AFTER_BANNED_L1 ?? "1") !== "0";
 
 class RecycleWindowError extends Error {
-  constructor(message) {
+  constructor(message, opts = {}) {
     super(message);
     this.name = "RecycleWindowError";
+    this.lastPageNum = Number.isInteger(opts.lastPageNum) && opts.lastPageNum > 0
+      ? opts.lastPageNum
+      : null;
   }
 }
 
@@ -193,8 +198,44 @@ const META_ANTIFRAUD_GATE_RECOVER_AFTER = Math.max(
   Number.parseInt(process.env.RAS_META_ANTIFRAUD_GATE_RECOVER_AFTER ?? "3", 10) || 3,
 );
 
+/**
+ * Hard deadline на ОДНУ попытку `_setupSearchSession` (поднять сессию: goto →
+ * 3.1 → «Найти» → РАК → Статус). Без него `_stealth.click()` без явного таймаута
+ * мог зависнуть навечно — watchdog убивал процесс, supervisor рестартил,
+ * терялся весь Map текущего прогона. С deadline неудачная попытка отваливается
+ * сама, цикл переходит к следующей попытке.
+ *
+ * Бюджет на 1 attempt (см. логи реальных прогонов):
+ *   warmup ~5с + pravocaptcha 2.5с + 3.1 ~5с + waitForResponse «Найти» 60с
+ *   + 3 RAK-retry × 45с + статус ~30с ≈ 240с. С запасом — 270с.
+ */
+const SETUP_ATTEMPT_DEADLINE_MS = Math.max(
+  60_000,
+  Number.parseInt(process.env.RAS_SETUP_ATTEMPT_DEADLINE_MS ?? "270000", 10) || 270_000,
+);
+
 const _sleepMs = (ms) =>
   ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+
+/**
+ * Promise.race с таймаутом. На таймауте reject'ит с понятным сообщением;
+ * исходный promise не отменяется (Playwright API не даёт отмены извне), но
+ * результат игнорируется. Применяется к `_setupSearchSession` и подобным
+ * длинным операциям, у которых внутри есть `await` без явного timeout
+ * (`_stealth.click()`), чтобы залипание DOM не подвешивало процесс навечно.
+ */
+function _withTimeout(promise, ms, label) {
+  let timer = null;
+  const timed = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label}: hard deadline ${Math.floor(ms / 1000)}s превышен`));
+    }, ms);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  return Promise.race([promise, timed]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 const DEFAULT_HEADLESS = (process.env.RAS_HEADLESS ?? "1") === "1";
 const XVFB_DISPLAY_NUM = String(process.env.RAS_DISPLAY_NUM ?? "99").trim() || "99";
@@ -379,6 +420,16 @@ let _browserRecycleForDuplicateIp = null;
 let _xvfbProcess = null;
 /** true только когда main() уже в цикле окон — RecycleWindowError имеет смысл только там. */
 let _inWindowLoop = false;
+/**
+ * Номер последней страницы, на которой стоял `_walkPagesForBody`, ОБНОВЛЯЕТСЯ
+ * в начале каждой итерации pageNum. Нужен, чтобы при `_recoverFrom` →
+ * `RecycleWindowError` сохранить позицию и main() после recycle браузера
+ * продолжил окно с этой страницы, а не заново с 1-й (см. log:
+ * `[main] resume с страницы N`). Без этого окно с TotalCount=685 (28 страниц)
+ * на каждый таймаут вынужден был пройти первые N страниц вхолостую — POST
+ * /Search × N жжёт прокси, ничего нового в Map не добавляет, риск watchdog.
+ */
+let _currentWalkPageNum = 1;
 
 function _hasCmd(cmd) {
   const probe = spawnSync("bash", ["-lc", `command -v "${cmd}"`], {
@@ -461,6 +512,39 @@ function pad2(n) {
   return String(n).padStart(2, "0");
 }
 
+/**
+ * Watchdog «тишины»: каждое log()-сообщение трактуется как heartbeat
+ * прогресса. Если N миллисекунд (RAS_WATCHDOG_STUCK_MS, по умолчанию
+ * 5 мин) ни одного лога — считаем процесс зависшим и аварийно выходим
+ * с кодом 73, чтобы supervisor (pm2 / systemd / while-true wrapper)
+ * пересоздал процесс с новой Playwright-сессией и (возможно) другим
+ * proxy_key. Подробности — см. CLAUDE.md "Watchdog & автономность".
+ */
+let _lastProgressAt = Date.now();
+let _watchdogTimer = null;
+// Дефолт поднят со 120s до 300s после серии false-positive в setup-фазе:
+// UI-recovery + 5 POST /Search × ~5–10с укладывались в 60–90с штатно, но на
+// «горячем» прокси иногда тянулись 150–200с — watchdog убивал процесс зря,
+// supervisor рестартил, Map текущего прогона терялся. С hard deadline на
+// _setupSearchSession (150s) и _recoverListingUiAfterFailedRound (150s)
+// watchdog должен срабатывать только когда деталь-уровневые таймауты НЕ
+// поймали зависание — это уже настоящий ступор.
+const _WATCHDOG_STUCK_MS = Math.max(
+  60_000,
+  Number(process.env.RAS_WATCHDOG_STUCK_MS) || 300_000,
+);
+const _WATCHDOG_INTERVAL_MS = Math.max(
+  5_000,
+  Number(process.env.RAS_WATCHDOG_INTERVAL_MS) || 30_000,
+);
+const _WATCHDOG_EXIT_CODE = 73;
+let _watchdogStuckFired = false;
+let _watchdogLastHeartbeatAt = 0;
+
+function _noteProgress() {
+  _lastProgressAt = Date.now();
+}
+
 function log(msg) {
   const d = new Date();
   const ts = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
@@ -475,6 +559,67 @@ function log(msg) {
             maxStringLength: 4_000,
           });
   process.stdout.write(`[${ts}] ${text}\n`);
+  _noteProgress();
+}
+
+function _startStuckWatchdog() {
+  if (_watchdogTimer !== null) return;
+  _noteProgress();
+  _watchdogTimer = setInterval(() => {
+    const silentMs = Date.now() - _lastProgressAt;
+    // Heartbeat: после 50% порога тишины — пишем каждые INTERVAL «жив».
+    // Так Roman видит, что watchdog не сдох и сколько осталось до exit.
+    if (silentMs >= _WATCHDOG_STUCK_MS / 2 && silentMs <= _WATCHDOG_STUCK_MS) {
+      if (Date.now() - _watchdogLastHeartbeatAt >= _WATCHDOG_INTERVAL_MS - 500) {
+        _watchdogLastHeartbeatAt = Date.now();
+        try {
+          process.stderr.write(
+            `[watchdog] alive, silent=${Math.floor(silentMs / 1000)}s / ` +
+              `${Math.floor(_WATCHDOG_STUCK_MS / 1000)}s\n`,
+          );
+        } catch {}
+      }
+      return;
+    }
+    if (silentMs <= _WATCHDOG_STUCK_MS) return;
+    if (_watchdogStuckFired) return;
+    _watchdogStuckFired = true;
+    const silentSec = Math.floor(silentMs / 1000);
+    const limitSec = Math.floor(_WATCHDOG_STUCK_MS / 1000);
+    // Пишем напрямую в stderr — _log()-pipeline может быть тем самым,
+    // что залип (или промежуточный буфер забит).
+    try {
+      process.stderr.write(
+        `\n[watchdog] STUCK: нет прогресса в логах ${silentSec}s ` +
+          `(> ${limitSec}s). Аварийный выход с кодом ${_WATCHDOG_EXIT_CODE}, ` +
+          `supervisor должен пересоздать процесс. ` +
+          `Подними RAS_WATCHDOG_STUCK_MS если это false-positive.\n`,
+      );
+      const recent = _responseLog
+        .slice(-10)
+        .map((l) => `  ${l}`)
+        .join("\n");
+      if (recent) {
+        process.stderr.write(`[watchdog] последние HTTP-ответы:\n${recent}\n`);
+      }
+    } catch {}
+    // Подождать секунду, чтобы stderr слили, и убить процесс жёстко.
+    // Не используем graceful shutdown — он сам может залипнуть в context.close().
+    setTimeout(() => {
+      try {
+        process.exit(_WATCHDOG_EXIT_CODE);
+      } catch {}
+    }, 1_000);
+  }, _WATCHDOG_INTERVAL_MS);
+  if (typeof _watchdogTimer.unref === "function") _watchdogTimer.unref();
+}
+
+function _stopStuckWatchdog() {
+  if (_watchdogTimer === null) return;
+  try {
+    clearInterval(_watchdogTimer);
+  } catch {}
+  _watchdogTimer = null;
 }
 
 function _dumpSearchResponse(label, body, suffix = "json") {
@@ -1356,6 +1501,7 @@ function _resolveCaseVerdicts(decisionLinksMap, onChange) {
       (orphans.length ? `, без caseId=${orphans.length}` : "") +
       (changedCount ? `, изменено=${changedCount}` : ""),
   );
+  return { changedCount, keepCount, skipCount };
 }
 
 /**
@@ -1405,6 +1551,23 @@ async function _saveDecisionLinks() {
       `буфер=${rowsToWrite.length} (keep=${keepInBatch}), ` +
       `всего в Map=${decisionLinks.size}, ${elapsed}мс`,
   );
+
+  // Cleanup безусловно после каждого save: идемпотентно, на чистой БД быстро
+  // (LIMIT 200 partial scan). Не гейтим по changedCount, потому что:
+  //   а) changedCount считается только по in-memory Map; если резолвер во
+  //      время прошлого прогона флипнул вердикт, а cleanup не дожил (краш) —
+  //      в этом прогоне changedCount был бы 0, но артефакт остался;
+  //   б) гонка embed-worker'а: между селектором и upsert'ом верд может флипнуться,
+  //      pre-upsert guard в embed/fullAct + embed/chunk помечает 'error',
+  //      cleanup подбирает по vector_status='error' + verdict_keep IS FALSE.
+  // Wrap'ом в try/catch: упадёт Qdrant/диск — парсер не валим, standalone-скрипт
+  // `npm run cleanup:invalid` подберёт позже.
+  try {
+    await _cleanupInvalidActs({ log });
+  } catch (e) {
+    log(`[cleanup] FAIL ${e?.stack ?? e?.message ?? e}`);
+  }
+
   return { inserted, updated, skipped: rowsToWrite.length - inserted - updated };
 }
 
@@ -1813,6 +1976,76 @@ function _shouldRotateIp(err) {
 /** Сколько подряд `proxy_flap`-провалов терпим перед эскалацией ротации IP. */
 const PROXY_FLAP_ROTATE_AFTER = 5;
 
+/** Timeout для page.goto: настраивается, по умолчанию 45с.
+ *  Раньше был хардкод 120с — на медленной/мёртвой прокси Roman прерывал
+ *  процесс, не дождавшись Playwright-таймаута. 45с с большим запасом для
+ *  голого GET через мобильный прокси. ENV: RAS_GOTO_TIMEOUT_MS. */
+const GOTO_TIMEOUT_MS = Math.max(
+  10_000,
+  Number(process.env.RAS_GOTO_TIMEOUT_MS) || 45_000,
+);
+
+/** Timeout для прямого POST /Search через page.request.post. Раньше был хардкод
+ *  60с × 8 попыток = до 8 минут на одну страницу с мёртвой прокси. Теперь
+ *  30с — на здоровом канале запрос укладывается в 1-3с, 30с уже сигнал «прокси
+ *  гниёт». ENV: RAS_SEARCH_POST_TIMEOUT_MS. */
+const SEARCH_POST_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.RAS_SEARCH_POST_TIMEOUT_MS) || 30_000,
+);
+
+/** Максимум попыток на одну страницу /Search. С recycle-after-rotate (см.
+ *  _recoverFrom) дрочить старый TCP-туннель не надо — после первого fail
+ *  крутим IP и recycle браузера. 4 попытки = две полных лестницы recovery.
+ *  ENV: RAS_SEARCH_PAGE_MAX_ATTEMPTS. */
+const SEARCH_PAGE_MAX_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.RAS_SEARCH_PAGE_MAX_ATTEMPTS) || 4,
+);
+
+/** Preflight через undici перед каждым page.goto: лёгкий HTTP-probe через
+ *  тот же прокси. Если 451/timeout — пропускаем дорогой Playwright-goto
+ *  и сразу идём в _recoverFrom. По умолчанию ВКЛ, выключение `RAS_PARSER_PREFLIGHT=0`.
+ *  Таймаут отдельный (быстро hands off, чтобы суммарно укладываться в watchdog). */
+const PARSER_PREFLIGHT_ENABLED = !/^(0|off|no|false)$/i.test(
+  String(process.env.RAS_PARSER_PREFLIGHT ?? "1").trim(),
+);
+const PARSER_PREFLIGHT_TIMEOUT_MS = Math.max(
+  2_000,
+  Number(process.env.RAS_PARSER_PREFLIGHT_TIMEOUT_MS) || 8_000,
+);
+
+/**
+ * Возвращает true, если preflight через текущий прокси проходит (RAS отдал HTML).
+ * Иначе false + лог. Никогда не throw'ит — preflight это «оптимизация», а не
+ * жёсткий контракт; при ошибке вызывающий код просто пойдёт в обычный goto.
+ */
+async function _preflightCurrentProxy() {
+  if (!PARSER_PREFLIGHT_ENABLED) return { ok: true, skipped: true };
+  if (!PROXY_SERVER) return { ok: true, skipped: true };
+  const res = await probeRasViaProxy({
+    proxyServer: PROXY_SERVER,
+    proxyUser: PROXY_USER,
+    proxyPass: PROXY_PASS,
+    targetUrl: BASE_URL,
+    timeoutMs: PARSER_PREFLIGHT_TIMEOUT_MS,
+  }).catch((e) => ({
+    ok: false,
+    status: null,
+    latencyMs: 0,
+    reason: `preflight crashed: ${e && e.message ? e.message : e}`,
+    kind: "unknown",
+  }));
+  if (res.ok) {
+    log(`[preflight] OK http=${res.status} ${res.latencyMs}ms (${res.reason})`);
+  } else {
+    log(
+      `[preflight] FAIL kind=${res.kind} http=${res.status ?? "-"} ${res.latencyMs}ms: ${res.reason}`,
+    );
+  }
+  return res;
+}
+
 /** Открывает страницу с ретраями: flap → smartWait, net/ban → `_recoverFrom`. */
 async function _safeGoto(
   page,
@@ -1825,9 +2058,33 @@ async function _safeGoto(
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let banReason = null;
     let flapErr = null;
+    // Preflight через текущий прокси (быстро, ~5-8с): если RAS отдаёт 451
+    // или прокси таймаутит — пропускаем тяжёлый Chromium-goto и сразу идём
+    // в _recoverFrom. Экономим до ~40с на каждой попытке с мёртвым IP.
+    if (url.startsWith(BASE_URL) || url === BASE_URL.replace(/\/$/, "")) {
+      const pf = await _preflightCurrentProxy();
+      if (!pf.ok && !pf.skipped) {
+        banReason = `preflight:${pf.kind}${pf.status ? `/http=${pf.status}` : ""}`;
+        log(
+          `[goto] Попытка ${attempt}/${maxAttempts}: preflight FAIL — ` +
+            `пропускаю Chromium-goto, иду сразу в _recoverFrom (${banReason})`,
+        );
+        if (attempt >= maxAttempts) {
+          lastBanReason = banReason;
+          break;
+        }
+        lastBanReason = banReason;
+        const rotated = await _recoverFrom(`safeGoto ${banReason}`);
+        if (!rotated) {
+          log("[goto] _recoverFrom не сработал — ip_cooldown и пробую снова");
+          await _stealth.smartWait("ip_cooldown");
+        }
+        continue;
+      }
+    }
     try {
       log(`[goto] Попытка ${attempt}/${maxAttempts}: GET ${url}`);
-      const resp = await page.goto(url, { waitUntil: "load", timeout: 120_000 });
+      const resp = await page.goto(url, { waitUntil: "load", timeout: GOTO_TIMEOUT_MS });
       const status = resp ? resp.status() : null;
 
       if (status !== null && _isLikelyBanned(status)) {
@@ -2625,7 +2882,10 @@ async function _applyRakDocumentTypeFilterUi(page, requestedSet) {
         continue;
       }
       const searchT0 = performance.now();
-      const respPromise = page.waitForResponse(_searchPostResponsePredicate, { timeout: 120_000 });
+      // 45с (было 120с): 3 RAK-retry × 45с = 135с укладывается в attempt
+      // setup deadline (150с). На bad IP с залипом UI быстрее переходим к
+      // следующему attempt, который дёрнет _recoverFrom (changeIp).
+      const respPromise = page.waitForResponse(_searchPostResponsePredicate, { timeout: 45_000 });
       const picked = await _stealth.click(opt.xpath, { afterWait: "micro" });
       if (!picked) {
         void respPromise.catch(() => {});
@@ -2716,28 +2976,42 @@ async function _applyRakDocumentTypeFilter(page, requestedSet) {
 /** Единая точка recovery: эскалатор крутит IP/operator/geo. В цикле окон при changeIp/duplicate
  *  пересоздаёт браузер и кидает RecycleWindowError, чтобы main подхватил новые куки.
  *  В setup-фазе (вне цикла окон) recycle НЕ делаем — `page` живёт в локали main и
- *  пересоздание ломает уже работающий вызов _safeGoto. */
+ *  пересоздание ломает уже работающий вызов _safeGoto.
+ *
+ *  ВАЖНО: даже если changeIp не сработал (rate-limit / сеть провайдера) — в
+ *  window-loop делаем recycle браузера. Без этого Playwright продолжит
+ *  держать keep-alive TCP с тем же мёртвым IP, и следующие POST /Search
+ *  отвалятся точно так же. Recycle закрывает все keepalive-туннели; даже
+ *  если IP не сменился, новое TCP-соединение часто проходит. */
 async function _recoverFrom(reason = "", _opts = {}) {
   const r = await _escalator.recoverFrom(reason, _opts);
   if (r.level === ESC_LEVELS.IP && r.detail?.ok && r.detail.duplicateIp) {
     log(`[recover] changeIp вернул тот же new_ip`);
     _escalator.revertLastIpRotationForDuplicateEgress(reason);
     if (_inWindowLoop && _browserRecycleForDuplicateIp) {
+      const lastPageNum = _currentWalkPageNum;
       await _browserRecycleForDuplicateIp();
-      throw new RecycleWindowError(`duplicate new_ip (${reason})`);
+      throw new RecycleWindowError(`duplicate new_ip (${reason})`, {
+        lastPageNum,
+      });
     }
     return true;
   }
   if (
     _inWindowLoop &&
     RECYCLE_BROWSER_AFTER_BANNED_L1 &&
-    r.level === ESC_LEVELS.IP &&
-    r.detail?.ok &&
     _browserRecycleForDuplicateIp
   ) {
-    log(`[recover] после changeIp — recycle браузера`);
+    const tag = r.detail?.ok ? "ok" : "fail";
+    log(
+      `[recover] level=${r.level} ${tag} — recycle браузера (сбросить TCP-keepalive)`,
+    );
+    const lastPageNum = _currentWalkPageNum;
     await _browserRecycleForDuplicateIp();
-    throw new RecycleWindowError(`recycle after changeIp (${reason})`);
+    throw new RecycleWindowError(
+      `recycle after recover level=${r.level} ${tag} (${reason})`,
+      { lastPageNum },
+    );
   }
   log(`[recover] level=${r.level} OK; summary=${JSON.stringify(_escalator.summary())}`);
   return true;
@@ -3057,7 +3331,7 @@ async function _uiClickPagerNext(page, label, bodyObj, pageNum) {
     response = await page.request.post(url, {
       headers,
       data: JSON.stringify(bodyObj),
-      timeout: 60_000,
+      timeout: SEARCH_POST_TIMEOUT_MS,
     });
   } catch (e) {
     return [null, null, `request: ${e}`, performance.now() - t0];
@@ -3188,7 +3462,21 @@ async function _browseSearchPage(
  *
  * @returns {Promise<boolean>} false если форма или промотка не удались
  */
-async function _recoverListingUiAfterFailedRound(
+async function _recoverListingUiAfterFailedRound(...args) {
+  try {
+    return await _withTimeout(
+      _recoverListingUiAfterFailedRoundInner(...args),
+      SETUP_ATTEMPT_DEADLINE_MS,
+      `[ui-recovery]`,
+    );
+  } catch (e) {
+    const label = (args && args[3]) || "ui-recovery";
+    log(`[${label}] UI-recovery deadline: ${e && e.message}`);
+    return false;
+  }
+}
+
+async function _recoverListingUiAfterFailedRoundInner(
   page,
   bodyObj,
   pageNum,
@@ -3261,6 +3549,7 @@ async function _walkPagesForBody(
   targetTypeIdsSet,
   uiFilters = {},
   supplyFilter31 = false,
+  startPageNum = 1,
 ) {
   const stats = {
     total: null,
@@ -3274,12 +3563,20 @@ async function _walkPagesForBody(
     links_skipped_category: 0,
   };
 
-  for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum += 1) {
+  const firstPage = Math.max(1, Number.isInteger(startPageNum) ? startPageNum : 1);
+  if (firstPage > 1) {
+    log(
+      `[${labelPrefix}] resume пейджера: стартую сразу со страницы ${firstPage} ` +
+        `(прогон после RecycleWindowError, страницы 1..${firstPage - 1} уже в Map)`,
+    );
+  }
+  for (let pageNum = firstPage; pageNum <= MAX_PAGES; pageNum += 1) {
+    _currentWalkPageNum = pageNum;
     log(`[${labelPrefix}] страница ${pageNum}...`);
 
     let data = null;
     let lastSuccessElapsedMs = 0;
-    const maxPageAttempts = 8;
+    const maxPageAttempts = SEARCH_PAGE_MAX_ATTEMPTS;
     let pageRound = 0;
     while (data === null) {
       pageRound += 1;
@@ -3580,6 +3877,20 @@ async function _walkPagesForBody(
       stats.links_skipped_category += linkOut.skippedCategory;
       stats.links_added_umbrella += linksAddedUmbrellaPage;
       await _saveDecisionLinks();
+      // Чекпоинт страницы. Если процесс упадёт после этой строки (watchdog,
+      // SIGKILL, OOM, supervisor-restart), следующий запуск прочитает state и
+      // продолжит окно со страницы pageNum+1, а не с 1-й. _saveDecisionLinks
+      // уже залил все новые ID этой страницы в PG, так что page pageNum
+      // действительно закрыта.
+      if (
+        _currentParserState !== null &&
+        mode === MODE_DECISION_LINKS &&
+        Number.isInteger(pageNum) &&
+        pageNum > 0
+      ) {
+        _currentParserState.currentLastPage = pageNum;
+        _saveParserState(_currentParserState);
+      }
     }
     stats.pages_seen += 1;
     stats.items += items.length;
@@ -3694,9 +4005,19 @@ function _loadParserState() {
       const od = _parseDdMmYyyy(String(j.oldestDay));
       if (od) oldestDay = _startOfDay(od);
     }
+    // currentLastPage — последняя успешно обработанная страница внутри окна
+    // nextEndDay. Если > 0 — продолжим со страницы currentLastPage+1, что
+    // экономит ходки по уже залитым в PG страницам при рестарте процесса
+    // (watchdog kill, supervisor restart). Поле опциональное: legacy state без
+    // него интерпретируется как currentLastPage=0 (полный прогон окна).
+    let currentLastPage = 0;
+    if (Number.isInteger(j.currentLastPage) && j.currentLastPage > 0) {
+      currentLastPage = j.currentLastPage;
+    }
     return {
       nextEndDay: _startOfDay(nextEndDay),
       oldestDay,
+      currentLastPage,
       updatedAt: String(j.updatedAt ?? ""),
     };
   } catch (e) {
@@ -3712,6 +4033,10 @@ function _saveParserState(state) {
     const payload = {
       nextEndDay: _formatDdMmYyyy(state.nextEndDay),
       oldestDay: state.oldestDay ? _formatDdMmYyyy(state.oldestDay) : null,
+      currentLastPage:
+        Number.isInteger(state.currentLastPage) && state.currentLastPage > 0
+          ? state.currentLastPage
+          : 0,
       updatedAt: new Date().toISOString(),
     };
     const tmp = PARSER_STATE_PATH + ".tmp";
@@ -4194,17 +4519,16 @@ async function _promptSetup(headless) {
         const freshLabel = haveFreshGap
           ? `[1] добрать свежие (${_formatDdMmYyyy(maxD)} → ${_formatDdMmYyyy(defaultEndDay)}), `
           : "";
-        const defaultHint = haveFreshGap ? "Enter = 1" : "Enter = 3";
         const raw = (
           await _ask(
             `Продолжить с прошлого прогона? ` +
               freshLabel +
               `[2] идти назад от ${_formatDdMmYyyy(minD)} вглубь прошлого, ` +
               `[3] задать даты вручную ` +
-              `[${defaultHint}]: `,
+              `[Enter = 2]: `,
           )
         ).trim();
-        if ((raw === "" && haveFreshGap) || raw === "1") {
+        if (raw === "1") {
           if (!haveFreshGap) {
             process.stdout.write(
               `В БД уже есть данные за ${_formatDdMmYyyy(defaultEndDay)} (последний акт — ` +
@@ -4220,7 +4544,7 @@ async function _promptSetup(headless) {
           );
           break;
         }
-        if (raw === "2") {
+        if (raw === "" || raw === "2") {
           const newEnd = new Date(
             minD.getFullYear(),
             minD.getMonth(),
@@ -4234,12 +4558,12 @@ async function _promptSetup(headless) {
           );
           break;
         }
-        if (raw === "3" || (raw === "" && !haveFreshGap)) {
+        if (raw === "3") {
           // Старое поведение: спросить обе даты руками.
           break;
         }
         process.stdout.write(
-          `Введи ${haveFreshGap ? "1, " : ""}2, 3 или Enter (= ${haveFreshGap ? "1" : "3"}).\n`,
+          `Введи ${haveFreshGap ? "1, " : ""}2, 3 или Enter (= 2).\n`,
         );
       }
     }
@@ -4694,9 +5018,26 @@ async function main() {
       `[setup] сбор PDF-ссылок по TypeId (${targetTypeIds.length} специфичных + ` +
         `umbrella ${UMBRELLA_DECISION_TYPE_ID} с allowlist жанров) -> Postgres table acts`,
     );
+    // Startup sweep: ловим legacy-сирот (verdict_keep=FALSE + RAG-артефакты),
+    // которые могли накопиться до ввода cleanup-механики, либо после кр crashes
+    // прошлого прогона между upsert'ом нового вердикта и собственно cleanup'ом.
+    try {
+      const swept = await _cleanupInvalidActs({ log });
+      log(
+        `[cleanup/startup] scanned=${swept.scanned} reset=${swept.rows_reset} ` +
+          `qdrant_deleted=${swept.qdrant_deleted} pdf_deleted=${swept.pdf_deleted} errors=${swept.errors}`,
+      );
+    } catch (e) {
+      log(`[cleanup/startup] FAIL ${e?.stack ?? e?.message ?? e}`);
+    }
   }
 
   try {
+    _startStuckWatchdog();
+    log(
+      `[watchdog] stuck-limit=${Math.floor(_WATCHDOG_STUCK_MS / 1000)}s, ` +
+        `check=${Math.floor(_WATCHDOG_INTERVAL_MS / 1000)}s, exit_code=${_WATCHDOG_EXIT_CODE}`,
+    );
     log("[browser] запускаю Playwright...");
 
     // Fail-fast по конфигу: пустые PROXY_USER/PROXY_PASS — это почти
@@ -4763,20 +5104,50 @@ async function main() {
     // Координация прокси с pdf/downloader: занимаем MP_PROXY_KEY в proxy_leases.
     // Если ключ занят качалкой PDF — падаем с понятным сообщением, чтобы не
     // ловить хаос changeIp/cookie от обоих процессов на одном gateway.
+    //
+    // Retry-цикл: supervisor рестартит парсер через 5с после kill. Старый PID
+    // может ещё доумирать (Chromium закрывается), `process.kill(pid, 0)` пока
+    // не даёт ESRCH → `releaseDeadLocalLeases` не чистит «нашу» аренду. До
+    // фикса это приводило к crash-loop'у через `lease conflict` пока TTL (5
+    // мин) не истечёт. Теперь: ждём 5–15с между попытками, повторяем cleanup,
+    // даём системе доubrать зомби. До 4 попыток ≈ 30с — потом сдаёмся, exit=1,
+    // supervisor рестартит с большим интервалом.
     const leaseCleanupOnStart =
       (process.env.RAS_PDF_LEASE_CLEANUP_ON_START ?? "1").trim() !== "0";
-    if (leaseCleanupOnStart) {
+    let leaseRes = null;
+    const leaseAcquireMaxAttempts = 4;
+    let lastLeaseError = null;
+    for (let attempt = 1; attempt <= leaseAcquireMaxAttempts; attempt += 1) {
+      if (leaseCleanupOnStart) {
+        try {
+          await _leaseReleaseDeadLocal({ logger: log });
+        } catch (e) {
+          log(`[lease] releaseDeadLocalLeases перед claim: ${e && e.message}`);
+        }
+      }
       try {
-        await _leaseReleaseDeadLocal({ logger: log });
+        leaseRes = await _leaseAcquire({
+          key: MP_PROXY_KEY,
+          role: "parser",
+          logger: log,
+        });
+        lastLeaseError = null;
+        break;
       } catch (e) {
-        log(`[lease] releaseDeadLocalLeases перед claim: ${e && e.message}`);
+        lastLeaseError = e;
+        if (attempt >= leaseAcquireMaxAttempts) break;
+        const waitMs = 5_000 * attempt;
+        log(
+          `[lease] попытка ${attempt}/${leaseAcquireMaxAttempts} не удалась ` +
+            `(${e && e.message?.split("\n")[0]}), жду ${Math.floor(waitMs / 1000)}с и ` +
+            `повторяю cleanup+claim (если старый PID ещё доумирает — успеет)`,
+        );
+        await _sleepMs(waitMs);
       }
     }
-    const leaseRes = await _leaseAcquire({
-      key: MP_PROXY_KEY,
-      role: "parser",
-      logger: log,
-    });
+    if (!leaseRes) {
+      throw lastLeaseError ?? new Error("[lease] acquire: неизвестная ошибка");
+    }
     leaseHolderId = leaseRes.holderId;
     if (leaseRes.leased) {
       leaseStopHeartbeat = _leaseStartHeartbeat({
@@ -4856,15 +5227,24 @@ async function main() {
         "[browser] recycle: подписался на page.on('request' | 'requestfailed' | 'response', ...)",
       );
       await _safeGoto(page, BASE_URL, { sentinelSelector: "#b-form-submit" });
-      const maxRecycleSetup = 4;
+      const maxRecycleSetup = 3;
       let up = false;
       for (let rs = 1; rs <= maxRecycleSetup; rs += 1) {
-        up = await _setupSearchSession(page, {
-          supplyFilter31,
-          statusFinishedOnly,
-          rakDocumentTypeFilter,
-          periodBody: setupPeriodRef,
-        });
+        try {
+          up = await _withTimeout(
+            _setupSearchSession(page, {
+              supplyFilter31,
+              statusFinishedOnly,
+              rakDocumentTypeFilter,
+              periodBody: setupPeriodRef,
+            }),
+            SETUP_ATTEMPT_DEADLINE_MS,
+            `[browser] recycle setup ${rs}/${maxRecycleSetup}`,
+          );
+        } catch (e) {
+          log(`[browser] recycle setup ${rs}/${maxRecycleSetup}: ${e && e.message}`);
+          up = false;
+        }
         if (up) break;
         log(
           `[browser] recycle: POST /Search не пойман (попытка setup ${rs}/${maxRecycleSetup})`,
@@ -4886,19 +5266,39 @@ async function main() {
 
     await _safeGoto(page, BASE_URL, { sentinelSelector: "#b-form-submit" });
 
-    const sessionUp = await _setupSearchSession(page, {
-      supplyFilter31,
-      statusFinishedOnly,
-      rakDocumentTypeFilter,
-      periodBody: setupPeriodRef,
-    });
+    let sessionUp = false;
+    try {
+      sessionUp = await _withTimeout(
+        _setupSearchSession(page, {
+          supplyFilter31,
+          statusFinishedOnly,
+          rakDocumentTypeFilter,
+          periodBody: setupPeriodRef,
+        }),
+        SETUP_ATTEMPT_DEADLINE_MS * 2,
+        "[setup] initial",
+      );
+    } catch (e) {
+      log(`[setup] initial deadline: ${e && e.message}`);
+      sessionUp = false;
+    }
 
     log("[wait] grace-пауза перед сбросом дебага через smartWait('reading')");
     await _stealth.smartWait("reading");
     await _dumpDebug(page);
 
     if (!sessionUp) {
-      log("[result] Запрос /Search не пойман. Смотри ./debug/ артефакты.");
+      // КРИТИЧЕСКИ ВАЖНО: бросаем error, чтобы main catch выставил
+      // process.exitCode=1 и supervisor пересоздал процесс. Без throw парсер
+      // тихо завершался с exit=0, supervisor НЕ рестартил → парсинг
+      // останавливался навсегда. Видели в реальном прогоне: RAS залип на
+      // кликах РАК-фильтра, initial setup deadline 300с пробил Promise.race,
+      // sessionUp=false, log + exit, supervisor: «parser exit=0 — выхожу без
+      // рестарта». Это ровно противоположно тому, что нужно для долгого
+      // аптайма: bad IP должен триггерить рестарт со свежим прокси.
+      throw new Error(
+        "[result] Запрос /Search не пойман после initial setup — рестарт через supervisor"
+      );
     } else {
       let bodyTemplate = null;
       const maxBodyParseAttempts = 5;
@@ -4946,11 +5346,39 @@ async function main() {
         // Чекпоинт позиции окна: пишем при старте (если процесс упадёт сейчас,
         // следующий запуск стартанёт с endDay), потом обновляем после каждой
         // успешной смены outerEnd. SIGINT-handler сохранит текущее значение.
+        //
+        // resumeForFirstWindow: если предыдущий прогон упал внутри окна
+        // (state.currentLastPage > 0) и текущий outerEnd совпадает с
+        // state.nextEndDay — продолжаем со страницы currentLastPage+1, чтобы
+        // не молотить впустую POST /Search по уже залитым в PG страницам.
+        // Срабатывает только для ПЕРВОГО окна прогона; дальше каждое окно
+        // стартует с 1.
+        let resumeForFirstWindow = 0;
         if (mode === MODE_DECISION_LINKS) {
-          _currentParserState = { nextEndDay: outerEnd, oldestDay };
+          const loaded = _loadParserState();
+          if (
+            loaded &&
+            loaded.nextEndDay &&
+            Number.isInteger(loaded.currentLastPage) &&
+            loaded.currentLastPage > 0 &&
+            _startOfDay(loaded.nextEndDay).getTime() === _startOfDay(outerEnd).getTime()
+          ) {
+            resumeForFirstWindow = loaded.currentLastPage;
+            log(
+              `[state] resume после рестарта: окно ${_formatDdMmYyyy(outerEnd)} ` +
+                `продолжаю со страницы ${resumeForFirstWindow + 1} ` +
+                `(прошлый прогон завершил ${resumeForFirstWindow})`,
+            );
+          }
+          _currentParserState = {
+            nextEndDay: outerEnd,
+            oldestDay,
+            currentLastPage: resumeForFirstWindow,
+          };
           _saveParserState(_currentParserState);
           _installParserStateSigintOnce();
         }
+        let firstWindowResumeConsumed = false;
 
         _inWindowLoop = true;
         while (true) {
@@ -5012,7 +5440,11 @@ async function main() {
               break;
             }
             if (mode === MODE_DECISION_LINKS) {
-              _currentParserState = { nextEndDay: outerEnd, oldestDay };
+              _currentParserState = {
+                nextEndDay: outerEnd,
+                oldestDay,
+                currentLastPage: 0,
+              };
               _saveParserState(_currentParserState);
             }
             pendingSubs = [{ endDay: outerEnd, daysSpan: 1 }];
@@ -5047,6 +5479,11 @@ async function main() {
 
           let stats = null;
           let dupRecycleAttempts = 0;
+          let resumeFromPage = 1;
+          if (!firstWindowResumeConsumed && resumeForFirstWindow > 0) {
+            resumeFromPage = resumeForFirstWindow + 1;
+            firstWindowResumeConsumed = true;
+          }
           while (true) {
             try {
               stats = await _walkPagesForBody(
@@ -5057,6 +5494,7 @@ async function main() {
                 targetTypeIdsSet,
                 { rakDocumentTypeFilter, statusFinishedOnly },
                 supplyFilter31,
+                resumeFromPage,
               );
               break;
             } catch (err) {
@@ -5068,9 +5506,14 @@ async function main() {
                     `перезапусков браузера на одном окне`,
                 );
               }
+              const fellOn = err.lastPageNum && err.lastPageNum > 0
+                ? err.lastPageNum
+                : 1;
+              resumeFromPage = fellOn;
               log(
                 `[main] ${err.message} — снова прогоняю окно ` +
                   `${_formatDdMmYyyy(sub.endDay)}/${sub.daysSpan}д ` +
+                  `со страницы ${resumeFromPage} ` +
                   `(recycle ${dupRecycleAttempts}/${MAX_WINDOW_RECYCLES_AFTER_DUP_IP})`,
               );
               try {
@@ -5139,6 +5582,12 @@ async function main() {
       log(`Error: ${e}`);
       if (e && e.stack) process.stderr.write(`${e.stack}\n`);
     }
+    // Любая необработанная ошибка (lease conflict, сеть, бан и т.п.) — не штатный
+    // выход. Выставляем ненулевой код, чтобы supervisor (npm start) перезапустил
+    // процесс. Раньше catch просто проглатывал ошибку, parser выходил с exit=0,
+    // и supervisor не рестартил → парсер навсегда падал. lease conflict особенно
+    // болезнен: после kill старого процесса нужен авто-retry через ~5с.
+    process.exitCode = 1;
   } finally {
     _browserRecycleForDuplicateIp = null;
     _inWindowLoop = false;
@@ -5181,6 +5630,7 @@ async function main() {
     } catch (e) {
       log(`[shutdown] pg pool.end() упал: ${e}`);
     }
+    _stopStuckWatchdog();
     log("[shutdown] всё, выход");
   }
 }

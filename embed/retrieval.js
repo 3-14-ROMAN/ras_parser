@@ -44,6 +44,50 @@ import {
 } from "./clients.js";
 import { hydrateForRerank } from "./hydrate.js";
 import { rerank } from "./rerank.js";
+import {
+  acquireRuntimeLease,
+  releaseRuntimeLease,
+} from "../db/runtimeFlags.js";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Search-priority lease: пока идёт поисковый запрос, индексер должен уступить
+// inference (см. embed/worker.js::waitForSearchPriority). Каждый search берёт
+// свой ключ `search_active:<uuid>` через acquireRuntimeLease, чтобы релиз
+// одного запроса не сносил другой одновременный. Acquire — до embedQuery,
+// release — в finally; ошибки релиза не валят поиск, только логируются.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SEARCH_LEASE_PREFIX = "search_active";
+
+function resolveSearchLeaseTtlSeconds() {
+  const raw = process.env.RAS_SEARCH_LEASE_TTL_SECONDS;
+  if (raw === undefined || raw === "") return 180;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 180;
+}
+
+async function withSearchLease(fn) {
+  const ttlSeconds = resolveSearchLeaseTtlSeconds();
+  let leaseKey = null;
+  try {
+    leaseKey = await acquireRuntimeLease(SEARCH_LEASE_PREFIX, { ttlSeconds });
+    console.log(`[search/lease] acquired key=${leaseKey} ttl=${ttlSeconds}s`);
+  } catch (e) {
+    console.warn(`[search/lease] acquire failed err=${e?.message ?? e} — running search without lease`);
+  }
+  try {
+    return await fn();
+  } finally {
+    if (leaseKey) {
+      try {
+        await releaseRuntimeLease(leaseKey);
+        console.log(`[search/lease] released key=${leaseKey}`);
+      } catch (e) {
+        console.warn(`[search/lease] release failed key=${leaseKey} err=${e?.message ?? e}`);
+      }
+    }
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Эмбеддинг запроса
@@ -317,7 +361,7 @@ export const DEFAULT_RRF_WEIGHTS = {
  *   topK:   Array<{ act_id: string, score: number, ranks: Record<string,number> }>,
  * }>}
  */
-export async function searchAll(queryText, opts = {}) {
+async function _searchAllImpl(queryText, opts = {}) {
   const perBranchLimit = opts.perBranchLimit ?? 100;
   const groupSize      = opts.groupSize      ?? 3;
   const weights        = opts.weights        ?? DEFAULT_RRF_WEIGHTS;
@@ -358,6 +402,10 @@ export async function searchAll(queryText, opts = {}) {
     merged,
     topK: merged.slice(0, topK).map(([act_id, score, ranks]) => ({ act_id, score, ranks })),
   };
+}
+
+export async function searchAll(queryText, opts = {}) {
+  return withSearchLease(() => _searchAllImpl(queryText, opts));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -402,7 +450,7 @@ export async function searchAll(queryText, opts = {}) {
  *   timing: { retrieval_ms, hydrate_ms, rerank_ms, total_ms },
  * }>}
  */
-export async function searchAndRerank(queryText, opts = {}) {
+async function _searchAndRerankImpl(queryText, opts = {}) {
   const perBranchLimit = opts.perBranchLimit  ?? 100;
   const groupSize      = opts.groupSize       ?? 3;
   const weights        = opts.weights         ?? DEFAULT_RRF_WEIGHTS;
@@ -418,7 +466,9 @@ export async function searchAndRerank(queryText, opts = {}) {
 
   // 1) Retrieval + RRF (поднимаем topK до rrfTopK, чтобы reranker'у было что
   // переcортировать; ничего не теряем — merged всё равно есть).
-  const retrieved = await searchAll(queryText, {
+  // Зовём _searchAllImpl напрямую — внешний withSearchLease уже держит лиз
+  // на весь pipeline, второй acquire здесь был бы лишним.
+  const retrieved = await _searchAllImpl(queryText, {
     perBranchLimit,
     groupSize,
     weights,
@@ -454,4 +504,8 @@ export async function searchAndRerank(queryText, opts = {}) {
       total_ms:     tRerank    - tStart,
     },
   };
+}
+
+export async function searchAndRerank(queryText, opts = {}) {
+  return withSearchLease(() => _searchAndRerankImpl(queryText, opts));
 }

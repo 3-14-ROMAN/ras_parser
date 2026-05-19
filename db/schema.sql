@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS acts (
     -- ── embedding state machine (см. ниже DO-block для миграции legacy) ──
     -- token_count       — реальный счёт токенов из инференса (Jina v4 tokenizer).
     --                     NULL до первого индексирования; заполняется индексером.
+    -- tokens_jina_v3    — счёт токенов через tokenizer jina-reranker-v3 (Qwen3).
+    --                     Считается в момент markTextExtracted (download:acts)
+    --                     через POST /count_tokens к inference. NULL если в
+    --                     момент скачивания inference был недоступен — тогда
+    --                     значение можно добить отдельным backfill-проходом.
+    --                     ИСПОЛЬЗОВАНИЕ: гейтинг по реальному лимиту реранкера
+    --                     (RERANKER_MAX_DOC_LENGTH в inference/app.py).
     -- is_long_act       — TRUE если token_count > 8192 (или, до подсчёта,
     --                     эвристика по length(act_text) > 32000). Routing:
     --                     FALSE → unit_type=full_act (один point на акт)
@@ -95,6 +102,7 @@ CREATE TABLE IF NOT EXISTS acts (
     --                     и переиндексирует, если меньше.
     -- indexed_at        — момент успешного indexed-перехода.
     token_count           INTEGER,
+    tokens_jina_v3        INTEGER,
     is_long_act           BOOLEAN,
     vector_status         TEXT NOT NULL DEFAULT 'pending'
         CHECK (vector_status IN ('pending', 'indexing', 'indexed', 'error')),
@@ -113,6 +121,7 @@ CREATE TABLE IF NOT EXISTS acts (
 -- БД эти ALTER тоже no-op (колонки уже созданы выше в CREATE TABLE).
 -- ─────────────────────────────────────────────────────────────────────────────
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS token_count    INTEGER;
+ALTER TABLE acts ADD COLUMN IF NOT EXISTS tokens_jina_v3 INTEGER;
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS is_long_act    BOOLEAN;
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS vector_status  TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS vector_error   TEXT;

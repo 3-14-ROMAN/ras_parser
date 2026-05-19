@@ -61,6 +61,7 @@ import {
   logPdfDownloadAggregateStats,
 } from "./downloader.js";
 import { extractPdfText } from "./extractor.js";
+import { countJinaV3Tokens } from "./jinaV3Tokens.js";
 import {
   ProxyQuarantineRegistry,
   readQuarantineConfigFromEnv,
@@ -132,6 +133,29 @@ const INFRA_PAUSE_MIN_MS = Math.max(0, Number(process.env.RAS_PDF_INFRA_PAUSE_MI
 const INFRA_PAUSE_MAX_MS = Math.max(
   INFRA_PAUSE_MIN_MS,
   Number(process.env.RAS_PDF_INFRA_PAUSE_MAX_MS ?? 120_000),
+);
+
+/**
+ * Slow-proxy detection: после probation (первого PDF OK) recoverable-сигналы
+ * вроде `evaluate timeout after Xms`, ERR_HTTP2_*, "ras/kad timeout" и пр.
+ * раньше тихо скипались (paceAfterFailure + continue) — медленный воркер
+ * продолжал ловить таймауты, теряя минуты на каждый цикл warmup'а.
+ *
+ * Считаем такие события в trailing-window. При длине ≥ THRESHOLD за окно
+ * воркер делает changeGeo (через тот же _attemptProxyRecoverBeforeQuarantine,
+ * что для infra/451) и продолжает работу. Cooldown не ставим — если новый
+ * geo тоже окажется медленным, через окно снова накопится порог и снова
+ * будет changeGeo. Здоровые воркеры всё это время разбирают общую очередь.
+ *
+ * RAS_PDF_SLOW_THRESHOLD=0 → детектор выключен.
+ */
+const SLOW_TIMEOUT_THRESHOLD = Math.max(
+  0,
+  Number(process.env.RAS_PDF_SLOW_THRESHOLD ?? 2),
+);
+const SLOW_TIMEOUT_WINDOW_MS = Math.max(
+  0,
+  Number(process.env.RAS_PDF_SLOW_WINDOW_MS ?? 300_000),
 );
 
 /** Интервал heartbeat-метрик пайплайна (мс). 0 = выключить лог. */
@@ -739,6 +763,17 @@ class MetricsReporter {
     this._intervalDeferred = 0;
     this._intervalDlFailed = 0;
     this._intervalExFailed = 0;
+    // Jina v3 reranker tokens — lifetime агрегаты (для avg/max), плюс
+    // per-interval счётчики (для since_last в heartbeat).
+    this._tokensSumLife = 0;
+    this._tokensCountLife = 0;
+    this._tokensMaxLife = 0;
+    this._tokensMaxIdLife = null;
+    this._intervalTokensSum = 0;
+    this._intervalTokensCount = 0;
+    this._intervalTokensMissing = 0;
+    this._intervalTokensLast = null;
+    this._intervalTokensLastId = null;
   }
 
   /**
@@ -792,6 +827,34 @@ class MetricsReporter {
     this._intervalExFailed += 1;
   }
 
+  /**
+   * Записать token_count акта (jina-reranker-v3 tokenizer).
+   * Кормит lifetime avg/max + per-interval since_last.
+   * @param {number} n
+   * @param {string} id
+   */
+  noteTokens(n, id) {
+    if (!Number.isFinite(n) || n < 0) return;
+    this._tokensSumLife += n;
+    this._tokensCountLife += 1;
+    if (n > this._tokensMaxLife) {
+      this._tokensMaxLife = n;
+      this._tokensMaxIdLife = id ?? null;
+    }
+    this._intervalTokensSum += n;
+    this._intervalTokensCount += 1;
+    this._intervalTokensLast = n;
+    this._intervalTokensLastId = id ?? null;
+  }
+
+  /**
+   * Текст есть, но inference /count_tokens вернул null (inference down).
+   * Считаем отдельно — это не «нет текста», это «нет числа токенов».
+   */
+  noteTokensMissing() {
+    this._intervalTokensMissing += 1;
+  }
+
   _trimOldTimestamps() {
     const cutoff = Date.now() - 15 * 60 * 1000;
     let i = 0;
@@ -832,6 +895,18 @@ class MetricsReporter {
     const intervalDef = this._intervalDeferred;
     const intervalDlFail = this._intervalDlFailed;
     const intervalExFail = this._intervalExFailed;
+    // Tokens since_last + lifetime snapshot (для avg/max в строке).
+    const intervalTokSum = this._intervalTokensSum;
+    const intervalTokCnt = this._intervalTokensCount;
+    const intervalTokMiss = this._intervalTokensMissing;
+    const intervalTokLast = this._intervalTokensLast;
+    const intervalTokLastId = this._intervalTokensLastId;
+    const tokAvgLife = this._tokensCountLife > 0
+      ? Math.round(this._tokensSumLife / this._tokensCountLife)
+      : 0;
+    const tokMaxLife = this._tokensMaxLife;
+    const tokMaxIdLife = this._tokensMaxIdLife;
+    const tokCountedLife = this._tokensCountLife;
 
     this._sumDownloadMs = 0;
     this._countDownload = 0;
@@ -847,17 +922,42 @@ class MetricsReporter {
     this._intervalDeferred = 0;
     this._intervalDlFailed = 0;
     this._intervalExFailed = 0;
+    this._intervalTokensSum = 0;
+    this._intervalTokensCount = 0;
+    this._intervalTokensMissing = 0;
+    this._intervalTokensLast = null;
+    this._intervalTokensLastId = null;
 
     const rate5 = (r5 / 5).toFixed(1);
     const rate15 = (r15 / 15).toFixed(1);
-    return (
+    const mainLine =
       `[pipe/metrics] pdf/min 1m=${r1} 5m=${rate5} 15m=${rate15} | ` +
       `since_last: ok=${intervalOk} deferred=${intervalDef} ` +
       `dl_failed=${intervalDlFail} ex_failed=${intervalExFail} | ` +
       `avg_ms: download=${avgDownload} extract=${avgExtract} mark_pg=${avgMark} ` +
       `queue_wait=${avgQueueWait} pace=${avgPace} | ` +
-      `queue=${queueSize}/${queueCap} session_saved=${sessionSaved}`
-    );
+      `queue=${queueSize}/${queueCap} session_saved=${sessionSaved}`;
+    if (tokCountedLife === 0 && intervalTokMiss === 0) {
+      return mainLine;
+    }
+    const intervalAvg = intervalTokCnt > 0
+      ? Math.round(intervalTokSum / intervalTokCnt)
+      : null;
+    const lastTag = intervalTokLast != null
+      ? ` last=${intervalTokLast}` +
+        (intervalTokLastId ? `(id=${intervalTokLastId})` : "")
+      : "";
+    const maxTag = tokMaxLife > 0
+      ? ` max=${tokMaxLife}` + (tokMaxIdLife ? `(id=${tokMaxIdLife})` : "")
+      : "";
+    const tokensLine =
+      `[pipe/metrics] tokens jina-v3: counted=${tokCountedLife} ` +
+      `avg=${tokAvgLife}${maxTag} | ` +
+      `since_last: n=${intervalTokCnt}` +
+      (intervalAvg != null ? ` avg=${intervalAvg}` : "") +
+      lastTag +
+      ` no_count=${intervalTokMiss}`;
+    return `${mainLine}\n${tokensLine}`;
   }
 }
 
@@ -1214,6 +1314,15 @@ export async function runPipeline({ workDir, logger, ids = null }) {
     worker_paused: 0,
     extracted: 0,
     ex_failed: 0,
+    // Jina v3 reranker tokenizer (см. pdf/jinaV3Tokens.js).
+    // Считается в _processOne для каждого успешно извлечённого текста.
+    // tokens_no_count — текст есть, но inference /count_tokens вернул null
+    // (inference недоступен) → в БД tokens_jina_v3 = NULL, добивается backfill'ом.
+    tokens_sum: 0,
+    tokens_counted: 0,
+    tokens_max: 0,
+    tokens_max_id: null,
+    tokens_no_count: 0,
   };
   const runState = {
     totalSeen: 0,
@@ -1402,6 +1511,17 @@ export async function runPipeline({ workDir, logger, ids = null }) {
       `отложено=${counters.dl_deferred}), ` +
       `извлечено текста=${counters.extracted} (ошибок извлечения=${counters.ex_failed})`,
   );
+  if (counters.tokens_counted > 0 || counters.tokens_no_count > 0) {
+    const avgTok = counters.tokens_counted > 0
+      ? Math.round(counters.tokens_sum / counters.tokens_counted)
+      : 0;
+    log(
+      `[pipe] tokens jina-v3: counted=${counters.tokens_counted} avg=${avgTok} ` +
+        `max=${counters.tokens_max}` +
+        (counters.tokens_max_id ? ` (id=${counters.tokens_max_id})` : "") +
+        ` sum=${counters.tokens_sum} no_count=${counters.tokens_no_count}`,
+    );
+  }
   log(
     `[pdf/stats] infra_deferred=${counters.infra_deferred} ` +
       `worker_restarts=${counters.worker_restarts} ` +
@@ -1485,6 +1605,11 @@ async function _downloadWorker({
    */
   const WORKER_UNEXPECTED_FAIL_LIMIT = 5;
   let consecutiveUnexpectedFails = 0;
+  /**
+   * Trailing-window timestamps of slow-class recoverable events на этом
+   * воркере (см. SLOW_TIMEOUT_THRESHOLD). При длине ≥ порога — changeGeo.
+   */
+  const slowEventTs = [];
   while (true) {
     if (shouldStop()) {
       logWorkerEnd(`[${label}] стоп-сигнал — выхожу из download loop`);
@@ -1862,6 +1987,57 @@ async function _downloadWorker({
           }
           continue;
         }
+        // Slow-proxy detect (см. SLOW_TIMEOUT_THRESHOLD / SLOW_TIMEOUT_WINDOW_MS).
+        // Probation выше уже отработал (либо noPdfOkInSession=false, либо триггер
+        // другой). Здесь ловим тот же класс событий ВНЕ probation: evaluate
+        // timeout / ERR_HTTP2 / ras-kad timeout. При пороге за окно — changeGeo
+        // на этом воркере без cooldown, акт возвращаем в общий пул.
+        if (
+          SLOW_TIMEOUT_THRESHOLD > 0 &&
+          isProbationRotateFirstTrigger({
+            status: r.status ?? null,
+            error: r.error ?? null,
+            reason: r.reason ?? null,
+          })
+        ) {
+          const now = Date.now();
+          slowEventTs.push(now);
+          while (
+            slowEventTs.length > 0 &&
+            now - slowEventTs[0] > SLOW_TIMEOUT_WINDOW_MS
+          ) {
+            slowEventTs.shift();
+          }
+          if (slowEventTs.length >= SLOW_TIMEOUT_THRESHOLD) {
+            const cnt = slowEventTs.length;
+            slowEventTs.length = 0;
+            try {
+              source.deferAct(act);
+            } catch (e) {
+              log(`[${label}] deferAct: ${e}`);
+            }
+            counters.dl_deferred += 1;
+            if (metrics) metrics.noteDeferred();
+            log(
+              `[pdf/slow] proxy=${proxyTag} ${cnt} slow events in ${SLOW_TIMEOUT_WINDOW_MS}ms ` +
+                `(last=${r.error ?? r.reason ?? "?"}) → changeGeo`,
+            );
+            const recovered = await _attemptProxyRecoverBeforeQuarantine({
+              label,
+              downloader,
+              log,
+              reason: `slow_${cnt}_events`,
+              shouldStop,
+              tryRotateFirst: false,
+              loopUntilSuccess: false,
+            });
+            if (recovered) {
+              counters.worker_restarts += 1;
+              consecutiveInfraFails = 0;
+            }
+            continue;
+          }
+        }
         log(`[${label}] recoverable skip id=${act.id}: ${r.error} (status=${r.status ?? "?"})`);
         consecutiveInfraFails = 0;
         await downloader.paceAfterFailure();
@@ -1982,13 +2158,30 @@ async function _processOne({ id, pdfPath }, log, counters, who, metrics) {
     }
     return;
   }
+  // Подсчёт токенов через tokenizer jina-reranker-v3 (POST /count_tokens
+  // к inference). При недоступности inference вернёт null — pipeline не
+  // блокируется, в БД tokens_jina_v3 останется NULL до backfill'а.
+  const tokensJinaV3 = await countJinaV3Tokens(r.text);
+  if (tokensJinaV3 != null) {
+    counters.tokens_sum += tokensJinaV3;
+    counters.tokens_counted += 1;
+    if (tokensJinaV3 > counters.tokens_max) {
+      counters.tokens_max = tokensJinaV3;
+      counters.tokens_max_id = id;
+    }
+    if (metrics) metrics.noteTokens(tokensJinaV3, id);
+  } else {
+    counters.tokens_no_count += 1;
+    if (metrics) metrics.noteTokensMissing();
+  }
   const markT0 = performance.now();
   try {
-    await markTextExtracted(id, r.text);
+    await markTextExtracted(id, r.text, { tokensJinaV3 });
     const markMs = performance.now() - markT0;
     counters.extracted += 1;
     if (metrics) metrics.noteExtractOk({ extractMs: exMs, markMs });
-    log(`[pipe/${who}] OK id=${id} bytes=${r.bytes}`);
+    const tokTag = tokensJinaV3 != null ? ` tokens=${tokensJinaV3}` : ` tokens=?`;
+    log(`[pipe/${who}] OK id=${id} bytes=${r.bytes}${tokTag}`);
   } catch (e) {
     log(`[pipe/${who}] markTextExtracted: ${e}`);
   }
@@ -2026,8 +2219,10 @@ async function _drainPendingTextFromDb(log) {
       }
       const r = await extractPdfText(row.pdf_path);
       if (r.ok) {
-        await markTextExtracted(row.id, r.text);
-        log(`[pipe/resume] id=${row.id} OK bytes=${r.bytes}`);
+        const tokensJinaV3 = await countJinaV3Tokens(r.text);
+        await markTextExtracted(row.id, r.text, { tokensJinaV3 });
+        const tokTag = tokensJinaV3 != null ? ` tokens=${tokensJinaV3}` : ` tokens=?`;
+        log(`[pipe/resume] id=${row.id} OK bytes=${r.bytes}${tokTag}`);
       } else {
         await markExtractFailed(row.id, `${r.code}: ${r.error}`);
         log(`[pipe/resume] id=${row.id} FAIL ${r.code}: ${r.error}`);

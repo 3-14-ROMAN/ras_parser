@@ -44,7 +44,7 @@ npm run db:migrate     # прокат db/schema.sql (создаёт таблиц
 npm start
 ```
 
-(под капотом `node --env-file=.env parser.js`)
+(под капотом `bash scripts/run-parser-supervised.sh` — supervisor с авто-рестартом при ненулевых exit-кодах, включая `73` от watchdog'а «тишины». Чтобы запустить parser.js напрямую без рестартов — `node --env-file=.env parser.js`.)
 
 При старте парсер интерактивно спросит:
 

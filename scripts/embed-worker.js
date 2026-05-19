@@ -31,8 +31,8 @@ const controller = new AbortController();
 let stopRequested = false;
 function stop(sig) {
   if (stopRequested) {
-    process.stderr.write(`\n[worker] второй ${sig}, форсирую exit\n`);
-    process.exit(130);
+    process.stderr.write(`\n[worker] повторный ${sig}, уже останавливаемся gracefully\n`);
+    return;
   }
   stopRequested = true;
   process.stderr.write(`\n[worker] получил ${sig}, ставлю abort (дождёмся итерации)\n`);

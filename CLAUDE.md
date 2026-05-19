@@ -83,7 +83,7 @@ docker compose up -d postgres   # БД на /data/postgres
 npm run db:migrate              # схема `acts`
 
 # Основной парсер
-npm start                       # node --env-file=.env parser.js
+npm start                       # bash scripts/run-parser-supervised.sh (с авто-рестартом)
 
 # Управление прокси
 npm run proxy:ip
@@ -101,6 +101,30 @@ npm run proxy:list
   - Кросс-CaseId verdict-резолвер (`_resolveCaseVerdicts`) каждые `_saveDecisionLinks`.
   - Интерактивный план окон или CLI-режим (`MODE_TYPES` для справочника типов / `MODE_DECISION_LINKS` aka `acts` для актов).
 - `RAS_MODE=acts` и `RAS_MODE=decision_links` — алиасы, оба работают (для обратной совместимости со старыми `.env`).
+
+## Preflight через текущий прокси (parser.js)
+
+`network/proxyPreflight.js` — лёгкий HTTP-probe ras.arbitr.ru через тот же прокси, что отдан Chromium'у. Дёргается внутри `_safeGoto` перед каждой попыткой `page.goto(BASE_URL)`:
+
+- `undici.request` через `ProxyAgent`, таймаут `RAS_PARSER_PREFLIGHT_TIMEOUT_MS` (8с по умолчанию).
+- Классификация: `ok` если 2xx и body содержит RAS-маркеры (`b-form-submit` / `Картотека арбитражных`); иначе `banned`/`timeout`/`net`/`auth`.
+- Если probe `ok=false` — пропускаем Chromium-goto (он бы повис на 45с) и сразу зовём `_recoverFrom("preflight:<kind>")`. Эскалатор крутит IP/operator/geo, на следующей итерации probe снова.
+- ENV: `RAS_PARSER_PREFLIGHT` (1/0), `RAS_PARSER_PREFLIGHT_TIMEOUT_MS`.
+
+**Почему не используем `pdf/proxyHealth.js`**: тот ходит через MobileProxy anti-cloak API батчем по странам (30-60с), нужен для PDF-пула чтобы выбрать стартовую страну. Для parser.js (1 прокси, 1 контекст) хватает голого GET через текущий туннель.
+
+**Почему не вынесли всю сетевую логику в `network_parser/`**: shared-код уже в `network/` (`escalator.js`, `proxyClient.js`, `config.js`, `proxyPreflight.js`); PDF-специфика (`proxyHealth.js`, `httpPdfFetch.js`, `requestRouting.js`) — в `pdf/`. Структура устаканилась, переименование папок ради переименования = churn без пользы.
+
+## Watchdog «тишины» в parser.js + supervisor
+
+`parser.js` имеет один Playwright-контекст и один прокси. Если что-то залипает немо (Playwright потерял ответ, jQuery-callback не дёрнулся, зомби-await на Network) — у нет внутреннего пула, чтобы переключиться, как в pdf-пайплайне. Защита: глобальный watchdog по тишине в логах.
+
+- Каждое сообщение `log()` обновляет `_lastProgressAt`.
+- `setInterval(RAS_WATCHDOG_INTERVAL_MS, 30s)` сверяет: если `now - _lastProgressAt > RAS_WATCHDOG_STUCK_MS` (по умолчанию 5 мин) — пишет diagnostic dump в stderr (последние 10 HTTP-ответов) и делает `process.exit(73)`. graceful shutdown НЕ дёргаем — `context.close()` может сам залипнуть.
+- Запускай через `npm start` — bash-обёртка (`scripts/run-parser-supervised.sh`) рестартит парсер при ненулевых exit-кодах (включая 73), но НЕ рестартит при `0` / `130` (Ctrl+C) / `143` (SIGTERM). Сигналы Ctrl+C/SIGTERM пробрасывает в node, чтобы не оставлять зомби-Chromium. Чтобы запустить parser.js напрямую (без рестартов, для отладки): `node --env-file=.env parser.js`.
+- ENV: `RAS_WATCHDOG_STUCK_MS`, `RAS_WATCHDOG_INTERVAL_MS`, `RAS_PARSER_RESTART_DELAY_SEC`, `RAS_PARSER_MAX_RESTARTS` — см. `.env.example`.
+
+**Почему НЕ скопировали pdf-quarantine целиком**: у parser.js один proxy_key и один Playwright-контекст, per-key карантин не имеет смысла (карантинить нечего, выбора нет). Эскалатор IP→operator→geo уже делает recovery когда вызван явно (`_recoverFrom`); watchdog добавляет защиту для случаев когда ни один error-handler не сработал.
 
 ## PDF pipeline — operational notes
 
