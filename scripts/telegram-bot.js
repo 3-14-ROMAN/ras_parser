@@ -255,13 +255,6 @@ async function callStatsApi() {
 
 // ─── форматирование ─────────────────────────────────────────────────────────
 
-const START_TEXT =
-  "⚖️ <b>RAS Supply Search</b>\n" +
-  "\n" +
-  "Поиск судебной практики по спорам из договоров поставки.\n" +
-  "\n" +
-  "Бот перезапущен. Опишите ситуацию текстом или откройте меню.";
-
 const TEST_QUERY =
   "Покупатель подписал УПД без замечаний, но при монтаже выявил скрытые " +
   "недостатки оборудования. Нужны дела, где суд поддержал покупателя.";
@@ -719,15 +712,7 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (matchesCommand(text, "start")) {
-    await sendMessage(chatId, START_TEXT, {
-      parse_mode: "HTML",
-      reply_markup: MAIN_KEYBOARD,
-    });
-    return;
-  }
-
-  if (matchesCommand(text, "menu") || matchesCommand(text, "help")) {
+  if (matchesCommand(text, "start") || matchesCommand(text, "menu") || matchesCommand(text, "help")) {
     await sendMenu(chatId);
     return;
   }
