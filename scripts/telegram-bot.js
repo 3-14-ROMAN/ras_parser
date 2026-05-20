@@ -72,7 +72,7 @@ function setChatTopN(chatId, n) {
   return clamped;
 }
 const POLL_TIMEOUT_S    = Math.max(1, Math.min(50, Number(process.env.TG_BOT_POLL_TIMEOUT || 25)));
-const FETCH_TIMEOUT_MS  = Math.max(5000, Number(process.env.TG_BOT_FETCH_TIMEOUT_MS  || 35000));
+const FETCH_TIMEOUT_MS  = Math.max(5000, Number(process.env.TG_BOT_FETCH_TIMEOUT_MS  || 28000));
 const SEARCH_TIMEOUT_MS = Math.max(5000, Number(process.env.TG_BOT_SEARCH_TIMEOUT_MS || 120000));
 
 const ALLOWED_IDS = (() => {
