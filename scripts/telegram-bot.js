@@ -205,6 +205,38 @@ async function sendMessage(chatId, text, opts = {}) {
   return tg("sendMessage", params);
 }
 
+// Edit the message under which the callback button was tapped. Used for
+// navigation callbacks (menu/info/help/...) so a single bot message keeps
+// shapeshifting between sections instead of spamming new ones. Search
+// results stay separate sendMessage's — that's the user-visible distinction.
+//
+// Safe fallback: if Telegram refuses to edit (cb_id expired, message too
+// old, content identical → "message is not modified") we just drop —
+// answerCallbackQuery already fired, so the UI button "unsticks" anyway.
+async function editToCallback(cb, text, replyMarkup) {
+  const chatId = cb.message?.chat?.id;
+  const messageId = cb.message?.message_id;
+  if (!chatId || !messageId) return;
+  const safeText = text.length > TG_MAX_MSG
+    ? text.slice(0, TG_MAX_MSG - 16) + "\n…[обрезано]"
+    : text;
+  const params = {
+    chat_id: chatId,
+    message_id: messageId,
+    text: safeText,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  };
+  try {
+    await tg("editMessageText", params);
+  } catch (e) {
+    const desc = e?.tg_description || e?.message || "";
+    if (/message is not modified/i.test(desc)) return;
+    log("WARN", "editMessageText failed", { msg: desc });
+  }
+}
+
 // Экранирует строку для безопасной вставки в HTML parse_mode Telegram.
 // Telegram HTML понимает только <, >, &; кавычки оставляем как есть, но для
 // атрибутов href пропускаем через тот же escape — Telegram это принимает.
@@ -791,68 +823,60 @@ async function handleCallback(cb) {
   log("INFO", "callback", { user_id: userId, chat_id: chatId, data });
 
   try {
-    // set_top_<N> — отдельная семья callback'ов.
+    // set_top_<N> — отдельная семья callback'ов: меняем число и
+    // редактируем сообщение, оставляя пользователя в TopN-вью.
     const m = /^set_top_(\d+)$/.exec(data);
     if (m) {
       const n = setChatTopN(chatId, Number(m[1]));
       log("INFO", "topN set", { user_id: userId, chat_id: chatId, topN: n });
-      await sendMessage(
-        chatId,
-        `✅ Теперь показываю <b>${n}</b> актов`,
-        { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
-      );
+      await editToCallback(cb, topSettingsText(n), TOP_SETTINGS_KEYBOARD);
       return;
     }
 
     switch (data) {
-      case "menu":
-        await sendMenu(chatId);
+      case "menu": {
+        let stats = null;
+        try { stats = await callStatsApi(); }
+        catch (e) { log("WARN", "menu stats failed", { msg: e?.message ?? String(e) }); }
+        await editToCallback(cb, buildMenuText(stats), MAIN_KEYBOARD);
         return;
+      }
       case "info":
-        await sendMessage(chatId, INFO_TEXT, {
-          parse_mode: "HTML",
-          reply_markup: MAIN_KEYBOARD,
-        });
+        await editToCallback(cb, INFO_TEXT, MAIN_KEYBOARD);
         return;
       case "search_help":
-        await sendMessage(chatId, SEARCH_HELP_TEXT, {
-          parse_mode: "HTML",
-          reply_markup: MAIN_KEYBOARD,
-        });
+        await editToCallback(cb, SEARCH_HELP_TEXT, MAIN_KEYBOARD);
         return;
       case "examples":
-        await sendMessage(chatId, EXAMPLES_TEXT, {
-          parse_mode: "HTML",
-          reply_markup: MAIN_KEYBOARD,
-        });
+        await editToCallback(cb, EXAMPLES_TEXT, MAIN_KEYBOARD);
         return;
       case "ping":
-        await sendMessage(chatId, "✅ Бот работает", {
-          reply_markup: MAIN_KEYBOARD,
-        });
+        await editToCallback(cb, "✅ Бот работает", MAIN_KEYBOARD);
         return;
       case "features":
-        await sendMessage(chatId, FEATURES_TEXT, {
-          parse_mode: "HTML",
-          reply_markup: MAIN_KEYBOARD,
-        });
+        await editToCallback(cb, FEATURES_TEXT, MAIN_KEYBOARD);
         return;
-      case "status":
-        await sendStatusReply(chatId);
+      case "status": {
+        let stats = null;
+        try {
+          stats = await callStatsApi();
+        } catch (e) {
+          log("ERROR", "status failed", { msg: e?.message ?? String(e) });
+          await editToCallback(
+            cb,
+            "Не удалось получить статистику: " + htmlEscape(e?.message ?? "unknown"),
+            MAIN_KEYBOARD,
+          );
+          return;
+        }
+        await editToCallback(cb, formatStats(stats), MAIN_KEYBOARD);
         return;
+      }
       case "top_settings":
-        await sendMessage(
-          chatId,
-          topSettingsText(getChatTopN(chatId)),
-          { parse_mode: "HTML", reply_markup: TOP_SETTINGS_KEYBOARD },
-        );
+        await editToCallback(cb, topSettingsText(getChatTopN(chatId)), TOP_SETTINGS_KEYBOARD);
         return;
       case "new_search":
-        await sendMessage(
-          chatId,
-          "🔎 Отправьте новый запрос текстом.",
-          { parse_mode: "HTML" },
-        );
+        await editToCallback(cb, "🔎 Отправьте новый запрос текстом.", MAIN_KEYBOARD);
         return;
       default:
         log("WARN", "unknown callback_data", { data });
