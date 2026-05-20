@@ -101,9 +101,15 @@ function log(level, msg, extra) {
 
 // ─── HTTP agents ────────────────────────────────────────────────────────────
 
-const tgAgent = PROXY_URL
-  ? new SocksProxyAgent(PROXY_URL)
-  : new https.Agent({ keepAlive: true });
+// tgAgent — mutable: при флапах SOCKS-туннеля keep-alive pool копит дохлые
+// сокеты (=> ECONNRESET цепочкой). В pollLoop его пересоздают после N подряд
+// poll-ошибок, тогда новый коннект идёт честно через SOCKS handshake.
+function makeTgAgent() {
+  return PROXY_URL
+    ? new SocksProxyAgent(PROXY_URL)
+    : new https.Agent({ keepAlive: true });
+}
+let tgAgent = makeTgAgent();
 
 // search api — локалхост, прокси не нужен.
 const searchAgent = new http.Agent({ keepAlive: true });
@@ -256,7 +262,11 @@ const START_TEXT =
   "\n" +
   "Бот перезапущен. Опишите ситуацию текстом или откройте меню.";
 
-const MENU_TEXT =
+const TEST_QUERY =
+  "Покупатель подписал УПД без замечаний, но при монтаже выявил скрытые " +
+  "недостатки оборудования. Нужны дела, где суд поддержал покупателя.";
+
+const MENU_TEXT_TOP =
   "⚖️ <b>RAS Supply Search</b>\n" +
   "\n" +
   "Поиск судебной практики по спорам из договоров поставки.\n" +
@@ -269,10 +279,28 @@ const MENU_TEXT =
   "• экспертизы, УПД, ТОРГ-12, переписка, претензии\n" +
   "\n" +
   "<b>Как пользоваться:</b>\n" +
-  "Опишите ситуацию обычным текстом. Чем больше фактов, тем точнее подборка.\n" +
+  "Опишите ситуацию обычным текстом. Чем больше фактов, тем точнее подборка. " +
+  "Первый акт в ответе бота более релевантен вашему вопросу, последний менее.\n" +
   "\n" +
-  "Пример:\n" +
-  "<code>Покупатель подписал УПД без замечаний, но при монтаже выявил скрытые недостатки оборудования. Нужны дела, где суд поддержал покупателя.</code>";
+  "Подробнее о системе вы можете узнать в поле ИНФО.";
+
+const MENU_TEXT_BOTTOM =
+  "Пример (нажмите /test чтобы запустить):\n" +
+  "<code>" + TEST_QUERY + "</code>";
+
+function buildMenuText(stats) {
+  let statsLine = "";
+  if (stats && !stats.warming_up && Number.isFinite(Number(stats.qdrant_acts))) {
+    statsLine = `\n\nВ данный момент база пополняется, в ней <b>${fmtNum(stats.qdrant_acts)}</b> актов.`;
+  }
+  return MENU_TEXT_TOP + statsLine + "\n\n" + MENU_TEXT_BOTTOM;
+}
+
+const INFO_TEXT =
+  "ℹ️ <b>ИНФО</b>\n" +
+  "\n" +
+  "<i>Текст про систему временно не задан — пришли его в чат, я заменю эту заглушку. " +
+  "Старая версия не сохранилась.</i>";
 
 const SEARCH_HELP_TEXT =
   "🔎 <b>Как писать запрос</b>\n" +
@@ -316,6 +344,9 @@ const BOT_COMMANDS = [
 // Главное меню — inline keyboard под сообщением.
 const MAIN_KEYBOARD = {
   inline_keyboard: [
+    [
+      { text: "ℹ️ ИНФО",         callback_data: "info" },
+    ],
     [
       { text: "🔎 Как искать",   callback_data: "search_help" },
       { text: "📊 Статус базы",  callback_data: "status" },
@@ -545,11 +576,51 @@ function matchesCommand(text, name) {
   return re.test(text);
 }
 
-async function sendMenu(chatId, text = MENU_TEXT) {
-  await sendMessage(chatId, text, {
+async function sendMenu(chatId, text = null) {
+  let body = text;
+  if (body === null) {
+    let stats = null;
+    try {
+      stats = await callStatsApi();
+    } catch (e) {
+      log("WARN", "menu stats failed", { msg: e?.message ?? String(e) });
+    }
+    body = buildMenuText(stats);
+  }
+  await sendMessage(chatId, body, {
     parse_mode: "HTML",
     reply_markup: MAIN_KEYBOARD,
   });
+}
+
+async function runTestQuery(chatId, userId) {
+  const topN = getChatTopN(chatId);
+  log("INFO", "test command", { user_id: userId, chat_id: chatId });
+  log("INFO", "query", { user_id: userId, chat_id: chatId, q_len: TEST_QUERY.length, topN });
+  try {
+    tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+    const apiResp = await callSearchApi(TEST_QUERY, topN);
+    await sendSearchResults(chatId, TEST_QUERY, apiResp);
+    log("INFO", "answered", {
+      user_id: userId,
+      chat_id: chatId,
+      results: apiResp.results?.length ?? 0,
+      elapsed_ms: apiResp.elapsed_ms,
+    });
+  } catch (e) {
+    log("ERROR", "test failed", {
+      user_id: userId,
+      chat_id: chatId,
+      msg: e?.message ?? String(e),
+    });
+    try {
+      await sendMessage(
+        chatId,
+        "Ошибка поиска: " + htmlEscape(e?.message ?? "unknown"),
+        { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
+      );
+    } catch {}
+  }
 }
 
 async function sendStatusReply(chatId) {
@@ -602,6 +673,11 @@ async function handleMessage(msg) {
 
   if (matchesCommand(text, "ping")) {
     await sendMessage(chatId, "✅ Бот работает", { reply_markup: MAIN_KEYBOARD });
+    return;
+  }
+
+  if (matchesCommand(text, "test")) {
+    await runTestQuery(chatId, userId);
     return;
   }
 
@@ -685,6 +761,12 @@ async function handleCallback(cb) {
     switch (data) {
       case "menu":
         await sendMenu(chatId);
+        return;
+      case "info":
+        await sendMessage(chatId, INFO_TEXT, {
+          parse_mode: "HTML",
+          reply_markup: MAIN_KEYBOARD,
+        });
         return;
       case "search_help":
         await sendMessage(chatId, SEARCH_HELP_TEXT, {
@@ -787,10 +869,25 @@ async function pollLoop() {
 
   let backoffMs = 1000;
 
+  // Watchdog: SOCKS-туннель к Telegram периодически отваливается; без
+  // активной реакции бот молча висит на ретраях по 15-30 минут.
+  // - после 2 подряд ошибок: пересоздаём tgAgent (=> новый SOCKS handshake,
+  //   keep-alive pool с дохлыми сокетами выбрасывается);
+  // - после >=5 подряд ошибок ИЛИ >=2 мин без удачного poll: process.exit(1),
+  //   systemd через RestartSec=5 поднимает чистый процесс.
+  let pollErrCount = 0;
+  let lastGoodPollAt = Date.now();
+  const AGENT_RESET_AFTER = 2;
+  const HARD_EXIT_AFTER_ERRS = 5;
+  const HARD_EXIT_AFTER_MS = 2 * 60_000;
+  const BACKOFF_MAX_MS = 5_000;
+
   while (running) {
     try {
       const updates = await getUpdates(lastOffset);
       backoffMs = 1000;
+      pollErrCount = 0;
+      lastGoodPollAt = Date.now();
       for (const upd of updates) {
         lastOffset = Math.max(lastOffset, (upd.update_id ?? 0) + 1);
         if (upd.message) {
@@ -808,9 +905,33 @@ async function pollLoop() {
         }
       }
     } catch (e) {
-      log("WARN", "poll error", { msg: e?.message ?? String(e), backoff_ms: backoffMs });
+      pollErrCount += 1;
+      const sinceGoodMs = Date.now() - lastGoodPollAt;
+      log("WARN", "poll error", {
+        msg: e?.message ?? String(e),
+        backoff_ms: backoffMs,
+        err_streak: pollErrCount,
+        since_good_ms: sinceGoodMs,
+      });
+
+      if (pollErrCount === AGENT_RESET_AFTER) {
+        log("WARN", "poll: rotating tgAgent (SOCKS keep-alive pool reset)", {
+          err_streak: pollErrCount,
+        });
+        try { tgAgent.destroy?.(); } catch {}
+        tgAgent = makeTgAgent();
+      }
+
+      if (pollErrCount >= HARD_EXIT_AFTER_ERRS || sinceGoodMs >= HARD_EXIT_AFTER_MS) {
+        log("ERROR", "poll: telegram unreachable too long, exiting for systemd restart", {
+          err_streak: pollErrCount,
+          since_good_ms: sinceGoodMs,
+        });
+        process.exit(1);
+      }
+
       await new Promise((r) => setTimeout(r, backoffMs));
-      backoffMs = Math.min(backoffMs * 2, 30_000);
+      backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
     }
   }
 }
