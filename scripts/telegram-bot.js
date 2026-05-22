@@ -451,12 +451,15 @@ const MAIN_KEYBOARD = {
 const RESULTS_KEYBOARD = {
   inline_keyboard: [
     [
-      { text: "📊 Статус базы",  callback_data: "status" },
+      { text: "🏠 Меню",         callback_data: "menu" },
+    ],
+    [
       { text: "🔎 Новый поиск",  callback_data: "new_search" },
+      { text: "📊 Статус базы",  callback_data: "status" },
     ],
     [
       { text: "🎛 Кол-во актов", callback_data: "top_settings" },
-      { text: "🏠 Меню",         callback_data: "menu" },
+      { text: "ℹ️ Инфо",         callback_data: "info" },
     ],
   ],
 };

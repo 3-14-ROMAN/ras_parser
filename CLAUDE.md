@@ -122,7 +122,15 @@ npm run proxy:list
 - Каждое сообщение `log()` обновляет `_lastProgressAt`.
 - `setInterval(RAS_WATCHDOG_INTERVAL_MS, 30s)` сверяет: если `now - _lastProgressAt > RAS_WATCHDOG_STUCK_MS` (по умолчанию 5 мин) — пишет diagnostic dump в stderr (последние 10 HTTP-ответов) и делает `process.exit(73)`. graceful shutdown НЕ дёргаем — `context.close()` может сам залипнуть.
 - Запускай через `npm start` — bash-обёртка (`scripts/run-parser-supervised.sh`) рестартит парсер при ненулевых exit-кодах (включая 73), но НЕ рестартит при `0` / `130` (Ctrl+C) / `143` (SIGTERM). Сигналы Ctrl+C/SIGTERM пробрасывает в node, чтобы не оставлять зомби-Chromium. Чтобы запустить parser.js напрямую (без рестартов, для отладки): `node --env-file=.env parser.js`.
-- ENV: `RAS_WATCHDOG_STUCK_MS`, `RAS_WATCHDOG_INTERVAL_MS`, `RAS_PARSER_RESTART_DELAY_SEC`, `RAS_PARSER_MAX_RESTARTS` — см. `.env.example`.
+- ENV: `RAS_WATCHDOG_STUCK_MS`, `RAS_WATCHDOG_INTERVAL_MS`, `RAS_PARSER_RESTART_DELAY_*`, `RAS_PARSER_SHORT_RUN_SEC`, `RAS_PARSER_HEALTHY_RUN_SEC`, `RAS_PARSER_FLAP_*`, `RAS_PARSER_MAX_RESTARTS`, `RAS_NONINTERACTIVE` — см. `.env.example`.
+
+### Supervised-режим под месяцы работы
+
+- **Первый attempt** запускается интерактивно (TTY → парсер задаёт вопросы headless/даты/категория). Удобно для разовой настройки.
+- **Все рестарты (attempt ≥ 2)** запускаются с `RAS_NONINTERACTIVE=1`. Парсер пропускает все `_ask()`-промпты через `_isInteractive()` и подсасывает параметры из env + `parsed_data/parser_state.json`. State.json в non-interactive ветке `_promptSetup` приоритетнее `RAS_DATE_TO/RAS_DATE_FROM` — иначе рестарт начинал бы с «вчера» вместо точки падения. Это закрывает класс багов «парсер висит в `_ask()` после супервизорного рестарта».
+- **Exponential backoff:** при коротком uptime (<`RAS_PARSER_SHORT_RUN_SEC`, def 60s) задержка перед следующим рестартом удваивается, cap = `RAS_PARSER_RESTART_DELAY_MAX_SEC` (def 300s). При здоровом uptime (≥`RAS_PARSER_HEALTHY_RUN_SEC`, def 600s) сбрасывается к минимуму. Защита от рестарт-шторма при системной проблеме (все прокси мертвы, RAS лёг).
+- **Flap-detect:** если ≥`RAS_PARSER_FLAP_MAX_IN_WINDOW` (def 10) крахов за `RAS_PARSER_FLAP_WINDOW_SEC` (def 300s) — supervisor выходит с кодом 99. Сигнал «парсер не успевает стартовать, нужен человек», а не «молоти в стену вечно».
+- **Полная автономия** (cron / systemd, без TTY): поставь `RAS_NONINTERACTIVE=1` в `.env` и убедись что заданы `RAS_DATE_TO/FROM` / `RAS_SUPPLY_FILTER_31` / `RAS_DOC_FILTER_RAK` / `RAS_STATUS_FINISHED_ONLY` / `RAS_HEADLESS` (или валидный `parsed_data/parser_state.json`).
 
 **Почему НЕ скопировали pdf-quarantine целиком**: у parser.js один proxy_key и один Playwright-контекст, per-key карантин не имеет смысла (карантинить нечего, выбора нет). Эскалатор IP→operator→geo уже делает recovery когда вызван явно (`_recoverFrom`); watchdog добавляет защиту для случаев когда ни один error-handler не сработал.
 

@@ -4169,6 +4169,35 @@ function _parseDateFromEnv(raw, label) {
 }
 
 /**
+ * «Интерактивен ли запуск».
+ *
+ * Возвращает true только если stdin привязан к TTY И не задан опт-аут
+ * `RAS_NONINTERACTIVE=1`. На supervised-рестартах (см.
+ * `scripts/run-parser-supervised.sh`) `RAS_NONINTERACTIVE=1` ставится для
+ * `attempt>=2`, чтобы парсер не зависал на `_ask()` промптах в Cursor-
+ * терминале с прицепленным stdin. Первый запуск в TTY остаётся
+ * интерактивным — даём человеку настроить параметры.
+ *
+ * Применяется во всех setup-промптах (`_resolveHeadlessFromEnvOrPrompt`,
+ * `_promptSetup`) ВМЕСТО голого `process.stdin.isTTY`.
+ *
+ * @returns {boolean}
+ */
+function _isInteractive() {
+  if (!process.stdin.isTTY) return false;
+  const v = String(process.env.RAS_NONINTERACTIVE ?? "").trim().toLowerCase();
+  if (v === "1" || v === "yes" || v === "on" || v === "true") return false;
+  return true;
+}
+
+let _nonInteractiveWarned = false;
+function _warnNonInteractiveOnce(why) {
+  if (_nonInteractiveWarned) return;
+  _nonInteractiveWarned = true;
+  log(`[setup] RAS_NONINTERACTIVE=${process.env.RAS_NONINTERACTIVE ?? ""} — ${why}`);
+}
+
+/**
  * Первый интерактивный шаг: окно браузера или headless.
  * Вызывать до любых тяжёлых операций в `main()` (mkdir/debug и т.д.).
  *
@@ -4183,8 +4212,10 @@ async function _resolveHeadlessFromEnvOrPrompt() {
     return headless;
   };
 
-  // TTY → всегда спрашиваем, env-defaults игнорируются (это режим для автозапуска/API).
-  if (process.stdin.isTTY) {
+  // TTY + не задан RAS_NONINTERACTIVE → всегда спрашиваем (человек настраивает).
+  // TTY + RAS_NONINTERACTIVE=1 (supervised restart) → пропускаем промпт, идём по env.
+  // non-TTY → пропускаем промпт, идём по env.
+  if (_isInteractive()) {
     while (true) {
       const raw = (await _ask("Показывать экран браузера? [1] да, [2] нет: ")).trim();
       if (raw === "1") return normalizeHeadfulRequest(false, "интерактивный выбор");
@@ -4193,7 +4224,11 @@ async function _resolveHeadlessFromEnvOrPrompt() {
     }
   }
 
-  // Не-TTY: автоматический режим. Берём из env, иначе DEFAULT_HEADLESS.
+  if (process.stdin.isTTY) {
+    _warnNonInteractiveOnce("пропускаю интерактивные промпты, беру параметры из env");
+  }
+
+  // env-driven путь. DEFAULT_HEADLESS уже учитывает RAS_HEADLESS (см. константу).
   if (process.env.RAS_HEADLESS !== undefined) {
     const headless = normalizeHeadfulRequest(DEFAULT_HEADLESS, "RAS_HEADLESS");
     process.stdout.write(
@@ -4203,10 +4238,10 @@ async function _resolveHeadlessFromEnvOrPrompt() {
     return headless;
   }
   process.stdout.write(
-    `[setup] stdin не интерактивный, RAS_HEADLESS не задан — ` +
+    `[setup] RAS_HEADLESS не задан — ` +
       `RAS_HEADLESS по умолчанию (${DEFAULT_HEADLESS ? "headless" : "headful"})\n`,
   );
-  return normalizeHeadfulRequest(DEFAULT_HEADLESS, "non-TTY stdin");
+  return normalizeHeadfulRequest(DEFAULT_HEADLESS, "non-interactive fallback");
 }
 
 /**
@@ -4214,11 +4249,13 @@ async function _resolveHeadlessFromEnvOrPrompt() {
  */
 async function _promptSetup(headless) {
   // Контракт интерактивного режима:
-  //   TTY (terminal) → всегда спрашиваем всё, env-defaults игнорируются.
+  //   TTY + не задан RAS_NONINTERACTIVE → спрашиваем всё, env-defaults игнорируются.
   //     Это режим для человека за клавиатурой.
-  //   non-TTY (cron / API / pipe / CI) → читаем из env, иначе спросить
-  //     невозможно (нет stdin), упадём с понятной ошибкой / возьмём дефолт.
-  const interactive = Boolean(process.stdin.isTTY);
+  //   TTY + RAS_NONINTERACTIVE=1 → ведём как non-TTY. Это supervised-рестарт:
+  //     stdin физически привязан к терминалу (Cursor / `npm start`), но мы
+  //     обязаны пройти без вопросов. Параметры берём из env + parser_state.json.
+  //   non-TTY (cron / API / pipe / CI) → читаем из env / state.json.
+  const interactive = _isInteractive();
   if (interactive) {
     log(
       "[setup] интерактивный режим (TTY): спрашиваю все параметры, " +
@@ -4569,9 +4606,27 @@ async function _promptSetup(headless) {
     }
   }
 
+  // Non-interactive: приоритет parser_state.json над env, чтобы supervised-
+  // рестарт продолжал с точки падения, а не с «вчера». В TTY-интерактиве
+  // state.json подсасывается выше через явный вопрос «продолжить?».
+  if (!interactive && preEndDay === null && preOldestDay === undefined) {
+    const state = _loadParserState();
+    if (state && state.nextEndDay) {
+      preEndDay = state.nextEndDay;
+      preOldestDay = state.oldestDay;
+      log(
+        `[setup] non-interactive: подхватываю parser_state.json — ` +
+          `дата_до=${_formatDdMmYyyy(preEndDay)}, ` +
+          `дата_с=${state.oldestDay === null ? "нет" : _formatDdMmYyyy(state.oldestDay)}` +
+          (state.updatedAt ? ` (сохранён ${state.updatedAt})` : ""),
+      );
+    }
+  }
+
   const toRaw = interactive ? "" : (process.env.RAS_DATE_TO ?? "").trim();
   let endDay = preEndDay;
-  if (toRaw) {
+  if (toRaw && endDay === null) {
+    // state.json не подхватился — пробуем env RAS_DATE_TO.
     const parsed = _parseDdMmYyyy(toRaw);
     if (parsed === null) {
       log(`[setup] дата «до» '${toRaw}' не DD.MM.YYYY — спрошу в терминале`);
@@ -4579,11 +4634,13 @@ async function _promptSetup(headless) {
       endDay = _startOfDay(parsed);
       log(`[setup] дата «до»=${_formatDdMmYyyy(endDay)} (RAS_DATE_TO)`);
     }
+  } else if (toRaw && endDay !== null) {
+    log(`[setup] RAS_DATE_TO='${toRaw}' проигнорирован — state.json приоритетнее`);
   }
-  if (endDay === null && !process.stdin.isTTY) {
+  if (endDay === null && !interactive) {
     endDay = defaultEndDay;
     log(
-      "[setup] stdin не интерактивный и RAS_DATE_TO не задан — " +
+      "[setup] non-interactive и нет state.json/RAS_DATE_TO — " +
         `дата «до»=вчера ${_formatDdMmYyyy(endDay)} (как Enter на вопросе «дата до»)`,
     );
   }
@@ -4610,7 +4667,8 @@ async function _promptSetup(headless) {
   }
 
   let oldestDay = preOldestDay;
-  if (!interactive && process.env.RAS_DATE_FROM !== undefined) {
+  if (!interactive && oldestDay === undefined && process.env.RAS_DATE_FROM !== undefined) {
+    // state.json не подхватился — пробуем env RAS_DATE_FROM.
     oldestDay = _parseDateFromEnv(process.env.RAS_DATE_FROM, "RAS_DATE_FROM");
     if (oldestDay === undefined && String(process.env.RAS_DATE_FROM).trim() !== "") {
       log(`[setup] RAS_DATE_FROM задан некорректно — спрошу в терминале`);
@@ -4620,10 +4678,12 @@ async function _promptSetup(headless) {
           `${oldestDay === null ? "нет" : _formatDdMmYyyy(oldestDay)} (RAS_DATE_FROM)`,
       );
     }
+  } else if (!interactive && oldestDay !== undefined && process.env.RAS_DATE_FROM !== undefined) {
+    log(`[setup] RAS_DATE_FROM игнорирован — state.json приоритетнее`);
   }
-  if (oldestDay === undefined && !process.stdin.isTTY) {
+  if (oldestDay === undefined && !interactive) {
     log(
-      "[setup] stdin не интерактивный и RAS_DATE_FROM не задан — " +
+      "[setup] non-interactive и нет state.json/RAS_DATE_FROM — " +
         "нижняя граница дат: нет (как пустой Enter на вопросе «дата с»)",
     );
     oldestDay = null;

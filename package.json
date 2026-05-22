@@ -41,6 +41,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@google/genai": "^2.4.0",
     "@mobileproxy/sdk": "^1.0.0",
     "@qdrant/js-client-rest": "^1.18.0",
     "ghost-cursor-playwright": "^2.1.0",
