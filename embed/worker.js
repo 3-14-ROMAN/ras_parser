@@ -139,6 +139,7 @@ export async function runWorker(opts = {}) {
     await waitForSearchPriority({ signal, log, phase: `iter ${iter}/before_full` });
     if (signal?.aborted) break;
 
+    let shortIndexed = 0;
     try {
       const fr = await embedFullActBatch(batchSizeFull, log);
       // rerouted_pre / missing_marked — это repair-проход. Даже если batchSize=0
@@ -155,26 +156,33 @@ export async function runWorker(opts = {}) {
           `rerouted_pre=${fr.rerouted_pre ?? 0} missing_marked=${fr.missing_marked ?? 0}`,
         );
       }
+      shortIndexed = fr.batchSize;
     } catch (e) {
       log(`[iter ${iter}/full] FATAL ${e?.stack ?? e?.message ?? e}`);
     }
 
     if (signal?.aborted) break;
 
-    await waitForSearchPriority({ signal, log, phase: `iter ${iter}/before_chunk` });
-    if (signal?.aborted) break;
+    // Priority: пока в short-очереди есть pending — НЕ трогаем chunk (long).
+    // Long-акты дороже (sub-batching, late chunking) и могут блокировать
+    // короткие надолго. Сначала разгребаем ≤8k токенов, потом —
+    // длинные. Когда обе очереди пусты → idle sleep.
+    if (shortIndexed === 0) {
+      await waitForSearchPriority({ signal, log, phase: `iter ${iter}/before_chunk` });
+      if (signal?.aborted) break;
 
-    try {
-      const cr = await embedChunkActBatch(batchSizeChunk, log);
-      if (cr.batchSize > 0) {
-        didWork = true;
-        totalIndexed += cr.indexed;
-        totalErrored += cr.errored;
-        totalChunks  += cr.totalChunks;
-        log(`[iter ${iter}/chunk] processed=${cr.batchSize} indexed=${cr.indexed} chunks=${cr.totalChunks} error=${cr.errored}`);
+      try {
+        const cr = await embedChunkActBatch(batchSizeChunk, log);
+        if (cr.batchSize > 0) {
+          didWork = true;
+          totalIndexed += cr.indexed;
+          totalErrored += cr.errored;
+          totalChunks  += cr.totalChunks;
+          log(`[iter ${iter}/chunk] processed=${cr.batchSize} indexed=${cr.indexed} chunks=${cr.totalChunks} error=${cr.errored}`);
+        }
+      } catch (e) {
+        log(`[iter ${iter}/chunk] FATAL ${e?.stack ?? e?.message ?? e}`);
       }
-    } catch (e) {
-      log(`[iter ${iter}/chunk] FATAL ${e?.stack ?? e?.message ?? e}`);
     }
 
     const iterMs = Date.now() - iterStart;
