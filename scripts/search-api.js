@@ -7,6 +7,20 @@
  *   GET  /health
  *     → 200 {"ok": true, "ts": "<ISO>"}
  *
+ *   POST /hyde     {"query": "..."}
+ *   GET  /hyde?q=...
+ *     → 200 {
+ *         "query":     "<исходный запрос>",
+ *         "model":     "gemini-flash-latest",
+ *         "elapsed_ms": <int>,
+ *         "hyde_text": "<синтетический фрагмент мотивировочной части акта>",
+ *         "hyde_chars": <int>,
+ *         "usage":     {"prompt_tokens":..., "candidates_tokens":..., "total_tokens":...}|null,
+ *         "finish_reason": "STOP"|"MAX_TOKENS"|...|null
+ *       }
+ *     → 503 если GEMINI_API_KEY не задан.
+ *     → 502 если Gemini вернул пусто / safety-block / таймаут.
+ *
  *   POST /search   {"query": "...", "topN": 5}
  *   GET  /search?q=...&topN=5
  *     → 200 {
@@ -62,6 +76,7 @@ import process from "node:process";
 import { searchAndRerank } from "../embed/retrieval.js";
 import { closePool, getPool } from "../db/pgClient.js";
 import { qdrant, COLLECTION as QDRANT_COLLECTION } from "../embed/clients.js";
+import { generateHypotheticalAct } from "../llm/hydeGenerator.js";
 
 const HOST = process.env.RAS_SEARCH_API_HOST || "127.0.0.1";
 const PORT = Number(process.env.RAS_SEARCH_API_PORT || 8091);
@@ -426,6 +441,77 @@ async function handleSearch(req, res, url) {
   });
 }
 
+async function handleHyde(req, res, url) {
+  let query = null;
+
+  if (req.method === "POST") {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: e.message });
+      return;
+    }
+    query = typeof body.query === "string" ? body.query : null;
+  } else if (req.method === "GET") {
+    query = url.searchParams.get("q") || url.searchParams.get("query");
+  } else {
+    sendJson(res, 405, { ok: false, error: "method not allowed" });
+    return;
+  }
+
+  if (!query || typeof query !== "string" || !query.trim()) {
+    sendJson(res, 400, { ok: false, error: "missing or empty 'query'" });
+    return;
+  }
+  const trimmed = query.trim();
+  if (trimmed.length > 2000) {
+    sendJson(res, 400, { ok: false, error: "query too long (>2000 chars)" });
+    return;
+  }
+
+  if (!process.env.GEMINI_API_KEY) {
+    sendJson(res, 503, { ok: false, error: "GEMINI_API_KEY not configured" });
+    return;
+  }
+
+  // Пробрасываем abort клиента в SDK: если юзер закрыл соединение,
+  // нет смысла дожимать запрос в Gemini.
+  const ac = new AbortController();
+  const onClose = () => ac.abort(new Error("client closed connection"));
+  req.on("close", onClose);
+
+  let result;
+  try {
+    result = await generateHypotheticalAct(trimmed, { signal: ac.signal });
+  } catch (e) {
+    req.off("close", onClose);
+    log("ERROR", "hyde failed", { msg: e?.message ?? String(e) });
+    sendJson(res, 502, { ok: false, error: "hyde generation failed", detail: e?.message ?? String(e) });
+    return;
+  }
+  req.off("close", onClose);
+
+  log("INFO", "hyde", {
+    q_len: trimmed.length,
+    out_chars: result.text.length,
+    model: result.model,
+    elapsed_ms: result.elapsed_ms,
+    total_tokens: result.usage?.total_tokens ?? null,
+  });
+
+  sendJson(res, 200, {
+    ok:           true,
+    query:        trimmed,
+    model:        result.model,
+    elapsed_ms:   result.elapsed_ms,
+    hyde_text:    result.text,
+    hyde_chars:   result.text.length,
+    usage:        result.usage,
+    finish_reason: result.finish_reason,
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
   try {
@@ -435,6 +521,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/search") {
       await handleSearch(req, res, url);
+      return;
+    }
+    if (url.pathname === "/hyde") {
+      await handleHyde(req, res, url);
       return;
     }
     if (url.pathname === "/stats") {
