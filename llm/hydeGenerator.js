@@ -57,6 +57,7 @@ const SYSTEM_INSTRUCTION = `Ты — генератор поисковых те�
 
 ПРАВИЛА:
 1. Не здоровайся, не пиши пояснений. Выдавай только текст судебного акта.
+1.1. ТОЛЬКО plain text. Никакого markdown: запрещены **жирный**, *курсив*, __подчёркивание__, ~~зачёркивание~~, заголовки # / ## / ###, маркированные списки (- / * / +), горизонтальные линии (---), цитаты (>), inline-code (\`...\`), html-теги (<b>, <i>, <u>, <strong>). Названия блоков «Обстоятельства спора», «Позиция сторон», «Оценка суда» пиши обычными словами в начале абзаца без выделения, либо естественной фразой («Как следует из материалов дела…», «Истец указывает…», «Оценив представленные доказательства…»).
 2. ЗАПРЕЩЕНО вводить любые конкретные нормы права, которых НЕТ в запросе:
    - конкретные статьи и пункты кодексов (ст. N ГК РФ, ст. N АПК РФ, НК, КоАП и т.п.);
    - конкретные федеральные законы, постановления Пленума ВС/ВАС, обзоры практики, информационные письма;
@@ -181,6 +182,64 @@ function numFromEnv(envName, fallback) {
 }
 
 /**
+ * Чистит markdown/html-разметку из текста модели до того, как он уйдёт в
+ * эмбеддер. Это страховка: в промпте мы и так запрещаем разметку, но
+ * модели иногда срываются на привычные `**заголовки**`. Лишние ``*`_# в
+ * векторном пространстве — артефактные токены, которых в реальном корпусе
+ * актов нет.
+ *
+ * Не трогает: нумерацию «1.» / «2)» (она в актах есть), кавычки «»/„",
+ * длинные/короткие тире, перечисление с цифрами.
+ */
+export function normalizeHydeText(input) {
+  if (!input) return "";
+  let t = String(input);
+
+  // html-инлайн-теги
+  t = t.replace(/<\/?(?:b|i|u|em|strong|mark|span|small|sup|sub)\b[^>]*>/gi, "");
+
+  // fenced code-блоки целиком + inline code
+  t = t.replace(/```[\s\S]*?```/g, "");
+  t = t.replace(/`([^`\n]+)`/g, "$1");
+
+  // markdown-заголовки в начале строки: «### Оценка суда» / «## Позиция»
+  t = t.replace(/^[ \t]*#{1,6}[ \t]+/gm, "");
+
+  // bold/italic парами: **x**, __x__
+  t = t.replace(/\*\*([^*\n]+?)\*\*/g, "$1");
+  t = t.replace(/__([^_\n]+?)__/g, "$1");
+
+  // italic одинарными *x* / _x_ — осторожнее, чтобы не съесть legit '_'
+  // в нерусских токенах: ловим только пары вокруг непустого фрагмента,
+  // граничные символы — пробел/кавычка/скобка/начало/конец строки.
+  t = t.replace(/(^|[\s«("'])\*([^*\n]+?)\*(?=[\s.,;:!?»)"']|$)/g, "$1$2");
+  t = t.replace(/(^|[\s«("'])_([^_\n]+?)_(?=[\s.,;:!?»)"']|$)/g, "$1$2");
+
+  // strikethrough
+  t = t.replace(/~~([^~\n]+?)~~/g, "$1");
+
+  // блок-цитаты «> текст»
+  t = t.replace(/^[ \t]*>[ \t]?/gm, "");
+
+  // горизонтальные линии: ---, ***, ___
+  t = t.replace(/^[ \t]*(?:[-*_][ \t]*){3,}$/gm, "");
+
+  // маркеры bullet-списков в начале строки (нумерованные «1.»/«1)» НЕ трогаем)
+  t = t.replace(/^[ \t]*[-*+][ \t]+/gm, "");
+
+  // двойные пробелы внутри строки
+  t = t.replace(/[ \t]{2,}/g, " ");
+
+  // trailing whitespace на каждой строке
+  t = t.replace(/[ \t]+$/gm, "");
+
+  // лишние пустые строки (3+ → 2)
+  t = t.replace(/\n{3,}/g, "\n\n");
+
+  return t.trim();
+}
+
+/**
  * Сгенерировать HyDE-текст по запросу юзера.
  *
  * @param {string} rawQuery — пользовательский запрос (бытовой язык).
@@ -253,15 +312,17 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
   }
 
   const elapsedMs = Date.now() - t0;
-  const text = response?.text;
+  const rawText = response?.text;
   const finishReason = response?.candidates?.[0]?.finishReason ?? null;
 
-  if (!text || !text.trim()) {
+  if (!rawText || !rawText.trim()) {
     const blockReason = response?.promptFeedback?.blockReason
                      || response?.candidates?.[0]?.finishReason
                      || "unknown";
     throw new Error(`hyde: empty completion (reason=${blockReason})`);
   }
+
+  const text = normalizeHydeText(rawText);
 
   const usage = response?.usageMetadata
     ? {
@@ -272,7 +333,7 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
     : null;
 
   return {
-    text: text.trim(),
+    text,
     model,
     elapsed_ms: elapsedMs,
     usage,
