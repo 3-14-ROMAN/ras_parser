@@ -13,15 +13,28 @@
 //
 // SDK: @google/genai v2 (уже в package.json). API-ключ — GEMINI_API_KEY.
 // ENV: RAS_HYDE_MODEL, RAS_HYDE_TEMPERATURE, RAS_HYDE_MAX_OUTPUT_TOKENS,
-//      RAS_HYDE_TIMEOUT_MS.
+//      RAS_HYDE_TIMEOUT_MS, RAS_HYDE_PROXY_URL.
+
+import { connect as tlsConnect } from "node:tls";
 
 import { GoogleGenAI } from "@google/genai";
-import { setGlobalDispatcher, EnvHttpProxyAgent } from "undici";
+import {
+  Agent as UndiciAgent,
+  EnvHttpProxyAgent,
+  fetch as undiciFetch,
+} from "undici";
+import { SocksClient } from "socks";
 
-const DEFAULT_MODEL              = "gemini-flash-latest";
+const DEFAULT_MODEL              = "gemini-3.1-pro-preview";
 const DEFAULT_TEMPERATURE        = 0.3;
-const DEFAULT_MAX_OUTPUT_TOKENS  = 1024;
-const DEFAULT_TIMEOUT_MS         = 15000;
+// Gemini 3.x reasoning-модели жгут часть выходного бюджета на thinking
+// (внутренние рассуждения), и в 3.1 Pro thinking отключить нельзя
+// (Budget=0 → API возвращает 400 "This model only works in thinking mode").
+// Поэтому держим maxOutputTokens с запасом: ~1000-2000 на thinking + ~1500
+// на текст. Под flash-модели можно уронить до 1024.
+const DEFAULT_MAX_OUTPUT_TOKENS  = 4096;
+const DEFAULT_THINKING_BUDGET    = -1; // -1 = AUTO, 0 = DISABLED (только не-3.x)
+const DEFAULT_TIMEOUT_MS         = 30000;
 const DEFAULT_TOP_P              = 0.95;
 
 const MAX_QUERY_CHARS = 2000;
@@ -36,46 +49,109 @@ const SAFETY_SETTINGS_OFF = [
   { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
 ];
 
-const SYSTEM_INSTRUCTION = `Ты — генератор синтетических фрагментов мотивировочной части решений арбитражных судов Российской Федерации по спорам из договоров поставки (категория 3.1 кодификатора СИП).
+const SYSTEM_INSTRUCTION = `Ты — генератор поисковых текстов для базы судебных актов Арбитражного суда РФ.
 
-Задача: по бытовому описанию ситуации сгенерировать связный фрагмент текста в стилистике реального судебного акта так, чтобы он по векторному сходству был близок к корпусу реальных мотивировок.
+Твоя задача: на основе запроса пользователя создать вымышленный фрагмент мотивировочной части решения суда. Этот текст будет переведен в вектор для поиска похожих реальных дел.
 
-Жёсткие требования:
-- Стиль — строгий канцелярский русский. Обязательные обороты к месту: «суд установил», «материалами дела подтверждается», «суд приходит к выводу», «в нарушение условий договора», «исследовав представленные в материалы дела доказательства», «оснований для иной оценки судом не усматривается».
-- Активно ссылайся на нормы: ст. 309, 310, 314, 393, 401, 421, 506, 516 ГК РФ; ст. 65, 71, 75 АПК РФ. Выбирай те, что релевантны фабуле.
-- Упоминай типичные доказательства: договор поставки, спецификации, товарные накладные (ТОРГ-12), УПД, акты сверки расчётов, платёжные поручения, претензионная переписка, переписка по электронной почте.
-- НЕ выдумывай конкретику: номера дел, имена сторон, ИНН, ОГРН, даты, конкретные суммы, реквизиты документов — обходи обобщёнными формулировками («истец», «ответчик», «спорная партия товара», «согласно представленным в материалы дела документам», «в заявленном размере»).
-- НЕ добавляй преамбулу, шапку, заголовок, markdown, нумерацию, маркированные списки.
-- НЕ комментируй свою работу и не обращайся к пользователю. Выдай только сам фрагмент текста, ничего больше.
-- Объём: 4–8 абзацев, ориентировочно 800–1500 знаков.`;
+ПРАВИЛА:
+1. Не здоровайся, не пиши пояснений. Выдавай только текст судебного акта.
+2. Не выдумывай номера дел (А...), даты, ФИО судей и названия компаний.
+3. Используй строгий канцелярский язык арбитражных судов РФ (например: "Суд установил", "Истец указывает", "Оценив представленные доказательства").
+4. Сфокусируйся на аргументации, обстоятельствах спора и правовой оценке.
+5. Если пользователь указал конкретную статью (например, "ст. 309 ГК РФ"), используй ее. Если не указал — пиши общие фразы ("нормы о неисполнении обязательств").
+
+Обязательная структура ответа:
+- Обстоятельства спора (в чем суть конфликта).
+- Позиция сторон (кратко доводы).
+- Оценка суда (почему суд принял такое решение).`;
 
 let _client = null;
 let _proxyInstalled = false;
 
 // Google AI Studio (generativelanguage.googleapis.com) блокирует ряд стран,
 // включая РФ — отдаёт 400 "User location is not supported for the API use".
-// Если задан RAS_HYDE_HTTP_PROXY (http://... или https://...), ставим
-// undici EnvHttpProxyAgent глобально, чтобы node fetch ходил в Gemini через
-// прокси. NO_PROXY=localhost,127.0.0.1,::1 защищает Qdrant/inference от
-// случайной проксификации.
+// Обходим через RAS_HYDE_PROXY_URL. Поддержанные схемы:
+//   - http://[user:pass@]host:port  → undici EnvHttpProxyAgent
+//   - https://...                    → то же
+//   - socks5h://host:port или socks5://[user:pass@]host:port
+//                                    → undici Agent c custom connect через
+//                                      пакет `socks` (DNS у socks5h резолвится
+//                                      на стороне прокси, что важно для
+//                                      обхода locally-poisoned DNS).
 //
-// SOCKS-прокси здесь не поддерживается (нет нативной поддержки в undici).
-// Если нужен SOCKS — поднимите локальный socks→http конвертер (gost, etc.).
-function maybeInstallHttpProxy() {
+// Чтобы не задеть остальные fetch в процессе (Qdrant/inference на localhost,
+// MobileProxy management API, etc.), подменяем globalThis.fetch wrapper'ом,
+// который пускает через наш dispatcher ТОЛЬКО Gemini-домены. Все остальные
+// URL уходят оригинальному fetch без изменений.
+const GEMINI_HOST_RE = /(?:generativelanguage|aiplatform)\.googleapis\.com/i;
+
+function makeSocksDispatcher(socksUrl) {
+  const u = new URL(socksUrl);
+  const proxy = {
+    host: u.hostname,
+    port: Number(u.port) || 1080,
+    type: 5,
+    userId:   u.username ? decodeURIComponent(u.username) : undefined,
+    password: u.password ? decodeURIComponent(u.password) : undefined,
+  };
+  return new UndiciAgent({
+    connect: (options, callback) => {
+      const port = Number(options.port) || (options.protocol === "https:" ? 443 : 80);
+      const host = options.servername || options.hostname || options.host;
+      SocksClient.createConnection({
+        proxy,
+        command: "connect",
+        destination: { host, port },
+      })
+        .then(({ socket }) => {
+          if (options.protocol === "https:") {
+            const tls = tlsConnect({
+              socket,
+              servername: host,
+              ALPNProtocols: options.ALPNProtocols,
+              rejectUnauthorized: options.rejectUnauthorized !== false,
+            });
+            tls.once("secureConnect", () => callback(null, tls));
+            tls.once("error", (err) => callback(err));
+          } else {
+            callback(null, socket);
+          }
+        })
+        .catch((err) => callback(err));
+    },
+  });
+}
+
+function maybeInstallProxy() {
   if (_proxyInstalled) return;
   _proxyInstalled = true;
-  const url = process.env.RAS_HYDE_HTTP_PROXY?.trim();
+  // RAS_HYDE_PROXY_URL — основной, RAS_HYDE_HTTP_PROXY оставлен как алиас
+  // для обратной совместимости с прошлой версией модуля.
+  const url = (process.env.RAS_HYDE_PROXY_URL || process.env.RAS_HYDE_HTTP_PROXY)?.trim();
   if (!url) return;
-  if (!/^https?:\/\//i.test(url)) {
-    throw new Error(
-      `hyde: RAS_HYDE_HTTP_PROXY must be http(s):// URL (got "${url.slice(0, 12)}…"); ` +
-      `SOCKS не поддерживается — поднимите HTTP-прокси-обёртку.`,
-    );
+
+  let dispatcher;
+  if (/^socks(5h?|4a?)?:\/\//i.test(url)) {
+    dispatcher = makeSocksDispatcher(url);
+  } else if (/^https?:\/\//i.test(url)) {
+    if (!process.env.HTTPS_PROXY) process.env.HTTPS_PROXY = url;
+    if (!process.env.HTTP_PROXY)  process.env.HTTP_PROXY  = url;
+    if (!process.env.NO_PROXY)    process.env.NO_PROXY    = "localhost,127.0.0.1,::1";
+    dispatcher = new EnvHttpProxyAgent();
+  } else {
+    throw new Error(`hyde: unsupported RAS_HYDE_PROXY_URL scheme: "${url.slice(0, 12)}…"`);
   }
-  if (!process.env.HTTPS_PROXY) process.env.HTTPS_PROXY = url;
-  if (!process.env.HTTP_PROXY)  process.env.HTTP_PROXY  = url;
-  if (!process.env.NO_PROXY)    process.env.NO_PROXY    = "localhost,127.0.0.1,::1";
-  setGlobalDispatcher(new EnvHttpProxyAgent());
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = function patchedFetch(input, init) {
+    const target = typeof input === "string"
+      ? input
+      : input?.url ?? (input?.href ?? "");
+    if (GEMINI_HOST_RE.test(target)) {
+      return undiciFetch(input, { ...(init || {}), dispatcher });
+    }
+    return originalFetch(input, init);
+  };
 }
 
 function getClient() {
@@ -84,7 +160,7 @@ function getClient() {
   if (!apiKey) {
     throw new Error("hyde: GEMINI_API_KEY is not set");
   }
-  maybeInstallHttpProxy();
+  maybeInstallProxy();
   _client = new GoogleGenAI({ apiKey });
   return _client;
 }
@@ -127,6 +203,10 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
   const temperature     = opts.temperature     ?? numFromEnv("RAS_HYDE_TEMPERATURE",       DEFAULT_TEMPERATURE);
   const maxOutputTokens = opts.maxOutputTokens ?? numFromEnv("RAS_HYDE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
   const timeoutMs       = opts.timeoutMs       ?? numFromEnv("RAS_HYDE_TIMEOUT_MS",        DEFAULT_TIMEOUT_MS);
+  // Бюджет на thinking. -1 = AUTO, 0 = OFF (для 3.x Pro невозможно — API
+  // вернёт 400 "This model only works in thinking mode"). Под reasoning-
+  // модели держим AUTO и компенсируем общим maxOutputTokens.
+  const thinkingBudget  = opts.thinkingBudget  ?? numFromEnv("RAS_HYDE_THINKING_BUDGET",   DEFAULT_THINKING_BUDGET);
 
   const ai = getClient();
 
@@ -155,6 +235,7 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
         maxOutputTokens,
         topP: DEFAULT_TOP_P,
         safetySettings: SAFETY_SETTINGS_OFF,
+        thinkingConfig: { thinkingBudget },
         abortSignal: ac.signal,
       },
     });
