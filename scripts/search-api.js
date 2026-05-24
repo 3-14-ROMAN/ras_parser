@@ -90,6 +90,16 @@ const GROUP_SIZE          = Number(process.env.RAS_RRF_GROUP_SIZE      ?? 3);
 const RRF_K               = Number(process.env.RAS_RRF_K               ?? 60);
 const CHUNK_WINDOW        = Number(process.env.RAS_RERANK_CHUNK_WINDOW ?? 1);
 
+// HyDE pre-step в /search: дефолт ON, если есть GEMINI_API_KEY. Поставь
+// RAS_SEARCH_HYDE_ENABLED=0 чтобы выключить (тогда /search ходит на
+// embedding с original query, как раньше).
+const HYDE_ENABLED = (process.env.RAS_SEARCH_HYDE_ENABLED ?? "1") !== "0";
+// Safety-cap на длину HyDE-текста перед передачей в эмбеддер: длинный
+// текст квадратично замедляет multivector ColBERT-ветку Qdrant
+// (наш корпус 84К актов, на 200+ query-токенах поиск шёл ~60s).
+// 600 символов ≈ 150-180 токенов — компромисс между стилистикой и скоростью.
+const HYDE_MAX_CHARS_FOR_EMBED = Number(process.env.RAS_HYDE_MAX_EMBED_CHARS ?? 1200);
+
 const RERANK_MAX_DOC_LENGTH = process.env.RAS_RERANK_MAX_DOC_LENGTH
   ? Number(process.env.RAS_RERANK_MAX_DOC_LENGTH)
   : null;
@@ -394,6 +404,47 @@ async function handleSearch(req, res, url) {
   }
 
   const t0 = Date.now();
+  log("INFO", "search/start", { q_len: trimmed.length, hyde_enabled: HYDE_ENABLED });
+
+  // HyDE pre-step: бытовой запрос → синтетический акт → дальше в embedding.
+  // Запускается если RAS_SEARCH_HYDE_ENABLED=1 и GEMINI_API_KEY задан.
+  // На любой сбой (Gemini timeout/safety-block/прокси упал) — fallback на
+  // оригинал, поиск НЕ должен падать из-за внешнего LLM. Реранкер всё равно
+  // видит оригинальный query.
+  let hydeText      = null;
+  let hydeModel     = null;
+  let hydeElapsedMs = null;
+  let hydeError     = null;
+  if (HYDE_ENABLED && process.env.GEMINI_API_KEY) {
+    const tHyde = Date.now();
+    try {
+      const r = await generateHypotheticalAct(trimmed);
+      hydeText      = r.text;
+      hydeModel     = r.model;
+      hydeElapsedMs = Date.now() - tHyde;
+      log("INFO", "search/hyde-done", { elapsed_ms: hydeElapsedMs, chars: hydeText.length, model: hydeModel });
+    } catch (e) {
+      hydeError     = e?.message ?? String(e);
+      hydeElapsedMs = Date.now() - tHyde;
+      log("WARN", "search/hyde-fallback", { msg: hydeError, elapsed_ms: hydeElapsedMs });
+    }
+  } else {
+    log("INFO", "search/hyde-skipped", { enabled: HYDE_ENABLED, has_key: !!process.env.GEMINI_API_KEY });
+  }
+
+  // Safety-truncate перед embed (защита от срыва модели на длинный текст).
+  let hydeTextForEmbed = hydeText;
+  let hydeTruncatedFrom = 0;
+  if (hydeText && HYDE_MAX_CHARS_FOR_EMBED > 0 && hydeText.length > HYDE_MAX_CHARS_FOR_EMBED) {
+    hydeTruncatedFrom = hydeText.length;
+    hydeTextForEmbed = hydeText.slice(0, HYDE_MAX_CHARS_FOR_EMBED);
+    log("WARN", "search/hyde-truncated", { from: hydeTruncatedFrom, to: HYDE_MAX_CHARS_FOR_EMBED });
+  }
+  log("INFO", "search/before-rerank-pipeline", {
+    hyde_text_chars: hydeTextForEmbed?.length ?? 0,
+    hyde_truncated_from: hydeTruncatedFrom || null,
+  });
+
   let result;
   try {
     result = await searchAndRerank(trimmed, {
@@ -406,6 +457,7 @@ async function handleSearch(req, res, url) {
       maxChars:              MAX_CHARS,
       rerankMaxDocLength:    RERANK_MAX_DOC_LENGTH ?? undefined,
       rerankMaxQueryLength:  RERANK_MAX_QUERY_LENGTH ?? undefined,
+      queryForEmbedding:     hydeTextForEmbed ?? undefined,
     });
   } catch (e) {
     log("ERROR", "search failed", { msg: e?.message ?? String(e) });
@@ -421,6 +473,10 @@ async function handleSearch(req, res, url) {
     topN,
     returned: compact.length,
     elapsed_ms: elapsed,
+    hyde_used: hydeText !== null,
+    hyde_chars: hydeText?.length ?? 0,
+    hyde_ms: hydeElapsedMs,
+    hyde_error: hydeError,
     retrieval_ms: result.timing?.retrieval_ms,
     hydrate_ms:   result.timing?.hydrate_ms,
     rerank_ms:    result.timing?.rerank_ms,
@@ -432,6 +488,13 @@ async function handleSearch(req, res, url) {
     topN,
     elapsed_ms: elapsed,
     timing:     result.timing ?? null,
+    hyde: {
+      used:       hydeText !== null,
+      model:      hydeModel,
+      chars:      hydeText?.length ?? 0,
+      elapsed_ms: hydeElapsedMs,
+      error:      hydeError,
+    },
     rerank: {
       model:         result.rerank?.model ?? null,
       scored:        result.rerank?.scored ?? 0,

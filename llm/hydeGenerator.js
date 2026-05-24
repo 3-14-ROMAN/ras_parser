@@ -20,7 +20,7 @@ import { connect as tlsConnect } from "node:tls";
 import { GoogleGenAI } from "@google/genai";
 import {
   Agent as UndiciAgent,
-  EnvHttpProxyAgent,
+  ProxyAgent,
   fetch as undiciFetch,
 } from "undici";
 import { SocksClient } from "socks";
@@ -72,26 +72,27 @@ const SYSTEM_INSTRUCTION = `Ты — генератор поисковых те�
 Обязательная структура ответа:
 - Обстоятельства спора (в чем суть конфликта).
 - Позиция сторон (кратко доводы).
-- Оценка суда (почему суд принял такое решение).`;
+- Оценка суда (почему суд принял такое решение).
+
+ОБЪЁМ: 400–600 символов всего. По 1–2 коротких предложения на каждый блок.`;
 
 let _client = null;
-let _proxyInstalled = false;
+let _proxyDispatcher = null;
+let _proxyResolved  = false;
 
 // Google AI Studio (generativelanguage.googleapis.com) блокирует ряд стран,
 // включая РФ — отдаёт 400 "User location is not supported for the API use".
 // Обходим через RAS_HYDE_PROXY_URL. Поддержанные схемы:
-//   - http://[user:pass@]host:port  → undici EnvHttpProxyAgent
-//   - https://...                    → то же
+//   - http(s)://[user:pass@]host:port → undici ProxyAgent
 //   - socks5h://host:port или socks5://[user:pass@]host:port
-//                                    → undici Agent c custom connect через
-//                                      пакет `socks` (DNS у socks5h резолвится
-//                                      на стороне прокси, что важно для
-//                                      обхода locally-poisoned DNS).
+//                                     → undici Agent c custom connect через
+//                                       пакет `socks` (у socks5h DNS резолвится
+//                                       на стороне прокси).
 //
-// Чтобы не задеть остальные fetch в процессе (Qdrant/inference на localhost,
-// MobileProxy management API, etc.), подменяем globalThis.fetch wrapper'ом,
-// который пускает через наш dispatcher ТОЛЬКО Gemini-домены. Все остальные
-// URL уходят оригинальному fetch без изменений.
+// Чтобы не задеть остальные fetch в процессе (Qdrant/inference на localhost),
+// подмена globalThis.fetch делается scope-локально через try/finally в момент
+// вызова generateHypotheticalAct, а не глобально при импорте модуля. Так
+// между HyDE-вызовами globalThis.fetch остаётся чистым.
 const GEMINI_HOST_RE = /(?:generativelanguage|aiplatform)\.googleapis\.com/i;
 
 function makeSocksDispatcher(socksUrl) {
@@ -131,36 +132,20 @@ function makeSocksDispatcher(socksUrl) {
   });
 }
 
-function maybeInstallProxy() {
-  if (_proxyInstalled) return;
-  _proxyInstalled = true;
-  // RAS_HYDE_PROXY_URL — основной, RAS_HYDE_HTTP_PROXY оставлен как алиас
-  // для обратной совместимости с прошлой версией модуля.
+function getProxyDispatcher() {
+  if (_proxyResolved) return _proxyDispatcher;
+  _proxyResolved = true;
+  // RAS_HYDE_PROXY_URL — основной, RAS_HYDE_HTTP_PROXY оставлен алиасом.
   const url = (process.env.RAS_HYDE_PROXY_URL || process.env.RAS_HYDE_HTTP_PROXY)?.trim();
-  if (!url) return;
-
-  let dispatcher;
+  if (!url) return null;
   if (/^socks(5h?|4a?)?:\/\//i.test(url)) {
-    dispatcher = makeSocksDispatcher(url);
+    _proxyDispatcher = makeSocksDispatcher(url);
   } else if (/^https?:\/\//i.test(url)) {
-    if (!process.env.HTTPS_PROXY) process.env.HTTPS_PROXY = url;
-    if (!process.env.HTTP_PROXY)  process.env.HTTP_PROXY  = url;
-    if (!process.env.NO_PROXY)    process.env.NO_PROXY    = "localhost,127.0.0.1,::1";
-    dispatcher = new EnvHttpProxyAgent();
+    _proxyDispatcher = new ProxyAgent(url);
   } else {
     throw new Error(`hyde: unsupported RAS_HYDE_PROXY_URL scheme: "${url.slice(0, 12)}…"`);
   }
-
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = function patchedFetch(input, init) {
-    const target = typeof input === "string"
-      ? input
-      : input?.url ?? (input?.href ?? "");
-    if (GEMINI_HOST_RE.test(target)) {
-      return undiciFetch(input, { ...(init || {}), dispatcher });
-    }
-    return originalFetch(input, init);
-  };
+  return _proxyDispatcher;
 }
 
 function getClient() {
@@ -169,7 +154,6 @@ function getClient() {
   if (!apiKey) {
     throw new Error("hyde: GEMINI_API_KEY is not set");
   }
-  maybeInstallProxy();
   _client = new GoogleGenAI({ apiKey });
   return _client;
 }
@@ -276,6 +260,7 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
   const thinkingBudget  = opts.thinkingBudget  ?? numFromEnv("RAS_HYDE_THINKING_BUDGET",   DEFAULT_THINKING_BUDGET);
 
   const ai = getClient();
+  const dispatcher = getProxyDispatcher();
 
   // Внутренний AbortController на таймаут + объединение с внешним signal,
   // если он передан. Это нужно, чтобы клиент HTTP-сервера мог отменить
@@ -289,6 +274,25 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
   }
   const timer = setTimeout(() => ac.abort(new Error(`hyde timeout ${timeoutMs}ms`)), timeoutMs);
   timer.unref?.();
+
+  // Scope-локальная подмена globalThis.fetch только если задан прокси.
+  // SDK @google/genai зовёт глобальный fetch — мы перенаправляем его на
+  // undici.fetch с dispatcher для Gemini-доменов, оставляя остальные fetch
+  // через оригинал. После try/finally globalThis.fetch восстанавливается,
+  // чтобы Qdrant/inference fetch'ы в том же процессе не задеть.
+  let originalFetch = null;
+  if (dispatcher) {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = function patchedFetch(input, init) {
+      const target = typeof input === "string"
+        ? input
+        : input?.url ?? (input?.href ?? "");
+      if (GEMINI_HOST_RE.test(target)) {
+        return undiciFetch(input, { ...(init || {}), dispatcher });
+      }
+      return originalFetch(input, init);
+    };
+  }
 
   const t0 = Date.now();
   let response;
@@ -309,6 +313,7 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
   } finally {
     clearTimeout(timer);
     if (opts.signal) opts.signal.removeEventListener?.("abort", onExternalAbort);
+    if (originalFetch) globalThis.fetch = originalFetch;
   }
 
   const elapsedMs = Date.now() - t0;

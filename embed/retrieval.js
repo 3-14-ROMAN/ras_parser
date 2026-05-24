@@ -1,23 +1,23 @@
 /**
- * embed/retrieval.js — retrieval layer с 4-ветвенным поиском + RRF.
+ * embed/retrieval.js — retrieval layer с 5-ветвенным поиском + RRF.
  *
- * Архитектура (Roman's Step 4):
+ * Архитектура (после переработки 2026-05-23: добавлена ветка long_colbert):
  *   ┌──────────────────────────┐
  *   │ /embed(query)            │   /embed возвращает colbert, dense, sparse.
  *   └──────────┬───────────────┘   (sparse — token-id → tf, IDF на Qdrant.)
  *              │
- *      ┌───────┴───────┬────────────────┬─────────────┐
- *      ▼               ▼                ▼             ▼
- *   full_colbert    full_sparse     long_dense    long_sparse
- *   (full_act +     (full_act,     (chunk,       (chunk,
- *    has_colbert,    sparse-only)   dense_late,   sparse,
- *    dense prefetch                 group_by      group_by
- *    → colbert                      act_id)       act_id)
- *    MaxSim rerank)
- *      │               │                │             │
- *      └──────┬────────┴────────┬───────┴──────┬──────┘
- *             ▼                 ▼              ▼
- *      ranked act_id     ranked act_id   ranked act_id    (4 списка)
+ *      ┌───────┴───────┬───────────────┬──────────────┬──────────────┐
+ *      ▼               ▼               ▼              ▼              ▼
+ *   full_colbert   full_sparse     long_dense     long_sparse    long_colbert
+ *   (full_act,     (full_act,     (chunk,        (chunk,        (chunk,
+ *    has_colbert,   sparse-only)   dense_late,    sparse,        has_colbert,
+ *    dense prefetch                 group_by       group_by       dense_late prefetch
+ *    → colbert                      act_id)        act_id)        → colbert MaxSim,
+ *    MaxSim rerank)                                                group_by act_id)
+ *      │              │              │              │              │
+ *      └──────┬───────┴───────┬──────┴──────┬───────┴───────┬──────┘
+ *             ▼               ▼             ▼               ▼
+ *      ranked act_id   ranked act_id  ranked act_id  ranked act_id    (5 списков)
  *             │
  *             ▼
  *         RRF merge (по рангам, не по score'ам)
@@ -32,8 +32,15 @@
  * Веса по умолчанию (можно тюнить env / argument):
  *   full_colbert : 1.15  — самый точный сигнал для коротких актов (token-level)
  *   full_sparse  : 1.00  — точные юридические термины / статьи / номера
- *   long_dense   : 1.00  — late-chunk dense для длинных актов
+ *   long_dense   : 1.00  — late-chunk dense mean-pool для длинных актов
  *   long_sparse  : 1.00  — точные термы внутри длинных актов
+ *   long_colbert : 1.15  — late-chunk colbert MaxSim (паритет с short colbert)
+ *
+ * long_colbert использует те же 128-dim multivector токены, что и short-акты,
+ * но посчитанные через late chunking: один forward pass на весь акт, потом
+ * raw tokens нарезаны на чанки без overlap. Хранится в Qdrant в том же
+ * named-vector "colbert" (multivector_config max_sim), отличается только
+ * payload (unit_type=chunk vs full_act).
  */
 
 import {
@@ -41,6 +48,7 @@ import {
   COLLECTION,
   inferencePost,
   qdrant,
+  loadReranker,
 } from "./clients.js";
 import { hydrateForRerank } from "./hydrate.js";
 import { rerank } from "./rerank.js";
@@ -289,6 +297,56 @@ export async function branchLongSparse(q, opts = {}) {
   return { groups, actIds: actIdsFromGroups(groups) };
 }
 
+/**
+ * Ветка E — длинные акты, ColBERT MaxSim per chunk.
+ *   filter: unit_type=chunk AND has_colbert=true
+ *   prefetch: dense_late (128-dim mean-pool) → грубая отсортировка top-N
+ *   search:   colbert (multivector token-level) → MaxSim rerank внутри N
+ *   group_by: act_id (один длинный акт → одна позиция в выдаче)
+ *
+ * Это паритет с full_colbert для длинных актов: late chunking даёт raw
+ * token embeddings per chunk, MaxSim матчит токены query с токенами чанка
+ * без усреднения. Главный качественный сигнал для коротких запросов
+ * с конкретными терминами по длинным актам.
+ *
+ * Prefetch limit держим побольше (≈ limit × 5), потому что dense_late
+ * на mean-pool достаточно грубый — MaxSim переcортирует.
+ */
+export async function branchLongColbert(q, opts = {}) {
+  const limit         = opts.limit         ?? 100;
+  const prefetchLimit = opts.prefetchLimit ?? Math.max(500, limit * 5);
+  const groupSize     = opts.groupSize     ?? 3;
+  const flt = {
+    must: [
+      { key: "unit_type",   match: { value: "chunk" } },
+      { key: "has_colbert", match: { value: true   } },
+    ],
+  };
+  const body = {
+    prefetch: {
+      query:  q.colbertMeanPool,
+      using:  "dense_late",
+      filter: flt,
+      limit:  prefetchLimit,
+    },
+    query:    q.colbert,
+    using:    "colbert",
+    filter:   flt,
+    group_by: "act_id",
+    limit,
+    group_size: groupSize,
+    with_payload: DEFAULT_PAYLOAD_FIELDS,
+    with_vector:  false,
+  };
+  const res = await qdrant(
+    "POST",
+    `/collections/${COLLECTION}/points/query/groups`,
+    body,
+  );
+  const groups = res?.result?.groups ?? [];
+  return { groups, actIds: actIdsFromGroups(groups) };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RRF — Reciprocal Rank Fusion
 // ─────────────────────────────────────────────────────────────────────────────
@@ -336,6 +394,7 @@ export const DEFAULT_RRF_WEIGHTS = {
   full_sparse:  1.00,
   long_dense:   1.00,
   long_sparse:  1.00,
+  long_colbert: 1.15,
 };
 
 /**
@@ -368,18 +427,52 @@ async function _searchAllImpl(queryText, opts = {}) {
   const rrfK           = opts.rrfK           ?? 60;
   const topK           = opts.topK           ?? 20;
 
-  const q = await embedQuery(queryText);
+  // HyDE-режим: если задан queryForDense — это синтетический акт, который
+  // эмбедится в dense-вектор для смысло-поиска. Параллельно эмбедится
+  // оригинальный (короткий) queryText — его ColBERT-multivector и sparse
+  // используются в лексических ветках. Так dense ловит «о чём дело» через
+  // богатую HyDE-форму, а ColBERT/sparse матчатся пословно с коротким
+  // user-query (избегаем O(N×M) взрыва ColBERT MaxSim на длинном тексте).
+  const queryForDense = (typeof opts.queryForDense === "string"
+                         && opts.queryForDense.trim())
+    ? opts.queryForDense
+    : null;
+
+  let q;
+  if (queryForDense) {
+    const [qLex, qDense] = await Promise.all([
+      embedQuery(queryText),
+      embedQuery(queryForDense),
+    ]);
+    q = {
+      colbert:         qLex.colbert,          // multivector → короткий оригинал
+      sparse:          qLex.sparse,           // sparse terms → короткий оригинал
+      dense:           qDense.dense,          // 2048-d → HyDE
+      colbertMeanPool: qDense.colbertMeanPool,// 128-d late-dense → HyDE
+      tokens:          qLex.tokens,
+      tokensDense:     qDense.tokens,
+    };
+  } else {
+    q = await embedQuery(queryText);
+  }
 
   const branchOpts       = { limit: perBranchLimit };
   const longBranchOpts   = { limit: perBranchLimit, groupSize };
 
-  // 4 ветки параллельно. Promise.all потому, что они независимы — пока одна
+  // 5 веток параллельно. Promise.all потому, что они независимы — пока одна
   // ветка ждёт ответа Qdrant, другие тоже летят.
-  const [full_colbert, full_sparse, long_dense, long_sparse] = await Promise.all([
+  const [
+    full_colbert,
+    full_sparse,
+    long_dense,
+    long_sparse,
+    long_colbert,
+  ] = await Promise.all([
     branchFullColbert(q, branchOpts),
     branchFullSparse(q, branchOpts),
     branchLongDense(q, longBranchOpts),
     branchLongSparse(q, longBranchOpts),
+    branchLongColbert(q, longBranchOpts),
   ]);
 
   const merged = rrfMerge(
@@ -388,6 +481,7 @@ async function _searchAllImpl(queryText, opts = {}) {
       full_sparse:  full_sparse.actIds,
       long_dense:   long_dense.actIds,
       long_sparse:  long_sparse.actIds,
+      long_colbert: long_colbert.actIds,
     },
     weights,
     rrfK,
@@ -398,7 +492,13 @@ async function _searchAllImpl(queryText, opts = {}) {
       tokens:      q.tokens,
       sparseTerms: q.sparse.indices?.length ?? 0,
     },
-    branches: { full_colbert, full_sparse, long_dense, long_sparse },
+    branches: {
+      full_colbert,
+      full_sparse,
+      long_dense,
+      long_sparse,
+      long_colbert,
+    },
     merged,
     topK: merged.slice(0, topK).map(([act_id, score, ranks]) => ({ act_id, score, ranks })),
   };
@@ -434,6 +534,9 @@ export async function searchAll(queryText, opts = {}) {
  *   @param {number} [opts.maxChars=12000]       cap на длину документа в /rerank (char-уровень)
  *   @param {number} [opts.rerankMaxDocLength=2048]   max_doc_length токенов (Jina v3)
  *   @param {number} [opts.rerankMaxQueryLength=512]  max_query_length токенов (Jina v3)
+ *   @param {string} [opts.queryForEmbedding]    HyDE-текст; идёт в embedQuery
+ *                                               для retrieval. Rerank остаётся
+ *                                               на оригинальном queryText.
  *
  * @returns {Promise<{
  *   query: { tokens: number, sparseTerms: number },
@@ -461,8 +564,24 @@ async function _searchAndRerankImpl(queryText, opts = {}) {
   const maxChars       = opts.maxChars;        // undefined → дефолт hydrate.js
   const rerankMaxDoc   = opts.rerankMaxDocLength;
   const rerankMaxQ     = opts.rerankMaxQueryLength;
+  // HyDE: текст для DENSE-веток (dense full + dense_late). ColBERT-
+  // multivector и sparse остаются на оригинальном queryText — они
+  // лексические, длинный синтетический текст там даёт нелинейный взрыв
+  // стоимости поиска. Rerank (Jina v3 cross-encoder) тоже видит
+  // оригинал — он обучен на парах (user-query, doc).
+  const queryForDense = (typeof opts.queryForEmbedding === "string"
+                          && opts.queryForEmbedding.trim())
+    ? opts.queryForEmbedding
+    : null;
 
   const tStart = Date.now();
+
+  // Fire-and-forget reranker load. При RAS_RERANKER_AUTO_LIFECYCLE=1 на
+  // стороне inference reranker по дефолту выгружен; пока мы retrieval'им
+  // и hydrate'им (~300-1000 ms), reranker подгружается в VRAM параллельно.
+  // /rerank на стороне inference имеет auto-load fallback на случай race
+  // condition (если retrieval оказался быстрее load'а — /rerank сам ждёт).
+  loadReranker().catch(() => {});
 
   // 1) Retrieval + RRF (поднимаем topK до rrfTopK, чтобы reranker'у было что
   // переcортировать; ничего не теряем — merged всё равно есть).
@@ -474,6 +593,7 @@ async function _searchAndRerankImpl(queryText, opts = {}) {
     weights,
     rrfK,
     topK: rrfTopK,
+    queryForDense,
   });
   const tRetrieval = Date.now();
 
