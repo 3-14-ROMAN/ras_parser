@@ -494,6 +494,7 @@ async function handleSearch(req, res, url) {
       chars:      hydeText?.length ?? 0,
       elapsed_ms: hydeElapsedMs,
       error:      hydeError,
+      text:       hydeText, // полный текст для дебага/UI; null если HyDE упал/выключен
     },
     rerank: {
       model:         result.rerank?.model ?? null,

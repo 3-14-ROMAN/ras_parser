@@ -309,12 +309,21 @@ export async function branchLongSparse(q, opts = {}) {
  * без усреднения. Главный качественный сигнал для коротких запросов
  * с конкретными терминами по длинным актам.
  *
- * Prefetch limit держим побольше (≈ limit × 5), потому что dense_late
- * на mean-pool достаточно грубый — MaxSim переcортирует.
+ * Prefetch limit намеренно занижен. Профайлинг (scripts/profile-search-
+ * pipeline.js) показал: ColBERT MaxSim на 500 prefetch'ed chunk'ах с ~800
+ * token-vectors каждый занимает 15s даже на коротком запросе и 60s+
+ * (QDRANT_TIMEOUT) на HyDE — потому что для colbert HNSW отключён (m=0,
+ * rerank-only). На 100 chunks MaxSim работает в ~5× быстрее, качество
+ * берёт на себя dense_late prefetch (128-dim mean-pool, HNSW m=16).
+ * Если просядет recall — поднять RAS_LONG_COLBERT_PREFETCH.
  */
+const LONG_COLBERT_PREFETCH_DEFAULT = Number(
+  process.env.RAS_LONG_COLBERT_PREFETCH ?? 100,
+);
+
 export async function branchLongColbert(q, opts = {}) {
   const limit         = opts.limit         ?? 100;
-  const prefetchLimit = opts.prefetchLimit ?? Math.max(500, limit * 5);
+  const prefetchLimit = opts.prefetchLimit ?? LONG_COLBERT_PREFETCH_DEFAULT;
   const groupSize     = opts.groupSize     ?? 3;
   const flt = {
     must: [
@@ -427,34 +436,7 @@ async function _searchAllImpl(queryText, opts = {}) {
   const rrfK           = opts.rrfK           ?? 60;
   const topK           = opts.topK           ?? 20;
 
-  // HyDE-режим: если задан queryForDense — это синтетический акт, который
-  // эмбедится в dense-вектор для смысло-поиска. Параллельно эмбедится
-  // оригинальный (короткий) queryText — его ColBERT-multivector и sparse
-  // используются в лексических ветках. Так dense ловит «о чём дело» через
-  // богатую HyDE-форму, а ColBERT/sparse матчатся пословно с коротким
-  // user-query (избегаем O(N×M) взрыва ColBERT MaxSim на длинном тексте).
-  const queryForDense = (typeof opts.queryForDense === "string"
-                         && opts.queryForDense.trim())
-    ? opts.queryForDense
-    : null;
-
-  let q;
-  if (queryForDense) {
-    const [qLex, qDense] = await Promise.all([
-      embedQuery(queryText),
-      embedQuery(queryForDense),
-    ]);
-    q = {
-      colbert:         qLex.colbert,          // multivector → короткий оригинал
-      sparse:          qLex.sparse,           // sparse terms → короткий оригинал
-      dense:           qDense.dense,          // 2048-d → HyDE
-      colbertMeanPool: qDense.colbertMeanPool,// 128-d late-dense → HyDE
-      tokens:          qLex.tokens,
-      tokensDense:     qDense.tokens,
-    };
-  } else {
-    q = await embedQuery(queryText);
-  }
+  const q = await embedQuery(queryText);
 
   const branchOpts       = { limit: perBranchLimit };
   const longBranchOpts   = { limit: perBranchLimit, groupSize };
@@ -534,9 +516,10 @@ export async function searchAll(queryText, opts = {}) {
  *   @param {number} [opts.maxChars=12000]       cap на длину документа в /rerank (char-уровень)
  *   @param {number} [opts.rerankMaxDocLength=2048]   max_doc_length токенов (Jina v3)
  *   @param {number} [opts.rerankMaxQueryLength=512]  max_query_length токенов (Jina v3)
- *   @param {string} [opts.queryForEmbedding]    HyDE-текст; идёт в embedQuery
- *                                               для retrieval. Rerank остаётся
- *                                               на оригинальном queryText.
+ *   @param {string} [opts.queryForEmbedding]    HyDE-текст; используется вместо
+ *                                               queryText для embedQuery
+ *                                               (retrieval). Rerank остаётся на
+ *                                               оригинальном queryText.
  *
  * @returns {Promise<{
  *   query: { tokens: number, sparseTerms: number },
@@ -564,15 +547,13 @@ async function _searchAndRerankImpl(queryText, opts = {}) {
   const maxChars       = opts.maxChars;        // undefined → дефолт hydrate.js
   const rerankMaxDoc   = opts.rerankMaxDocLength;
   const rerankMaxQ     = opts.rerankMaxQueryLength;
-  // HyDE: текст для DENSE-веток (dense full + dense_late). ColBERT-
-  // multivector и sparse остаются на оригинальном queryText — они
-  // лексические, длинный синтетический текст там даёт нелинейный взрыв
-  // стоимости поиска. Rerank (Jina v3 cross-encoder) тоже видит
-  // оригинал — он обучен на парах (user-query, doc).
-  const queryForDense = (typeof opts.queryForEmbedding === "string"
-                          && opts.queryForEmbedding.trim())
+  // HyDE: текст, которым эмбедится запрос для ВСЕХ retrieval-веток.
+  // Rerank (Jina v3 cross-encoder) остаётся на оригинальном queryText —
+  // он обучен на парах (user-query, doc), синтетический акт ему не нужен.
+  const queryForEmbedding = (typeof opts.queryForEmbedding === "string"
+                              && opts.queryForEmbedding.trim())
     ? opts.queryForEmbedding
-    : null;
+    : queryText;
 
   const tStart = Date.now();
 
@@ -587,13 +568,12 @@ async function _searchAndRerankImpl(queryText, opts = {}) {
   // переcортировать; ничего не теряем — merged всё равно есть).
   // Зовём _searchAllImpl напрямую — внешний withSearchLease уже держит лиз
   // на весь pipeline, второй acquire здесь был бы лишним.
-  const retrieved = await _searchAllImpl(queryText, {
+  const retrieved = await _searchAllImpl(queryForEmbedding, {
     perBranchLimit,
     groupSize,
     weights,
     rrfK,
     topK: rrfTopK,
-    queryForDense,
   });
   const tRetrieval = Date.now();
 

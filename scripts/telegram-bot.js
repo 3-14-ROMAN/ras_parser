@@ -448,11 +448,36 @@ const MAIN_KEYBOARD = {
   ],
 };
 
-const RESULTS_KEYBOARD = {
-  inline_keyboard: [
-    [
-      { text: "🏠 Меню",         callback_data: "menu" },
-    ],
+// In-memory LRU кэш HyDE-текстов под кнопкой «📝 Как Gemini переписал».
+// Telegram callback_data ограничен 64 байтами — сам текст туда не положить,
+// поэтому храним в памяти по короткому id и в callback'е достаём.
+// Лимит 1000 записей: при превышении выкидываем самую старую.
+const HYDE_CACHE_MAX = 1000;
+const _hydeCache = new Map(); // id -> { text, model, chars, query, ts }
+let   _hydeCacheCounter = 0;
+function rememberHydeText({ text, model, chars, query }) {
+  if (!text) return null;
+  const id = (++_hydeCacheCounter).toString(36); // base36 — компактнее
+  _hydeCache.set(id, { text, model, chars, query, ts: Date.now() });
+  while (_hydeCache.size > HYDE_CACHE_MAX) {
+    const firstKey = _hydeCache.keys().next().value;
+    _hydeCache.delete(firstKey);
+  }
+  return id;
+}
+function recallHydeText(id) {
+  return _hydeCache.get(id) || null;
+}
+
+// Сборка inline-клавиатуры под результатами поиска. Если есть HyDE-текст —
+// добавляем кнопку «📝 Как Gemini переписал запрос» первой строкой.
+function buildResultsKeyboard(hydeId) {
+  const rows = [];
+  if (hydeId) {
+    rows.push([{ text: "📝 Как Gemini переписал запрос", callback_data: `show_hyde:${hydeId}` }]);
+  }
+  rows.push(
+    [{ text: "🏠 Меню", callback_data: "menu" }],
     [
       { text: "🔎 Новый поиск",  callback_data: "new_search" },
       { text: "📊 Статус базы",  callback_data: "status" },
@@ -461,8 +486,11 @@ const RESULTS_KEYBOARD = {
       { text: "🎛 Кол-во актов", callback_data: "top_settings" },
       { text: "ℹ️ Инфо",         callback_data: "info" },
     ],
-  ],
-};
+  );
+  return { inline_keyboard: rows };
+}
+
+const RESULTS_KEYBOARD = buildResultsKeyboard(null); // дефолт без HyDE-кнопки
 
 // Клавиатура выбора TopN. Cb_data set_top_N — N валидно ∈ {3,5,10,15,20}.
 const TOP_SETTINGS_KEYBOARD = {
@@ -576,13 +604,27 @@ function formatResultCard(r, idx1Based) {
 const SAFE_MSG_CHARS = 3900;
 
 // Отправка результатов поиска: заголовок + пачки карточек ≤ SAFE_MSG_CHARS.
-// Последняя пачка содержит RESULTS_KEYBOARD.
-async function sendSearchResults(chatId, _query, apiResp) {
+// Последняя пачка содержит keyboard. Если в apiResp есть hyde.text — кладём
+// его в LRU-кэш и добавляем в keyboard кнопку «📝 Как Gemini переписал запрос».
+async function sendSearchResults(chatId, query, apiResp) {
   const results = (apiResp.results ?? []);
+
+  // HyDE-текст под кнопку (если есть).
+  const hyde = apiResp.hyde || null;
+  const hydeId = (hyde && hyde.used && hyde.text)
+    ? rememberHydeText({
+        text:  hyde.text,
+        model: hyde.model,
+        chars: hyde.chars,
+        query,
+      })
+    : null;
+  const keyboard = buildResultsKeyboard(hydeId);
+
   if (results.length === 0) {
     await sendMessage(chatId, "Ничего не найдено.", {
       parse_mode: "HTML",
-      reply_markup: RESULTS_KEYBOARD,
+      reply_markup: keyboard,
     });
     return;
   }
@@ -618,7 +660,7 @@ async function sendSearchResults(chatId, _query, apiResp) {
     const isLast = i === batches.length - 1;
     await sendMessage(chatId, batches[i], {
       parse_mode: "HTML",
-      ...(isLast ? { reply_markup: RESULTS_KEYBOARD } : {}),
+      ...(isLast ? { reply_markup: keyboard } : {}),
     });
   }
 }
@@ -833,6 +875,39 @@ async function handleCallback(cb) {
       const n = setChatTopN(chatId, Number(m[1]));
       log("INFO", "topN set", { user_id: userId, chat_id: chatId, topN: n });
       await editToCallback(cb, topSettingsText(n), TOP_SETTINGS_KEYBOARD);
+      return;
+    }
+
+    // show_hyde:<id> — показать HyDE-текст под кнопкой. Достаём из LRU-кэша
+    // (см. rememberHydeText в sendSearchResults). Если кэш потерян (рестарт
+    // бота или вытеснение по LRU) — отвечаем дружелюбной заглушкой.
+    const hm = /^show_hyde:(\w+)$/.exec(data);
+    if (hm) {
+      const entry = recallHydeText(hm[1]);
+      if (!entry) {
+        await tg("answerCallbackQuery", {
+          callback_query_id: cb.id,
+          text: "Запрос устарел, повторите поиск",
+          show_alert: true,
+        });
+        return;
+      }
+      const HEADER =
+        `📝 <b>Как Gemini переписал запрос</b>\n` +
+        `<i>Ваш запрос → синтетический «эталонный» текст, ` +
+        `который ищется в базе судебных актов.</i>\n\n` +
+        `<b>Исходный запрос:</b>\n<code>${htmlEscape(entry.query || "")}</code>\n\n` +
+        `<b>Переписанный (HyDE, model=${htmlEscape(entry.model || "?")}, ${entry.chars} симв.):</b>\n`;
+      // HyDE-текст обёрнут в <pre>, чтобы переносы строк и кавычки
+      // отрисовались как есть, без Markdown-интерпретации.
+      const body = `<pre>${htmlEscape(entry.text)}</pre>`;
+      const full = HEADER + body;
+      await sendMessage(chatId, full, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🏠 Меню", callback_data: "menu" }]] },
+      });
+      // Закрываем «спиннер» на кнопке.
+      await tg("answerCallbackQuery", { callback_query_id: cb.id });
       return;
     }
 
