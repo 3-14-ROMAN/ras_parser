@@ -453,19 +453,19 @@ const MAIN_KEYBOARD = {
 // поэтому храним в памяти по короткому id и в callback'е достаём.
 // Лимит 1000 записей: при превышении выкидываем самую старую.
 const HYDE_CACHE_MAX = 1000;
-const _hydeCache = new Map(); // id -> { text, model, chars, query, ts }
+const _hydeCache = new Map(); // id -> { text, model, model_version, chars, usage, elapsed_ms, finish, query, ts }
 let   _hydeCacheCounter = 0;
-function rememberHydeText({ text, model, chars, query }) {
-  if (!text) return null;
+function rememberHydeEntry(entry) {
+  if (!entry?.text) return null;
   const id = (++_hydeCacheCounter).toString(36); // base36 — компактнее
-  _hydeCache.set(id, { text, model, chars, query, ts: Date.now() });
+  _hydeCache.set(id, { ...entry, ts: Date.now() });
   while (_hydeCache.size > HYDE_CACHE_MAX) {
     const firstKey = _hydeCache.keys().next().value;
     _hydeCache.delete(firstKey);
   }
   return id;
 }
-function recallHydeText(id) {
+function recallHydeEntry(id) {
   return _hydeCache.get(id) || null;
 }
 
@@ -474,7 +474,7 @@ function recallHydeText(id) {
 function buildResultsKeyboard(hydeId) {
   const rows = [];
   if (hydeId) {
-    rows.push([{ text: "📝 Как Gemini переписал запрос", callback_data: `show_hyde:${hydeId}` }]);
+    rows.push([{ text: "📝 HyDE запрос", callback_data: `show_hyde:${hydeId}` }]);
   }
   rows.push(
     [{ text: "🏠 Меню", callback_data: "menu" }],
@@ -612,10 +612,15 @@ async function sendSearchResults(chatId, query, apiResp) {
   // HyDE-текст под кнопку (если есть).
   const hyde = apiResp.hyde || null;
   const hydeId = (hyde && hyde.used && hyde.text)
-    ? rememberHydeText({
-        text:  hyde.text,
-        model: hyde.model,
-        chars: hyde.chars,
+    ? rememberHydeEntry({
+        text:          hyde.text,
+        model:         hyde.model,
+        model_version: hyde.model_version,
+        chars:         hyde.chars,
+        usage:         hyde.usage,
+        elapsed_ms:    hyde.elapsed_ms,
+        finish:        hyde.finish_reason,
+        truncated_from: hyde.truncated_from,
         query,
       })
     : null;
@@ -878,12 +883,12 @@ async function handleCallback(cb) {
       return;
     }
 
-    // show_hyde:<id> — показать HyDE-текст под кнопкой. Достаём из LRU-кэша
-    // (см. rememberHydeText в sendSearchResults). Если кэш потерян (рестарт
-    // бота или вытеснение по LRU) — отвечаем дружелюбной заглушкой.
+    // show_hyde:<id> — показать HyDE-текст + метаданные генерации.
+    // Достаём из LRU-кэша. Если кэш потерян (рестарт бота / LRU eviction) —
+    // alert «Запрос устарел».
     const hm = /^show_hyde:(\w+)$/.exec(data);
     if (hm) {
-      const entry = recallHydeText(hm[1]);
+      const entry = recallHydeEntry(hm[1]);
       if (!entry) {
         await tg("answerCallbackQuery", {
           callback_query_id: cb.id,
@@ -892,21 +897,47 @@ async function handleCallback(cb) {
         });
         return;
       }
+      const u = entry.usage || {};
+      const tokParts = [];
+      if (u.prompt_tokens     != null) tokParts.push(`prompt=${u.prompt_tokens}`);
+      if (u.candidates_tokens != null) tokParts.push(`output=${u.candidates_tokens}`);
+      if (u.total_tokens != null && u.prompt_tokens != null && u.candidates_tokens != null) {
+        const thinking = u.total_tokens - u.prompt_tokens - u.candidates_tokens;
+        if (thinking > 0) tokParts.push(`thinking=${thinking}`);
+      }
+      if (u.total_tokens != null) tokParts.push(`total=${u.total_tokens}`);
+      const tokensLine = tokParts.length ? tokParts.join(", ") : "—";
+
+      const elapsedSec = entry.elapsed_ms != null
+        ? (entry.elapsed_ms / 1000).toFixed(2) + " сек"
+        : "—";
+
+      const modelLine = entry.model_version && entry.model_version !== entry.model
+        ? `<code>${htmlEscape(entry.model)}</code> → API: <code>${htmlEscape(entry.model_version)}</code>`
+        : `<code>${htmlEscape(entry.model || "?")}</code>`;
+
+      const truncLine = entry.truncated_from
+        ? `\n⚠️ Текст обрезан до ${entry.chars} символов (из ${entry.truncated_from}) перед embedding'ом.`
+        : "";
+
       const HEADER =
-        `📝 <b>Как Gemini переписал запрос</b>\n` +
-        `<i>Ваш запрос → синтетический «эталонный» текст, ` +
-        `который ищется в базе судебных актов.</i>\n\n` +
+        `📝 <b>HyDE запрос</b>\n` +
+        `<i>Ваш запрос → синтетический «эталонный» фрагмент акта, который ищется в базе.</i>\n\n` +
+        `<b>Модель:</b> ${modelLine}\n` +
+        `<b>Токены:</b> ${tokensLine}\n` +
+        `<b>Время:</b> ${elapsedSec}\n` +
+        `<b>Длина:</b> ${entry.chars} симв.\n` +
+        `<b>Finish:</b> ${htmlEscape(entry.finish || "—")}` +
+        truncLine + `\n\n` +
         `<b>Исходный запрос:</b>\n<code>${htmlEscape(entry.query || "")}</code>\n\n` +
-        `<b>Переписанный (HyDE, model=${htmlEscape(entry.model || "?")}, ${entry.chars} симв.):</b>\n`;
-      // HyDE-текст обёрнут в <pre>, чтобы переносы строк и кавычки
-      // отрисовались как есть, без Markdown-интерпретации.
+        `<b>Переписанный текст:</b>\n`;
+      // HyDE-текст в <pre> — переносы строк/кавычки рендерятся как есть.
       const body = `<pre>${htmlEscape(entry.text)}</pre>`;
       const full = HEADER + body;
       await sendMessage(chatId, full, {
         parse_mode: "HTML",
         reply_markup: { inline_keyboard: [[{ text: "🏠 Меню", callback_data: "menu" }]] },
       });
-      // Закрываем «спиннер» на кнопке.
       await tg("answerCallbackQuery", { callback_query_id: cb.id });
       return;
     }

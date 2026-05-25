@@ -339,7 +339,8 @@ export async function generateHypotheticalAct(rawQuery, opts = {}) {
 
   return {
     text,
-    model,
+    model,                                    // что запросили (RAS_HYDE_MODEL)
+    model_version: response?.modelVersion ?? null, // что фактически ответил API
     elapsed_ms: elapsedMs,
     usage,
     finish_reason: finishReason,

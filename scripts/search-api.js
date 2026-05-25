@@ -411,18 +411,31 @@ async function handleSearch(req, res, url) {
   // На любой сбой (Gemini timeout/safety-block/прокси упал) — fallback на
   // оригинал, поиск НЕ должен падать из-за внешнего LLM. Реранкер всё равно
   // видит оригинальный query.
-  let hydeText      = null;
-  let hydeModel     = null;
-  let hydeElapsedMs = null;
-  let hydeError     = null;
+  let hydeText        = null;
+  let hydeModel       = null;
+  let hydeModelVer    = null;
+  let hydeUsage       = null;
+  let hydeFinish      = null;
+  let hydeElapsedMs   = null;
+  let hydeError       = null;
   if (HYDE_ENABLED && process.env.GEMINI_API_KEY) {
     const tHyde = Date.now();
     try {
       const r = await generateHypotheticalAct(trimmed);
       hydeText      = r.text;
       hydeModel     = r.model;
+      hydeModelVer  = r.model_version;
+      hydeUsage     = r.usage;
+      hydeFinish    = r.finish_reason;
       hydeElapsedMs = Date.now() - tHyde;
-      log("INFO", "search/hyde-done", { elapsed_ms: hydeElapsedMs, chars: hydeText.length, model: hydeModel });
+      log("INFO", "search/hyde-done", {
+        elapsed_ms: hydeElapsedMs,
+        chars: hydeText.length,
+        model: hydeModel,
+        model_version: hydeModelVer,
+        usage: hydeUsage,
+        finish: hydeFinish,
+      });
     } catch (e) {
       hydeError     = e?.message ?? String(e);
       hydeElapsedMs = Date.now() - tHyde;
@@ -472,14 +485,17 @@ async function handleSearch(req, res, url) {
     q_len: trimmed.length,
     topN,
     returned: compact.length,
-    elapsed_ms: elapsed,
-    hyde_used: hydeText !== null,
-    hyde_chars: hydeText?.length ?? 0,
-    hyde_ms: hydeElapsedMs,
-    hyde_error: hydeError,
+    total_ms:     elapsed,
+    hyde_ms:      hydeElapsedMs,
     retrieval_ms: result.timing?.retrieval_ms,
     hydrate_ms:   result.timing?.hydrate_ms,
     rerank_ms:    result.timing?.rerank_ms,
+    hyde_used:    hydeText !== null,
+    hyde_chars:   hydeText?.length ?? 0,
+    hyde_model:   hydeModel,
+    hyde_model_version: hydeModelVer,
+    hyde_total_tokens:  hydeUsage?.total_tokens ?? null,
+    hyde_error:   hydeError,
   });
 
   sendJson(res, 200, {
@@ -489,12 +505,16 @@ async function handleSearch(req, res, url) {
     elapsed_ms: elapsed,
     timing:     result.timing ?? null,
     hyde: {
-      used:       hydeText !== null,
-      model:      hydeModel,
-      chars:      hydeText?.length ?? 0,
-      elapsed_ms: hydeElapsedMs,
-      error:      hydeError,
-      text:       hydeText, // полный текст для дебага/UI; null если HyDE упал/выключен
+      used:          hydeText !== null,
+      model:         hydeModel,              // что запросили
+      model_version: hydeModelVer,           // что вернул API (gemini-3.5-flash → gemini-3.5-flash-001)
+      chars:         hydeText?.length ?? 0,
+      elapsed_ms:    hydeElapsedMs,
+      usage:         hydeUsage,              // prompt/candidates/total tokens
+      finish_reason: hydeFinish,
+      truncated_from: hydeTruncatedFrom || null,
+      error:         hydeError,
+      text:          hydeText,               // полный текст для UI-кнопки и дебага
     },
     rerank: {
       model:         result.rerank?.model ?? null,
