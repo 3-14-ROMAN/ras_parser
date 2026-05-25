@@ -78,6 +78,7 @@ import { searchAndRerank } from "../embed/retrieval.js";
 import { closePool, getPool } from "../db/pgClient.js";
 import { qdrant, COLLECTION as QDRANT_COLLECTION } from "../embed/clients.js";
 import { generateHypotheticalAct } from "../llm/hydeGenerator.js";
+import { logSearch, closeLogsPool, isLogsPgConfigured } from "../db/pgLogsClient.js";
 
 const HOST = process.env.RAS_SEARCH_API_HOST || "127.0.0.1";
 const PORT = Number(process.env.RAS_SEARCH_API_PORT || 8091);
@@ -380,6 +381,11 @@ async function handleSearch(req, res, url) {
   let useSummary    = false; // саммари ещё не реализовано, но параметр уже принимаем
   let hydeModelOpt  = null;  // переопределение RAS_HYDE_MODEL для одного запроса
   let summaryModelOpt = null;
+  // Identity клиента — для логов (бот шлёт; curl напрямую может не слать).
+  let clientChatId   = null;
+  let clientUserId   = null;
+  let clientUsername = null;
+  let rawRequest     = null;
 
   if (req.method === "POST") {
     let body;
@@ -395,6 +401,10 @@ async function handleSearch(req, res, url) {
     if (body.use_summary    !== undefined) useSummary  = !!body.use_summary;
     if (typeof body.hyde_model    === "string" && body.hyde_model.trim())    hydeModelOpt    = body.hyde_model.trim();
     if (typeof body.summary_model === "string" && body.summary_model.trim()) summaryModelOpt = body.summary_model.trim();
+    if (Number.isFinite(Number(body.chat_id)))  clientChatId   = Number(body.chat_id);
+    if (Number.isFinite(Number(body.user_id)))  clientUserId   = Number(body.user_id);
+    if (typeof body.username === "string")      clientUsername = body.username.slice(0, 64);
+    rawRequest = body;
   } else if (req.method === "GET") {
     query = url.searchParams.get("q") || url.searchParams.get("query");
     if (url.searchParams.has("topN")) topN = clampTopN(url.searchParams.get("topN"));
@@ -532,7 +542,7 @@ async function handleSearch(req, res, url) {
     top_act_ids:  compact.map((c) => c.act_id),
   });
 
-  sendJson(res, 200, {
+  const responseBody = {
     ok:         true,
     search_id:  searchId,
     query:      trimmed,
@@ -557,7 +567,58 @@ async function handleSearch(req, res, url) {
       skipped_empty: result.rerank?.skipped_empty ?? 0,
     },
     results: compact,
-  });
+  };
+  sendJson(res, 200, responseBody);
+
+  // Fire-and-forget логирование в ras_pg_logs (отдельный Postgres на HDD).
+  // Идёт ПОСЛЕ ответа клиенту, чтобы не задерживать UX. Все ошибки пула
+  // ловятся внутри logSearch и уходят только в stderr — пайплайн целостность
+  // от логирования не зависит.
+  try {
+    const thinking = (hydeUsage?.total_tokens != null
+                      && hydeUsage?.prompt_tokens != null
+                      && hydeUsage?.candidates_tokens != null)
+      ? hydeUsage.total_tokens - hydeUsage.prompt_tokens - hydeUsage.candidates_tokens
+      : null;
+    void logSearch({
+      search_id:      searchId,
+      ts:             new Date(),
+      chat_id:        clientChatId,
+      user_id:        clientUserId,
+      username:       clientUsername,
+      query:          trimmed,
+      query_chars:    trimmed.length,
+      top_n:          topN,
+      use_hyde:       useHyde,
+      use_summary:    useSummary,
+      hyde_model_req:     hydeModelOpt    ?? (useHyde ? (process.env.RAS_HYDE_MODEL || null) : null),
+      summary_model_req:  summaryModelOpt ?? null,
+      hyde_used:      hydeText !== null,
+      hyde_text:      hydeText,
+      hyde_chars:     hydeText?.length ?? null,
+      hyde_model_actual:   hydeModelVer,
+      hyde_prompt_tokens:     hydeUsage?.prompt_tokens     ?? null,
+      hyde_candidates_tokens: hydeUsage?.candidates_tokens ?? null,
+      hyde_thinking_tokens:   thinking,
+      hyde_total_tokens:      hydeUsage?.total_tokens      ?? null,
+      hyde_finish_reason:     hydeFinish,
+      hyde_elapsed_ms:        hydeElapsedMs,
+      hyde_truncated_from:    hydeTruncatedFrom || null,
+      hyde_error:             hydeError,
+      retrieval_ms:   result.timing?.retrieval_ms ?? null,
+      hydrate_ms:     result.timing?.hydrate_ms   ?? null,
+      rerank_ms:      result.timing?.rerank_ms    ?? null,
+      total_ms:       elapsed,
+      returned_count: compact.length,
+      top_act_ids:    compact.map((c) => c.act_id),
+      results:        JSON.stringify(compact),
+      raw_request:    rawRequest ? JSON.stringify(rawRequest) : null,
+      raw_response:   JSON.stringify(responseBody),
+    });
+  } catch (e) {
+    // Не должно случиться — logSearch ловит свои ошибки сам, но на всякий.
+    log("WARN", "log_search wrap failed", { search_id: searchId, msg: e?.message ?? String(e) });
+  }
 }
 
 async function handleHyde(req, res, url) {
@@ -674,6 +735,7 @@ async function shutdown(signal) {
   if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
   server.close(() => log("INFO", "http closed"));
   try { await closePool(); } catch {}
+  try { await closeLogsPool(); } catch {}
   setTimeout(() => process.exit(0), 500).unref();
 }
 process.on("SIGINT",  () => shutdown("SIGINT"));

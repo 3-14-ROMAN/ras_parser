@@ -7,6 +7,7 @@
   "scripts": {
     "start": "bash scripts/run-parser-supervised.sh",
     "db:migrate": "docker exec -i ras_pg psql -U ras -d ras < db/schema.sql",
+    "db:migrate-logs": "docker exec -i ras_pg_logs psql -U ras_logs -d ras_logs < db/logs_schema.sql",
     "download:acts": "RAS_PDF_PARALLEL_DOWNLOADERS=auto RAS_PDF_POOL_COUNTRY_IDS=all RAS_PDF_TARGET_COUNTRY_IDS=82,100,22,15,61,72,122,147,148,152,180 RAS_PDF_BAD_COUNTRY_IDS=1,2 RAS_PDF_PREFLIGHT_GEO=1 RAS_PDF_MAX_WORKERS=0 RAS_PDF_LEASE_CLEANUP_ON_START=1 HTTP_CONCURRENCY=1 HTTP_RETRIES=1 HTTP_TIMEOUT_MS=20000 RAS_PDF_QUARANTINE_INFRA_THRESHOLD=3 RAS_PDF_QUARANTINE_451_THRESHOLD=3 RAS_PDF_QUARANTINE_WINDOW_MS=180000 RAS_PDF_QUARANTINE_MS=300000 RAS_PDF_QUARANTINE_451_MS=600000 RAS_PDF_SUPERVISOR_MAX_RESTARTS=200 RAS_PDF_STUCK_TIMEOUT_MS=1800000 RAS_PDF_STUCK_FATAL_MS=5400000 RAS_PDF_PRAVOCAPTCHA_GATE_STREAK=1 xvfb-run -a --server-args='-screen 0 1366x900x24' node --env-file=.env scripts/download-acts.js",
     "probe:geo": "xvfb-run -a --server-args='-screen 0 1366x900x24' node --env-file=.env scripts/probe-geo.js",
     "probe:ras-countries": "node --env-file=.env scripts/probe-ras-countries.js",
@@ -34,6 +35,7 @@
     "embed:rerank": "node --env-file=.env scripts/search-qdrant-rerank.js",
     "qdrant:rebuild": "node --env-file=.env scripts/qdrant-rebuild-collection.js",
     "cleanup:invalid": "node --env-file=.env scripts/cleanup-invalid-acts.js",
+    "backfill:tokens": "node --env-file=.env scripts/backfill-token-count.mjs",
     "search:api": "node --env-file=.env scripts/search-api.js",
     "telegram:bot": "node --env-file=.env scripts/telegram-bot.js"
   },

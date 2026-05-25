@@ -19,6 +19,28 @@ services:
       timeout: 3s
       retries: 10
 
+  # Отдельный Postgres только под логи поисковых запросов /search.
+  # Volume на HDD (/mnt/ubuntu_hdd) — у логов нет требования к latency,
+  # зато размер растёт, и держать их рядом с боевым acts (на NVMe) нет
+  # смысла. На дефолтном порту 5432 уже сидит ras_pg, этот слушает 5433.
+  postgres_logs:
+    image: postgres:16-alpine
+    container_name: ras_pg_logs
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_LOGS_USER:-ras_logs}
+      POSTGRES_PASSWORD: ${POSTGRES_LOGS_PASSWORD:-ras_logs}
+      POSTGRES_DB: ${POSTGRES_LOGS_DB:-ras_logs}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - /mnt/ubuntu_hdd/ras_logs_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_LOGS_USER:-ras_logs} -d ${POSTGRES_LOGS_DB:-ras_logs}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   qdrant:
     image: qdrant/qdrant:v1.18.0
     container_name: ras_qdrant

@@ -359,6 +359,10 @@ async function callSearchApi(query, opts = {}) {
   if (opts.use_summary   !== undefined) payload.use_summary   = opts.use_summary;
   if (opts.hyde_model)                  payload.hyde_model    = opts.hyde_model;
   if (opts.summary_model)               payload.summary_model = opts.summary_model;
+  // Identity — для трейсинга в ras_pg_logs.
+  if (opts.chat_id  != null) payload.chat_id  = opts.chat_id;
+  if (opts.user_id  != null) payload.user_id  = opts.user_id;
+  if (opts.username)         payload.username = opts.username;
 
   const { status, body } = await requestJson({
     url:       `${SEARCH_API_URL}/search`,
@@ -1016,6 +1020,9 @@ async function handleMessage(msg) {
       use_summary:   settings.use_summary,
       hyde_model:    settings.hyde_model,
       summary_model: settings.summary_model,
+      chat_id:       chatId,
+      user_id:       userId,
+      username:      msg.from?.username || null,
     });
     await sendSearchResults(chatId, text, apiResp);
     log("INFO", "answered", {
