@@ -72,6 +72,7 @@
 
 import http from "node:http";
 import process from "node:process";
+import crypto from "node:crypto";
 
 import { searchAndRerank } from "../embed/retrieval.js";
 import { closePool, getPool } from "../db/pgClient.js";
@@ -374,6 +375,11 @@ async function handleStats(req, res) {
 async function handleSearch(req, res, url) {
   let query = null;
   let topN = DEFAULT_TOPN;
+  // Per-request overrides поверх env-дефолта. Бот передаёт юзерские настройки.
+  let useHyde       = HYDE_ENABLED;
+  let useSummary    = false; // саммари ещё не реализовано, но параметр уже принимаем
+  let hydeModelOpt  = null;  // переопределение RAS_HYDE_MODEL для одного запроса
+  let summaryModelOpt = null;
 
   if (req.method === "POST") {
     let body;
@@ -385,9 +391,17 @@ async function handleSearch(req, res, url) {
     }
     query = typeof body.query === "string" ? body.query : null;
     if (body.topN !== undefined) topN = clampTopN(body.topN);
+    if (body.use_hyde       !== undefined) useHyde     = !!body.use_hyde;
+    if (body.use_summary    !== undefined) useSummary  = !!body.use_summary;
+    if (typeof body.hyde_model    === "string" && body.hyde_model.trim())    hydeModelOpt    = body.hyde_model.trim();
+    if (typeof body.summary_model === "string" && body.summary_model.trim()) summaryModelOpt = body.summary_model.trim();
   } else if (req.method === "GET") {
     query = url.searchParams.get("q") || url.searchParams.get("query");
     if (url.searchParams.has("topN")) topN = clampTopN(url.searchParams.get("topN"));
+    if (url.searchParams.has("use_hyde"))    useHyde    = url.searchParams.get("use_hyde") !== "0";
+    if (url.searchParams.has("use_summary")) useSummary = url.searchParams.get("use_summary") !== "0";
+    if (url.searchParams.get("hyde_model"))    hydeModelOpt    = url.searchParams.get("hyde_model");
+    if (url.searchParams.get("summary_model")) summaryModelOpt = url.searchParams.get("summary_model");
   } else {
     sendJson(res, 405, { ok: false, error: "method not allowed" });
     return;
@@ -403,8 +417,20 @@ async function handleSearch(req, res, url) {
     return;
   }
 
+  // Уникальный ID поиска: 12 hex chars (~48 бит). Прокидывается во все логи
+  // [search-api] этого запроса; клиент тоже получает его в JSON ответа.
+  const searchId = crypto.randomBytes(6).toString("hex");
   const t0 = Date.now();
-  log("INFO", "search/start", { q_len: trimmed.length, hyde_enabled: HYDE_ENABLED });
+  log("INFO", "search/start", {
+    search_id: searchId,
+    q_len: trimmed.length,
+    q: trimmed.length <= 200 ? trimmed : trimmed.slice(0, 200) + "…",
+    topN,
+    use_hyde: useHyde,
+    use_summary: useSummary,
+    hyde_model_override:    hydeModelOpt,
+    summary_model_override: summaryModelOpt,
+  });
 
   // HyDE pre-step: бытовой запрос → синтетический акт → дальше в embedding.
   // Запускается если RAS_SEARCH_HYDE_ENABLED=1 и GEMINI_API_KEY задан.
@@ -418,10 +444,10 @@ async function handleSearch(req, res, url) {
   let hydeFinish      = null;
   let hydeElapsedMs   = null;
   let hydeError       = null;
-  if (HYDE_ENABLED && process.env.GEMINI_API_KEY) {
+  if (useHyde && process.env.GEMINI_API_KEY) {
     const tHyde = Date.now();
     try {
-      const r = await generateHypotheticalAct(trimmed);
+      const r = await generateHypotheticalAct(trimmed, hydeModelOpt ? { model: hydeModelOpt } : {});
       hydeText      = r.text;
       hydeModel     = r.model;
       hydeModelVer  = r.model_version;
@@ -429,6 +455,7 @@ async function handleSearch(req, res, url) {
       hydeFinish    = r.finish_reason;
       hydeElapsedMs = Date.now() - tHyde;
       log("INFO", "search/hyde-done", {
+        search_id: searchId,
         elapsed_ms: hydeElapsedMs,
         chars: hydeText.length,
         model: hydeModel,
@@ -439,10 +466,14 @@ async function handleSearch(req, res, url) {
     } catch (e) {
       hydeError     = e?.message ?? String(e);
       hydeElapsedMs = Date.now() - tHyde;
-      log("WARN", "search/hyde-fallback", { msg: hydeError, elapsed_ms: hydeElapsedMs });
+      log("WARN", "search/hyde-fallback", { search_id: searchId, msg: hydeError, elapsed_ms: hydeElapsedMs });
     }
   } else {
-    log("INFO", "search/hyde-skipped", { enabled: HYDE_ENABLED, has_key: !!process.env.GEMINI_API_KEY });
+    log("INFO", "search/hyde-skipped", {
+      search_id: searchId,
+      use_hyde: useHyde,
+      has_key: !!process.env.GEMINI_API_KEY,
+    });
   }
 
   // Safety-truncate перед embed (защита от срыва модели на длинный текст).
@@ -482,6 +513,7 @@ async function handleSearch(req, res, url) {
   const compact = (result.rerank?.ranked ?? []).slice(0, topN).map(compactResult);
 
   log("INFO", "search", {
+    search_id: searchId,
     q_len: trimmed.length,
     topN,
     returned: compact.length,
@@ -496,10 +528,13 @@ async function handleSearch(req, res, url) {
     hyde_model_version: hydeModelVer,
     hyde_total_tokens:  hydeUsage?.total_tokens ?? null,
     hyde_error:   hydeError,
+    use_summary:  useSummary,
+    top_act_ids:  compact.map((c) => c.act_id),
   });
 
   sendJson(res, 200, {
     ok:         true,
+    search_id:  searchId,
     query:      trimmed,
     topN,
     elapsed_ms: elapsed,

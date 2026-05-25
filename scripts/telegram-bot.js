@@ -38,6 +38,8 @@ import http from "node:http";
 import process from "node:process";
 
 import { SocksProxyAgent } from "socks-proxy-agent";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 // ─── env ────────────────────────────────────────────────────────────────────
 
@@ -50,26 +52,126 @@ if (!BOT_TOKEN) {
 const PROXY_URL      = process.env.TELEGRAM_PROXY_URL || "";
 const SEARCH_API_URL = (process.env.RAS_SEARCH_API_URL || "http://127.0.0.1:8091").replace(/\/+$/, "");
 
-// TopN: дефолт 10, allowed диапазон 3..20. Per-chat override хранится
-// в chatSettings и приоритетнее ENV-дефолта.
-const TOPN_MIN = 3;
-const TOPN_MAX = 20;
+// TopN: дефолт 10, allowed диапазон 1..50.
+const TOPN_MIN = 1;
+const TOPN_MAX = 50;
 const TOPN     = Math.max(TOPN_MIN, Math.min(TOPN_MAX, Number(process.env.TG_BOT_TOPN || 10)));
 
-// per-chat настройки: { topN }. In-memory; рестарт = всем дефолт.
+// Whitelist моделей, которые показываем в подменю выбора. Полный список
+// доступных по нашему API-ключу мы видели через ai.models.list(); сюда
+// взяли только text-generation модели, актуальные на момент сборки.
+const HYDE_MODELS = [
+  { id: "gemini-3.5-flash",         label: "Gemini 3.5 Flash (GA, default, быстро)" },
+  { id: "gemini-flash-latest",      label: "Gemini Flash Latest (alias)" },
+  { id: "gemini-pro-latest",        label: "Gemini Pro Latest (alias)" },
+  { id: "gemini-3-pro-preview",     label: "Gemini 3 Pro Preview (качество)" },
+  { id: "gemini-3.1-pro-preview",   label: "Gemini 3.1 Pro Preview (последний pro)" },
+  { id: "gemini-2.5-pro",           label: "Gemini 2.5 Pro (стабильный GA)" },
+  { id: "gemini-2.5-flash",         label: "Gemini 2.5 Flash (стабильный GA, дешёво)" },
+  { id: "gemini-3.1-flash-lite",    label: "Gemini 3.1 Flash Lite (минимум)" },
+];
+function isAllowedModel(id) { return HYDE_MODELS.some((m) => m.id === id); }
+function modelLabel(id)     { return HYDE_MODELS.find((m) => m.id === id)?.label ?? id; }
+
+// per-chat настройки. Persist в parsed_data/tg_bot_settings.json — JSON
+// debounced-сохранением: на каждое изменение пишем через ~300ms тишины.
+// При старте читаем; если файла нет/битый — chatSettings пустой, юзер
+// получает env-дефолты до первого изменения.
+const SETTINGS_FILE = path.resolve(
+  process.cwd(),
+  process.env.TG_BOT_SETTINGS_FILE || "parsed_data/tg_bot_settings.json",
+);
 const chatSettings = new Map();
 
-function getChatTopN(chatId) {
-  const s = chatSettings.get(chatId);
-  return Math.max(TOPN_MIN, Math.min(TOPN_MAX, Number(s?.topN || TOPN)));
+function defaultSettings() {
+  return {
+    topN:          TOPN,
+    use_hyde:      (process.env.TG_BOT_DEFAULT_USE_HYDE    ?? "1") !== "0",
+    use_summary:   (process.env.TG_BOT_DEFAULT_USE_SUMMARY ?? "0") !== "0",
+    hyde_model:    process.env.RAS_HYDE_MODEL || "gemini-3.5-flash",
+    summary_model: process.env.RAS_SUMMARY_MODEL || "gemini-3.5-flash",
+  };
 }
 
+function getChatSettings(chatId) {
+  const def = defaultSettings();
+  const s = chatSettings.get(chatId) || {};
+  return {
+    topN:          Math.max(TOPN_MIN, Math.min(TOPN_MAX, Number(s.topN ?? def.topN))),
+    use_hyde:      typeof s.use_hyde    === "boolean" ? s.use_hyde    : def.use_hyde,
+    use_summary:   typeof s.use_summary === "boolean" ? s.use_summary : def.use_summary,
+    hyde_model:    isAllowedModel(s.hyde_model)    ? s.hyde_model    : def.hyde_model,
+    summary_model: isAllowedModel(s.summary_model) ? s.summary_model : def.summary_model,
+  };
+}
+function getChatTopN(chatId) { return getChatSettings(chatId).topN; }
+
+function updateChatSettings(chatId, patch) {
+  const cur = chatSettings.get(chatId) || {};
+  const next = { ...cur, ...patch };
+  chatSettings.set(chatId, next);
+  schedulePersistSettings();
+  return getChatSettings(chatId);
+}
 function setChatTopN(chatId, n) {
   const clamped = Math.max(TOPN_MIN, Math.min(TOPN_MAX, Number(n) || TOPN));
-  const s = chatSettings.get(chatId) || {};
-  s.topN = clamped;
-  chatSettings.set(chatId, s);
-  return clamped;
+  return updateChatSettings(chatId, { topN: clamped }).topN;
+}
+
+let _persistTimer = null;
+function schedulePersistSettings() {
+  if (_persistTimer) clearTimeout(_persistTimer);
+  _persistTimer = setTimeout(persistSettingsNow, 300);
+  _persistTimer.unref?.();
+}
+async function persistSettingsNow() {
+  _persistTimer = null;
+  const dump = {};
+  for (const [chatId, s] of chatSettings.entries()) dump[chatId] = s;
+  try {
+    await fs.mkdir(path.dirname(SETTINGS_FILE), { recursive: true });
+    const tmp = SETTINGS_FILE + ".tmp";
+    await fs.writeFile(tmp, JSON.stringify(dump, null, 2));
+    await fs.rename(tmp, SETTINGS_FILE);
+  } catch (e) {
+    process.stderr.write(`[tg-bot] WARN settings persist failed: ${e?.message ?? e}\n`);
+  }
+}
+// Pending-input для stateful flow («ввести число»). In-memory: эфемерно,
+// при рестарте бота диалоговое состояние сбрасывается, но это ОК — юзер
+// просто повторно нажмёт кнопку.
+const _pendingInput = new Map(); // chatId -> { kind, ts }
+const PENDING_INPUT_TTL_MS = 5 * 60 * 1000; // 5 минут — потом «забываем»
+function setPendingInput(chatId, payload) {
+  if (payload === null || payload === undefined) {
+    _pendingInput.delete(chatId);
+  } else {
+    _pendingInput.set(chatId, { ...payload, ts: Date.now() });
+  }
+}
+function getPendingInput(chatId) {
+  const p = _pendingInput.get(chatId);
+  if (!p) return null;
+  if (Date.now() - p.ts > PENDING_INPUT_TTL_MS) {
+    _pendingInput.delete(chatId);
+    return null;
+  }
+  return p;
+}
+function clearPendingInput(chatId) { _pendingInput.delete(chatId); }
+
+async function loadSettingsFromDisk() {
+  try {
+    const raw = await fs.readFile(SETTINGS_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    for (const [chatId, s] of Object.entries(obj || {})) {
+      if (s && typeof s === "object") chatSettings.set(Number(chatId), s);
+    }
+  } catch (e) {
+    if (e?.code !== "ENOENT") {
+      process.stderr.write(`[tg-bot] WARN settings load failed: ${e?.message ?? e}\n`);
+    }
+  }
 }
 const POLL_TIMEOUT_S    = Math.max(1, Math.min(50, Number(process.env.TG_BOT_POLL_TIMEOUT || 25)));
 const FETCH_TIMEOUT_MS  = Math.max(5000, Number(process.env.TG_BOT_FETCH_TIMEOUT_MS  || 28000));
@@ -250,11 +352,18 @@ function htmlEscape(s) {
 
 // ─── Search API ─────────────────────────────────────────────────────────────
 
-async function callSearchApi(query, topN) {
+async function callSearchApi(query, opts = {}) {
+  const payload = { query };
+  if (opts.topN          !== undefined) payload.topN          = opts.topN;
+  if (opts.use_hyde      !== undefined) payload.use_hyde      = opts.use_hyde;
+  if (opts.use_summary   !== undefined) payload.use_summary   = opts.use_summary;
+  if (opts.hyde_model)                  payload.hyde_model    = opts.hyde_model;
+  if (opts.summary_model)               payload.summary_model = opts.summary_model;
+
   const { status, body } = await requestJson({
     url:       `${SEARCH_API_URL}/search`,
     method:    "POST",
-    body:      { query, topN },
+    body:      payload,
     agent:     searchAgent,
     timeoutMs: SEARCH_TIMEOUT_MS,
   });
@@ -367,9 +476,20 @@ const INFO_TEXT =
   "5. Реранкер перечитывает тексты актов и ставит выше те, которые ближе к запросу.\n" +
   "6. Бот возвращает топ-N актов. Количество можно выбрать в меню.\n" +
   "\n" +
+  "<b>HyDE — переписывание запроса</b>\n" +
+  "Пользовательский запрос (часто бытовым языком) перед поиском пропускается через LLM Gemini: модель генерирует короткий синтетический «эталонный» фрагмент мотивировочной части акта в стиле реальных судебных решений. Этот текст и идёт в векторный поиск.\n" +
+  "\n" +
+  "Зачем: в базе акты написаны строгим канцеляритом со ссылками на ГК/АПК; запросы юзеров — нет. Прямое сравнение «бытовой текст» ↔ «судебный акт» в векторном пространстве работает плохо. HyDE подтягивает запрос в тот же «регистр», что и документы, и embedding-сходство резко растёт.\n" +
+  "\n" +
+  "Реранкер получает <b>оригинальный</b> запрос (не HyDE-текст). HyDE можно включить/выключить в «Настройки поиска».\n" +
+  "\n" +
+  "<b>Саммари (на будущее)</b>\n" +
+  "Опция в настройках. Когда будет включена — после поиска LLM прочтёт топ найденных актов и составит краткое юридическое резюме: что суды решают по такой фабуле, к каким нормам апеллируют, какие доказательства принимают. Сейчас параметр сохраняется, но эффекта не даёт — функция в разработке.\n" +
+  "\n" +
   "<b>Модели</b>\n" +
   "• embedding: <code>jinaai/jina-embeddings-v4</code>\n" +
   "• reranker: <code>jinaai/jina-reranker-v3</code>\n" +
+  "• HyDE / саммари: <code>gemini-*</code> (выбирается в настройках)\n" +
   "\n" +
   "<b>Что важно понимать</b>\n" +
   "• Это не поиск по точному совпадению слов.\n" +
@@ -402,7 +522,9 @@ const SEARCH_HELP_TEXT =
   "• добавьте редкие детали: вид товара, дефект, статья ГК, вид экспертизы\n" +
   "• не смешивайте разные споры в одном сообщении\n" +
   "\n" +
-  "Сверху будут самые близкие по смыслу акты. Количество актов меняется кнопкой 🎛 <b>Кол-во актов</b>.";
+  "Сверху будут самые близкие по смыслу акты. Параметры — в кнопке 🎛 <b>Настройки поиска</b>: количество актов в выдаче (1–50), вкл/выкл HyDE (переписывание запроса через Gemini под стиль судебных актов), вкл/выкл саммари результатов и выбор моделей.\n" +
+  "\n" +
+  "<b>Подсказка про HyDE</b>: если ваш запрос уже написан юридическим языком (со ссылками на статьи и обороты «суд установил») — HyDE можно выключить, без него поиск отработает быстрее. На бытовых формулировках HyDE обычно поднимает релевантность.";
 
 const EXAMPLES_TEXT =
   "🧩 <b>Примеры запросов</b>\n" +
@@ -469,52 +591,80 @@ function recallHydeEntry(id) {
   return _hydeCache.get(id) || null;
 }
 
-// Сборка inline-клавиатуры под результатами поиска. Если есть HyDE-текст —
-// добавляем кнопку «📝 Как Gemini переписал запрос» первой строкой.
+// Inline-клавиатура под результатами поиска. Кнопка «📝 HyDE запрос»
+// показывается только если в этом поиске реально был HyDE-текст
+// (если HyDE выключен в настройках — кнопки нет, юзер видит остальные).
 function buildResultsKeyboard(hydeId) {
   const rows = [];
+  rows.push([{ text: "🔎 Новый поиск", callback_data: "new_search" }]);
   if (hydeId) {
     rows.push([{ text: "📝 HyDE запрос", callback_data: `show_hyde:${hydeId}` }]);
   }
   rows.push(
+    [
+      { text: "🎛 Настройки поиска", callback_data: "search_settings" },
+      { text: "📊 Статус базы",      callback_data: "status" },
+    ],
     [{ text: "🏠 Меню", callback_data: "menu" }],
-    [
-      { text: "🔎 Новый поиск",  callback_data: "new_search" },
-      { text: "📊 Статус базы",  callback_data: "status" },
-    ],
-    [
-      { text: "🎛 Кол-во актов", callback_data: "top_settings" },
-      { text: "ℹ️ Инфо",         callback_data: "info" },
-    ],
   );
   return { inline_keyboard: rows };
 }
 
-const RESULTS_KEYBOARD = buildResultsKeyboard(null); // дефолт без HyDE-кнопки
+const RESULTS_KEYBOARD = buildResultsKeyboard(null);
 
-// Клавиатура выбора TopN. Cb_data set_top_N — N валидно ∈ {3,5,10,15,20}.
-const TOP_SETTINGS_KEYBOARD = {
-  inline_keyboard: [
-    [
-      { text: "3",  callback_data: "set_top_3"  },
-      { text: "5",  callback_data: "set_top_5"  },
-      { text: "10", callback_data: "set_top_10" },
-      { text: "15", callback_data: "set_top_15" },
-      { text: "20", callback_data: "set_top_20" },
-    ],
-    [
-      { text: "🏠 Меню", callback_data: "menu" },
-    ],
-  ],
-};
-
-function topSettingsText(currentN) {
+// «Настройки поиска» — главное меню. Каждая кнопка ведёт в подвью или
+// тумблит флаг. Текст-карточка содержит текущие значения.
+function searchSettingsText(chatId) {
+  const s = getChatSettings(chatId);
+  const flag = (v) => (v ? "✅ вкл" : "❌ выкл");
   return (
-    "🎛 <b>Количество актов в выдаче</b>\n" +
+    "🎛 <b>Настройки поиска</b>\n" +
     "\n" +
-    `Сейчас: <b>${currentN}</b>\n` +
+    `📊 <b>Кол-во актов в выдаче:</b> ${s.topN} <i>(1–${TOPN_MAX})</i>\n` +
+    `🤖 <b>HyDE-обработка запроса:</b> ${flag(s.use_hyde)}\n` +
+    `📋 <b>Саммари результатов:</b> ${flag(s.use_summary)} <i>(в разработке)</i>\n` +
+    `🧠 <b>Модель HyDE:</b> <code>${htmlEscape(s.hyde_model)}</code>\n` +
+    `🧠 <b>Модель саммари:</b> <code>${htmlEscape(s.summary_model)}</code>\n` +
     "\n" +
-    "Выберите, сколько актов показывать после поиска:"
+    "<i>Все настройки сохраняются для вашего чата и переживают рестарт бота.</i>"
+  );
+}
+
+function searchSettingsKeyboard(chatId) {
+  const s = getChatSettings(chatId);
+  return {
+    inline_keyboard: [
+      [{ text: `✏️ Кол-во актов: ${s.topN}`, callback_data: "ss_edit_topn" }],
+      [
+        { text: `🤖 HyDE: ${s.use_hyde ? "✅" : "❌"}`,       callback_data: "ss_toggle_hyde"    },
+        { text: `📋 Саммари: ${s.use_summary ? "✅" : "❌"}`,  callback_data: "ss_toggle_summary" },
+      ],
+      [{ text: `🧠 Модель HyDE: ${s.hyde_model}`,    callback_data: "ss_pick_hyde_model"    }],
+      [{ text: `🧠 Модель саммари: ${s.summary_model}`, callback_data: "ss_pick_summary_model" }],
+      [{ text: "🏠 Меню", callback_data: "menu" }],
+    ],
+  };
+}
+
+function modelPickKeyboard(kind, current) {
+  const prefix = kind === "hyde" ? "ss_set_hyde_model:" : "ss_set_summary_model:";
+  const rows = HYDE_MODELS.map((m) => ([
+    { text: (m.id === current ? "✅ " : "") + m.label, callback_data: prefix + m.id },
+  ]));
+  rows.push([{ text: "↩️ Назад", callback_data: "search_settings" }]);
+  return { inline_keyboard: rows };
+}
+
+function modelPickText(kind, current) {
+  const what = kind === "hyde" ? "HyDE" : "саммари";
+  return (
+    `🧠 <b>Модель ${what}</b>\n` +
+    "\n" +
+    `Сейчас: <code>${htmlEscape(current)}</code>\n` +
+    "\n" +
+    "Все модели — Gemini, доступные по нашему API-ключу. " +
+    "Pro-варианты дают лучшее качество, flash — быстрее и дешевле.\n" +
+    (kind === "summary" ? "<i>Саммари ещё не активировано, выбор сохранится на будущее.</i>" : "")
   );
 }
 
@@ -622,6 +772,7 @@ async function sendSearchResults(chatId, query, apiResp) {
         finish:        hyde.finish_reason,
         truncated_from: hyde.truncated_from,
         query,
+        search_id:     apiResp.search_id,
       })
     : null;
   const keyboard = buildResultsKeyboard(hydeId);
@@ -794,7 +945,32 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Stateful input для «Кол-во актов»: после ss_edit_topn ждём от юзера
+  // число следующим сообщением. Если приходит что-то другое — снимаем
+  // ожидание и обрабатываем как обычное сообщение.
+  const pending = getPendingInput(chatId);
+  if (pending?.kind === "topN" && !text.startsWith("/")) {
+    clearPendingInput(chatId);
+    const num = Number(text.replace(/\s+/g, ""));
+    if (!Number.isFinite(num) || !Number.isInteger(num) || num < TOPN_MIN || num > TOPN_MAX) {
+      await sendMessage(
+        chatId,
+        `❌ Ожидал целое число от ${TOPN_MIN} до ${TOPN_MAX}, получил: <code>${htmlEscape(text.slice(0,40))}</code>\n\nНастройка не изменилась.`,
+        { parse_mode: "HTML", reply_markup: searchSettingsKeyboard(chatId) },
+      );
+      return;
+    }
+    const n = setChatTopN(chatId, num);
+    log("INFO", "topN set (input)", { user_id: userId, chat_id: chatId, topN: n });
+    await sendMessage(chatId, searchSettingsText(chatId), {
+      parse_mode: "HTML",
+      reply_markup: searchSettingsKeyboard(chatId),
+    });
+    return;
+  }
+
   if (matchesCommand(text, "start") || matchesCommand(text, "menu") || matchesCommand(text, "help")) {
+    clearPendingInput(chatId);
     await sendMenu(chatId);
     return;
   }
@@ -820,17 +996,32 @@ async function handleMessage(msg) {
     return;
   }
 
-  const topN = getChatTopN(chatId);
-  log("INFO", "query", { user_id: userId, chat_id: chatId, q_len: text.length, topN });
+  const settings = getChatSettings(chatId);
+  log("INFO", "query", {
+    user_id: userId,
+    chat_id: chatId,
+    q_len: text.length,
+    topN: settings.topN,
+    use_hyde: settings.use_hyde,
+    use_summary: settings.use_summary,
+    hyde_model: settings.hyde_model,
+  });
 
   try {
     // Лёгкий «typing» — Telegram держит ~5 секунд.
     tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
-    const apiResp = await callSearchApi(text, topN);
+    const apiResp = await callSearchApi(text, {
+      topN:          settings.topN,
+      use_hyde:      settings.use_hyde,
+      use_summary:   settings.use_summary,
+      hyde_model:    settings.hyde_model,
+      summary_model: settings.summary_model,
+    });
     await sendSearchResults(chatId, text, apiResp);
     log("INFO", "answered", {
       user_id: userId,
       chat_id: chatId,
+      search_id: apiResp.search_id,
       results: apiResp.results?.length ?? 0,
       elapsed_ms: apiResp.elapsed_ms,
     });
@@ -873,13 +1064,30 @@ async function handleCallback(cb) {
   log("INFO", "callback", { user_id: userId, chat_id: chatId, data });
 
   try {
-    // set_top_<N> — отдельная семья callback'ов: меняем число и
-    // редактируем сообщение, оставляя пользователя в TopN-вью.
+    // set_top_<N> — старая семья кнопок (3/5/10/15/20). Оставлена для
+    // обратной совместимости со старыми keyboard'ами в истории сообщений
+    // (новый UI использует stateful-ввод числа через ss_edit_topn).
     const m = /^set_top_(\d+)$/.exec(data);
     if (m) {
       const n = setChatTopN(chatId, Number(m[1]));
       log("INFO", "topN set", { user_id: userId, chat_id: chatId, topN: n });
-      await editToCallback(cb, topSettingsText(n), TOP_SETTINGS_KEYBOARD);
+      await editToCallback(cb, searchSettingsText(chatId), searchSettingsKeyboard(chatId));
+      return;
+    }
+
+    // ss_set_hyde_model:<id> / ss_set_summary_model:<id> — выбор модели.
+    const mm = /^ss_set_(hyde|summary)_model:(.+)$/.exec(data);
+    if (mm) {
+      const kind = mm[1];
+      const modelId = mm[2];
+      if (!isAllowedModel(modelId)) {
+        await tg("answerCallbackQuery", { callback_query_id: cb.id, text: "Неизвестная модель", show_alert: true });
+        return;
+      }
+      const patch = kind === "hyde" ? { hyde_model: modelId } : { summary_model: modelId };
+      updateChatSettings(chatId, patch);
+      log("INFO", "model set", { user_id: userId, chat_id: chatId, kind, model: modelId });
+      await editToCallback(cb, searchSettingsText(chatId), searchSettingsKeyboard(chatId));
       return;
     }
 
@@ -923,6 +1131,7 @@ async function handleCallback(cb) {
       const HEADER =
         `📝 <b>HyDE запрос</b>\n` +
         `<i>Ваш запрос → синтетический «эталонный» фрагмент акта, который ищется в базе.</i>\n\n` +
+        `<b>Search ID:</b> <code>${htmlEscape(entry.search_id || "—")}</code>\n` +
         `<b>Модель:</b> ${modelLine}\n` +
         `<b>Токены:</b> ${tokensLine}\n` +
         `<b>Время:</b> ${elapsedSec}\n` +
@@ -982,9 +1191,45 @@ async function handleCallback(cb) {
         return;
       }
       case "top_settings":
-        await editToCallback(cb, topSettingsText(getChatTopN(chatId)), TOP_SETTINGS_KEYBOARD);
+      case "search_settings":
+        await editToCallback(cb, searchSettingsText(chatId), searchSettingsKeyboard(chatId));
         return;
+      case "ss_edit_topn":
+        setPendingInput(chatId, { kind: "topN" });
+        await editToCallback(
+          cb,
+          `✏️ <b>Кол-во актов в выдаче</b>\n\nОтправьте число от <b>${TOPN_MIN}</b> до <b>${TOPN_MAX}</b> ` +
+            "следующим сообщением.\n\n" +
+            "<i>Или нажмите «Назад», чтобы оставить как было.</i>",
+          { inline_keyboard: [[{ text: "↩️ Назад", callback_data: "search_settings" }]] },
+        );
+        return;
+      case "ss_toggle_hyde": {
+        const cur = getChatSettings(chatId);
+        updateChatSettings(chatId, { use_hyde: !cur.use_hyde });
+        log("INFO", "toggle use_hyde", { user_id: userId, chat_id: chatId, value: !cur.use_hyde });
+        await editToCallback(cb, searchSettingsText(chatId), searchSettingsKeyboard(chatId));
+        return;
+      }
+      case "ss_toggle_summary": {
+        const cur = getChatSettings(chatId);
+        updateChatSettings(chatId, { use_summary: !cur.use_summary });
+        log("INFO", "toggle use_summary", { user_id: userId, chat_id: chatId, value: !cur.use_summary });
+        await editToCallback(cb, searchSettingsText(chatId), searchSettingsKeyboard(chatId));
+        return;
+      }
+      case "ss_pick_hyde_model": {
+        const cur = getChatSettings(chatId);
+        await editToCallback(cb, modelPickText("hyde", cur.hyde_model), modelPickKeyboard("hyde", cur.hyde_model));
+        return;
+      }
+      case "ss_pick_summary_model": {
+        const cur = getChatSettings(chatId);
+        await editToCallback(cb, modelPickText("summary", cur.summary_model), modelPickKeyboard("summary", cur.summary_model));
+        return;
+      }
       case "new_search":
+        setPendingInput(chatId, null);
         await editToCallback(cb, "🔎 Отправьте новый запрос текстом.", MAIN_KEYBOARD);
         return;
       default:
@@ -1024,8 +1269,9 @@ async function registerBotCommands() {
 }
 
 async function pollLoop() {
-  // На старте — getMe, чтобы убедиться что токен живой и прокси работает.
-  // Имя бота в логах НЕ пишет токен.
+  // На старте — загружаем persistent per-chat settings и проверяем токен/прокси.
+  await loadSettingsFromDisk();
+  log("INFO", "settings loaded", { file: SETTINGS_FILE, chats: chatSettings.size });
   try {
     const me = await tg("getMe", {});
     log("INFO", "ready", {
