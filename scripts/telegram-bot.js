@@ -51,6 +51,7 @@ if (!BOT_TOKEN) {
 
 const PROXY_URL      = process.env.TELEGRAM_PROXY_URL || "";
 const SEARCH_API_URL = (process.env.RAS_SEARCH_API_URL || "http://127.0.0.1:8091").replace(/\/+$/, "");
+const WHISPER_API_URL = (process.env.RAS_WHISPER_API_URL || "http://127.0.0.1:8001").replace(/\/+$/, "");
 
 // TopN: дефолт 10, allowed диапазон 1..50.
 const TOPN_MIN = 1;
@@ -214,7 +215,8 @@ function makeTgAgent() {
 let tgAgent = makeTgAgent();
 
 // search api — локалхост, прокси не нужен.
-const searchAgent = new http.Agent({ keepAlive: true });
+const searchAgent  = new http.Agent({ keepAlive: true });
+const whisperAgent = new http.Agent({ keepAlive: true });
 
 // ─── низкоуровневые http helpers ────────────────────────────────────────────
 
@@ -398,6 +400,54 @@ async function callStatsApi() {
   return body;
 }
 
+// ─── voice → text (Whisper STT) ─────────────────────────────────────────────
+
+/**
+ * Скачивает файл из Telegram через getFile API.
+ * Возвращает Buffer с raw bytes.
+ */
+async function downloadTgFile(fileId) {
+  const fileInfo = await tg("getFile", { file_id: fileId });
+  const filePath = fileInfo.file_path;
+  if (!filePath) throw new Error("getFile returned no file_path");
+  const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+  return new Promise((resolve, reject) => {
+    const u = new URL(fileUrl);
+    const lib = u.protocol === "https:" ? https : http;
+    const req = lib.get({ hostname: u.hostname, port: u.port || 443, path: u.pathname, agent: tgAgent }, (res) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`download file status=${res.statusCode}`));
+      }
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.setTimeout(FETCH_TIMEOUT_MS, () => req.destroy(new Error("download timeout")));
+  });
+}
+
+/**
+ * POST audio bytes (base64) → whisper worker → text.
+ */
+async function callTranscribeApi(audioBuffer) {
+  const audioBase64 = audioBuffer.toString("base64");
+  const { status, body } = await requestJson({
+    url:       `${WHISPER_API_URL}/transcribe`,
+    method:    "POST",
+    body:      { audio_base64: audioBase64 },
+    agent:     whisperAgent,
+    timeoutMs: 30000,
+  });
+  if (status !== 200 || !body?.text) {
+    const detail = body?.detail || body?.error || `status=${status}`;
+    throw new Error(`transcribe failed: ${detail}`);
+  }
+  return body; // { text, language, duration_sec, elapsed_ms, generate_ms }
+}
+
 // ─── форматирование ─────────────────────────────────────────────────────────
 
 const TEST_QUERY =
@@ -417,7 +467,8 @@ const MENU_TEXT_TOP =
   "• экспертизы, УПД, ТОРГ-12, переписка, претензии\n" +
   "\n" +
   "<b>Как пользоваться:</b>\n" +
-  "Опишите ситуацию обычным текстом. Чем больше фактов, тем точнее подборка. " +
+  "Опишите ситуацию обычным текстом или отправьте голосовое сообщение. " +
+  "Чем больше фактов, тем точнее подборка. " +
   "Первый акт в ответе бота более релевантен вашему вопросу, последний менее.\n" +
   "\n" +
   "Подробнее о системе вы можете узнать в поле ИНФО.";
@@ -938,8 +989,10 @@ async function handleMessage(msg) {
   const chatId = msg.chat?.id;
   const userId = msg.from?.id;
   const text   = (msg.text || "").trim();
+  const voice  = msg.voice || msg.audio; // voice = ogg/opus, audio = mp3/etc
 
-  if (!chatId || !userId || !text) return;
+  if (!chatId || !userId) return;
+  if (!text && !voice) return;
 
   if (!isAllowed(userId)) {
     log("WARN", "denied", { user_id: userId, chat_id: chatId });
@@ -973,6 +1026,14 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Voice confirm pending: юзер отправил текст (коррекция) или голосовуху
+  // (перезапись). Чистим pending — текст уйдёт в поиск ниже, голосовуха
+  // перетранскрибируется в voice handler.
+  if (pending?.kind === "voiceConfirm" && !text.startsWith("/")) {
+    clearPendingInput(chatId);
+    // fall through
+  }
+
   if (matchesCommand(text, "start") || matchesCommand(text, "menu") || matchesCommand(text, "help")) {
     clearPendingInput(chatId);
     await sendMenu(chatId);
@@ -997,6 +1058,69 @@ async function handleMessage(msg) {
 
   if (text.startsWith("/")) {
     await sendMessage(chatId, "Неизвестная команда.", { reply_markup: MAIN_KEYBOARD });
+    return;
+  }
+
+  // ── Voice message → Whisper STT → подтверждение ──────────────────────────
+  if (voice) {
+    log("INFO", "voice", {
+      user_id: userId, chat_id: chatId,
+      duration: voice.duration, file_size: voice.file_size,
+    });
+    try {
+      tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+
+      const audioBuffer = await downloadTgFile(voice.file_id);
+      const result = await callTranscribeApi(audioBuffer);
+
+      log("INFO", "transcribed", {
+        user_id: userId, chat_id: chatId,
+        text_len: result.text.length,
+        duration_sec: result.duration_sec,
+        elapsed_ms: result.elapsed_ms,
+      });
+
+      if (!result.text || result.text.trim().length < 2) {
+        await sendMessage(
+          chatId,
+          "🎤 Не удалось распознать речь. Попробуйте ещё раз или введите запрос текстом.",
+          { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
+        );
+        return;
+      }
+
+      const transcribed = result.text.trim();
+      setPendingInput(chatId, { kind: "voiceConfirm", text: transcribed });
+
+      await sendMessage(
+        chatId,
+        `🎤 <b>Распознанный текст:</b>\n` +
+          `<code>${htmlEscape(transcribed)}</code>\n\n` +
+          `<i>⏱ ${result.duration_sec}с аудио → ${(result.elapsed_ms / 1000).toFixed(1)}с распознавание</i>\n\n` +
+          `Нажмите <b>✅ Искать</b> или отправьте исправленный текст / новое голосовое.`,
+        {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "✅ Искать", callback_data: "voice_confirm" }],
+              [{ text: "❌ Отмена", callback_data: "voice_cancel" }],
+            ],
+          },
+        },
+      );
+    } catch (e) {
+      log("ERROR", "voice failed", {
+        user_id: userId, chat_id: chatId, msg: e?.message ?? String(e),
+      });
+      try {
+        await sendMessage(
+          chatId,
+          "🎤 Ошибка распознавания: " + htmlEscape(e?.message ?? "unknown") +
+            "\nПопробуйте ещё раз или введите запрос текстом.",
+          { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
+        );
+      } catch {}
+    }
     return;
   }
 
@@ -1237,7 +1361,73 @@ async function handleCallback(cb) {
       }
       case "new_search":
         setPendingInput(chatId, null);
-        await editToCallback(cb, "🔎 Отправьте новый запрос текстом.", MAIN_KEYBOARD);
+        await editToCallback(cb, "🔎 Отправьте новый запрос текстом или голосовое.", MAIN_KEYBOARD);
+        return;
+      case "voice_confirm": {
+        const p = getPendingInput(chatId);
+        if (!p || p.kind !== "voiceConfirm" || !p.text) {
+          await editToCallback(
+            cb,
+            "⏳ Запрос устарел. Отправьте голосовое или текст заново.",
+            MAIN_KEYBOARD,
+          );
+          return;
+        }
+        const queryText = p.text;
+        clearPendingInput(chatId);
+
+        // Обновляем сообщение-подтверждение → «ищу…»
+        await editToCallback(
+          cb,
+          `🔎 Ищу: <code>${htmlEscape(queryText)}</code>`,
+          null,
+        );
+
+        const settings = getChatSettings(chatId);
+        log("INFO", "voice search", {
+          user_id: userId, chat_id: chatId,
+          q_len: queryText.length,
+          topN: settings.topN,
+          use_hyde: settings.use_hyde,
+        });
+
+        try {
+          tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+          const apiResp = await callSearchApi(queryText, {
+            topN:          settings.topN,
+            use_hyde:      settings.use_hyde,
+            use_summary:   settings.use_summary,
+            hyde_model:    settings.hyde_model,
+            summary_model: settings.summary_model,
+            chat_id:       chatId,
+            user_id:       userId,
+            username:      cb.from?.username || null,
+          });
+          await sendSearchResults(chatId, queryText, apiResp);
+          log("INFO", "voice answered", {
+            user_id: userId, chat_id: chatId,
+            search_id: apiResp.search_id,
+            results: apiResp.results?.length ?? 0,
+            elapsed_ms: apiResp.elapsed_ms,
+          });
+        } catch (e) {
+          log("ERROR", "voice search failed", {
+            user_id: userId, chat_id: chatId, msg: e?.message ?? String(e),
+          });
+          try {
+            await sendMessage(
+              chatId,
+              "Ошибка поиска: " + htmlEscape(e?.message ?? "unknown") +
+                "\nПопробуйте ещё раз.",
+              { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
+            );
+          } catch {}
+        }
+        return;
+      }
+      case "voice_cancel":
+        clearPendingInput(chatId);
+        await editToCallback(cb, "❌ Голосовой запрос отменён.", MAIN_KEYBOARD);
         return;
       default:
         log("WARN", "unknown callback_data", { data });
