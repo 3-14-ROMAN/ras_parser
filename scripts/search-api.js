@@ -72,57 +72,28 @@
 
 import http from "node:http";
 import process from "node:process";
-import crypto from "node:crypto";
 
-import { searchAndRerank } from "../embed/retrieval.js";
 import { closePool, getPool } from "../db/pgClient.js";
 import { qdrant, COLLECTION as QDRANT_COLLECTION } from "../embed/clients.js";
 import { generateHypotheticalAct } from "../llm/hydeGenerator.js";
 import { logSearch, closeLogsPool, isLogsPgConfigured } from "../db/pgLogsClient.js";
+import {
+  runSearchPipeline,
+  clampTopN,
+  DEFAULT_TOPN,
+  MAX_TOPN,
+  HYDE_ENABLED,
+  RRF_TOPK_FOR_RERANK,
+  BRANCH_LIMIT,
+  GROUP_SIZE,
+  RRF_K,
+  MAX_CHARS,
+} from "./searchPipeline.js";
+import { handleDoczillaRequest, doczillaStartupRecovery, doczillaStartupChecks } from "./doczilla-facade.js";
 
 const HOST = process.env.RAS_SEARCH_API_HOST || "127.0.0.1";
 const PORT = Number(process.env.RAS_SEARCH_API_PORT || 8091);
-
-const DEFAULT_TOPN = Number(process.env.RAS_SEARCH_API_DEFAULT_TOPN || 5);
-const MAX_TOPN     = Number(process.env.RAS_SEARCH_API_MAX_TOPN     || 20);
-
-const RRF_TOPK_FOR_RERANK = Number(process.env.RAS_RRF_TOPK_FOR_RERANK ?? 50);
-const BRANCH_LIMIT        = Number(process.env.RAS_RRF_BRANCH_LIMIT    ?? 100);
-const GROUP_SIZE          = Number(process.env.RAS_RRF_GROUP_SIZE      ?? 3);
-const RRF_K               = Number(process.env.RAS_RRF_K               ?? 60);
-const CHUNK_WINDOW        = Number(process.env.RAS_RERANK_CHUNK_WINDOW ?? 1);
-
-// HyDE pre-step в /search: дефолт ON, если есть GEMINI_API_KEY. Поставь
-// RAS_SEARCH_HYDE_ENABLED=0 чтобы выключить (тогда /search ходит на
-// embedding с original query, как раньше).
-const HYDE_ENABLED = (process.env.RAS_SEARCH_HYDE_ENABLED ?? "1") !== "0";
-// Safety-cap на длину HyDE-текста перед передачей в эмбеддер: длинный
-// текст квадратично замедляет multivector ColBERT-ветку Qdrant
-// (наш корпус 84К актов, на 200+ query-токенах поиск шёл ~60s).
-// 600 символов ≈ 150-180 токенов — компромисс между стилистикой и скоростью.
-const HYDE_MAX_CHARS_FOR_EMBED = Number(process.env.RAS_HYDE_MAX_EMBED_CHARS ?? 1200);
-
-const RERANK_MAX_DOC_LENGTH = process.env.RAS_RERANK_MAX_DOC_LENGTH
-  ? Number(process.env.RAS_RERANK_MAX_DOC_LENGTH)
-  : null;
-const RERANK_MAX_QUERY_LENGTH = process.env.RAS_RERANK_MAX_QUERY_LENGTH
-  ? Number(process.env.RAS_RERANK_MAX_QUERY_LENGTH)
-  : null;
-
-const MAX_CHARS = (() => {
-  const explicit = process.env.RAS_RERANK_MAX_CHARS;
-  if (explicit !== undefined && explicit !== "") return Number(explicit);
-  if (
-    RERANK_MAX_DOC_LENGTH !== null &&
-    Number.isFinite(RERANK_MAX_DOC_LENGTH) &&
-    RERANK_MAX_DOC_LENGTH <= 0
-  ) {
-    return 0;
-  }
-  return 12000;
-})();
-
-const SNIPPET_CHARS = Number(process.env.RAS_SEARCH_API_SNIPPET_CHARS || 280);
+// DEFAULT_TOPN/MAX_TOPN/RRF_*/HYDE_* — все приехали из ./searchPipeline.js
 
 // Stats: background refresh, /stats отвечает мгновенно из кэша.
 const STATS_REFRESH_MS = Number(process.env.RAS_STATS_REFRESH_MS || 300_000);
@@ -151,49 +122,6 @@ function sendJson(res, status, body) {
     "cache-control": "no-store",
   });
   res.end(payload);
-}
-
-function makeSnippet(text, n) {
-  if (!text) return "";
-  const t = String(text).replace(/\s+/g, " ").trim();
-  if (n <= 0) return "";
-  return t.length > n ? `${t.slice(0, n)}…` : t;
-}
-
-function toDateString(d) {
-  if (!d) return null;
-  if (typeof d === "string") return d.slice(0, 10);
-  if (d instanceof Date) return d.toISOString().slice(0, 10);
-  return null;
-}
-
-function compactResult(r) {
-  const meta = r.meta ?? {};
-  return {
-    act_id:              r.act_id,
-    case_id:             meta.case_id ?? null,
-    case_number:         meta.case_number ?? null,
-    court:               meta.court ?? null,
-    registration_date:   toDateString(meta.registration_date),
-    type_name:           meta.type_name ?? null,
-    true_instance_level: meta.true_instance_level ?? null,
-    verdict_keep:        meta.verdict_keep ?? null,
-    verdict_action:      meta.verdict_action ?? null,
-    pdf_link:            meta.pdf_link ?? null,
-    rerank_score:        r.rerank_score ?? null,
-    rerank_rank:         r.rerank_rank ?? null,
-    rrf_score:           r.rrf_score ?? null,
-    rrf_rank:            r.rrf_rank ?? null,
-    snippet:             makeSnippet(r.text, SNIPPET_CHARS),
-    text_chars:          r.text_chars ?? 0,
-    kind:                r.kind ?? null,
-  };
-}
-
-function clampTopN(raw) {
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TOPN;
-  return Math.max(1, Math.min(MAX_TOPN, Math.floor(n)));
 }
 
 async function readJsonBody(req, limitBytes = 64 * 1024) {
@@ -373,15 +301,21 @@ async function handleStats(req, res) {
   });
 }
 
-async function handleSearch(req, res, url) {
+// Парсит входные параметры из POST body / GET query string в единый объект
+// PipelineParams. Возвращает { ok: true, params } или { ok: false, status, error }.
+// Используется обоими эндпоинтами (/search и /search/stream), чтобы поведение
+// валидации было одинаковое.
+async function parseSearchParams(req, url) {
   let query = null;
   let topN = DEFAULT_TOPN;
-  // Per-request overrides поверх env-дефолта. Бот передаёт юзерские настройки.
   let useHyde       = HYDE_ENABLED;
-  let useSummary    = false; // саммари ещё не реализовано, но параметр уже принимаем
-  let hydeModelOpt  = null;  // переопределение RAS_HYDE_MODEL для одного запроса
+  let useSummary    = false;
+  let hydeModelOpt  = null;
   let summaryModelOpt = null;
-  // Identity клиента — для логов (бот шлёт; curl напрямую может не слать).
+  // null = берём весь topN под summary; число = ограничение «сколько актов
+  // в выдаче скармливать grounding-модели». Клампится к [1; topN] перед
+  // использованием в pipeline.
+  let summaryTopN   = null;
   let clientChatId   = null;
   let clientUserId   = null;
   let clientUsername = null;
@@ -392,8 +326,7 @@ async function handleSearch(req, res, url) {
     try {
       body = await readJsonBody(req);
     } catch (e) {
-      sendJson(res, 400, { ok: false, error: e.message });
-      return;
+      return { ok: false, status: 400, error: e.message };
     }
     query = typeof body.query === "string" ? body.query : null;
     if (body.topN !== undefined) topN = clampTopN(body.topN);
@@ -401,6 +334,10 @@ async function handleSearch(req, res, url) {
     if (body.use_summary    !== undefined) useSummary  = !!body.use_summary;
     if (typeof body.hyde_model    === "string" && body.hyde_model.trim())    hydeModelOpt    = body.hyde_model.trim();
     if (typeof body.summary_model === "string" && body.summary_model.trim()) summaryModelOpt = body.summary_model.trim();
+    if (body.summary_top_n !== undefined && body.summary_top_n !== null) {
+      const n = Number(body.summary_top_n);
+      if (Number.isFinite(n) && n >= 1) summaryTopN = Math.floor(n);
+    }
     if (Number.isFinite(Number(body.chat_id)))  clientChatId   = Number(body.chat_id);
     if (Number.isFinite(Number(body.user_id)))  clientUserId   = Number(body.user_id);
     if (typeof body.username === "string")      clientUsername = body.username.slice(0, 64);
@@ -412,213 +349,146 @@ async function handleSearch(req, res, url) {
     if (url.searchParams.has("use_summary")) useSummary = url.searchParams.get("use_summary") !== "0";
     if (url.searchParams.get("hyde_model"))    hydeModelOpt    = url.searchParams.get("hyde_model");
     if (url.searchParams.get("summary_model")) summaryModelOpt = url.searchParams.get("summary_model");
+    if (url.searchParams.has("summary_top_n")) {
+      const n = Number(url.searchParams.get("summary_top_n"));
+      if (Number.isFinite(n) && n >= 1) summaryTopN = Math.floor(n);
+    }
   } else {
-    sendJson(res, 405, { ok: false, error: "method not allowed" });
-    return;
+    return { ok: false, status: 405, error: "method not allowed" };
   }
 
   if (!query || typeof query !== "string" || !query.trim()) {
-    sendJson(res, 400, { ok: false, error: "missing or empty 'query'" });
-    return;
+    return { ok: false, status: 400, error: "missing or empty 'query'" };
   }
   const trimmed = query.trim();
   if (trimmed.length > 2000) {
-    sendJson(res, 400, { ok: false, error: "query too long (>2000 chars)" });
+    return { ok: false, status: 400, error: "query too long (>2000 chars)" };
+  }
+
+  // Кламп summary_top_n к [1; topN] — нельзя скормить summary больше актов,
+  // чем мы вернули из поиска.
+  if (summaryTopN !== null) {
+    summaryTopN = Math.max(1, Math.min(topN, summaryTopN));
+  }
+
+  return {
+    ok: true,
+    params: {
+      trimmed, topN,
+      useHyde, useSummary, hydeModelOpt, summaryModelOpt,
+      summaryTopN,
+      clientChatId, clientUserId, clientUsername, rawRequest,
+    },
+  };
+}
+
+
+// ── HTTP-фасады поверх runSearchPipeline ─────────────────────────────────────
+
+async function handleSearch(req, res, url) {
+  const parsed = await parseSearchParams(req, url);
+  if (!parsed.ok) {
+    sendJson(res, parsed.status, { ok: false, error: parsed.error });
+    return;
+  }
+  // Abort summary если клиент HTTP закрыл соединение раньше времени.
+  const ac = new AbortController();
+  const onClose = () => ac.abort(new Error("client closed connection"));
+  req.on("close", onClose);
+  let result;
+  try {
+    result = await runSearchPipeline(parsed.params, { abortSignal: ac.signal });
+  } catch (e) {
+    req.off("close", onClose);
+    log("ERROR", "pipeline failed", { msg: e?.message ?? String(e), stage: e?.stage });
+    if (!res.headersSent) {
+      sendJson(res, 500, { ok: false, error: "search failed", detail: e?.message ?? String(e) });
+    }
+    return;
+  }
+  req.off("close", onClose);
+
+  sendJson(res, 200, result.responseBody);
+  try { void logSearch(result.logRow); }
+  catch (e) { log("WARN", "log_search wrap failed", { msg: e?.message ?? String(e) }); }
+}
+
+// SSE-эндпоинт: тот же pipeline, но прогресс утекает клиенту в реальном
+// времени через text/event-stream. Финальный event "result" несёт полный
+// /search-ответ (то же тело что у /search). После него — endmarker "done"
+// и закрытие соединения.
+//
+// Формат каждого события:
+//   event: <name>
+//   data: <json>
+//   <пустая строка>
+//
+// Keep-alive: каждые 10с пишем ': ping' (комментарий по спеке SSE) чтобы
+// прокси (nginx и т.п.) не закрыл idle-коннект на долгой саммари.
+async function handleSearchStream(req, res, url) {
+  if (req.method !== "POST" && req.method !== "GET") {
+    sendJson(res, 405, { ok: false, error: "method not allowed" });
+    return;
+  }
+  const parsed = await parseSearchParams(req, url);
+  if (!parsed.ok) {
+    sendJson(res, parsed.status, { ok: false, error: parsed.error });
     return;
   }
 
-  // Уникальный ID поиска: 12 hex chars (~48 бит). Прокидывается во все логи
-  // [search-api] этого запроса; клиент тоже получает его в JSON ответа.
-  const searchId = crypto.randomBytes(6).toString("hex");
-  const t0 = Date.now();
-  log("INFO", "search/start", {
-    search_id: searchId,
-    q_len: trimmed.length,
-    q: trimmed.length <= 200 ? trimmed : trimmed.slice(0, 200) + "…",
-    topN,
-    use_hyde: useHyde,
-    use_summary: useSummary,
-    hyde_model_override:    hydeModelOpt,
-    summary_model_override: summaryModelOpt,
+  res.writeHead(200, {
+    "content-type":      "text/event-stream; charset=utf-8",
+    "cache-control":     "no-cache, no-transform",
+    "connection":        "keep-alive",
+    "x-accel-buffering": "no",   // nginx — не буферизуй
   });
+  // initial comment — некоторые клиенты ждут первого байта чтобы открыть стрим.
+  res.write(":ok\n\n");
 
-  // HyDE pre-step: бытовой запрос → синтетический акт → дальше в embedding.
-  // Запускается если RAS_SEARCH_HYDE_ENABLED=1 и GEMINI_API_KEY задан.
-  // На любой сбой (Gemini timeout/safety-block/прокси упал) — fallback на
-  // оригинал, поиск НЕ должен падать из-за внешнего LLM. Реранкер всё равно
-  // видит оригинальный query.
-  let hydeText        = null;
-  let hydeModel       = null;
-  let hydeModelVer    = null;
-  let hydeUsage       = null;
-  let hydeFinish      = null;
-  let hydeElapsedMs   = null;
-  let hydeError       = null;
-  if (useHyde && process.env.GEMINI_API_KEY) {
-    const tHyde = Date.now();
+  const sendEvent = (name, data) => {
+    if (res.writableEnded) return;
     try {
-      const r = await generateHypotheticalAct(trimmed, hydeModelOpt ? { model: hydeModelOpt } : {});
-      hydeText      = r.text;
-      hydeModel     = r.model;
-      hydeModelVer  = r.model_version;
-      hydeUsage     = r.usage;
-      hydeFinish    = r.finish_reason;
-      hydeElapsedMs = Date.now() - tHyde;
-      log("INFO", "search/hyde-done", {
-        search_id: searchId,
-        elapsed_ms: hydeElapsedMs,
-        chars: hydeText.length,
-        model: hydeModel,
-        model_version: hydeModelVer,
-        usage: hydeUsage,
-        finish: hydeFinish,
-      });
+      res.write(`event: ${name}\n`);
+      res.write(`data: ${JSON.stringify(data ?? {})}\n\n`);
     } catch (e) {
-      hydeError     = e?.message ?? String(e);
-      hydeElapsedMs = Date.now() - tHyde;
-      log("WARN", "search/hyde-fallback", { search_id: searchId, msg: hydeError, elapsed_ms: hydeElapsedMs });
+      log("WARN", "sse write failed", { event: name, msg: e?.message ?? String(e) });
     }
-  } else {
-    log("INFO", "search/hyde-skipped", {
-      search_id: searchId,
-      use_hyde: useHyde,
-      has_key: !!process.env.GEMINI_API_KEY,
-    });
-  }
+  };
 
-  // Safety-truncate перед embed (защита от срыва модели на длинный текст).
-  let hydeTextForEmbed = hydeText;
-  let hydeTruncatedFrom = 0;
-  if (hydeText && HYDE_MAX_CHARS_FOR_EMBED > 0 && hydeText.length > HYDE_MAX_CHARS_FOR_EMBED) {
-    hydeTruncatedFrom = hydeText.length;
-    hydeTextForEmbed = hydeText.slice(0, HYDE_MAX_CHARS_FOR_EMBED);
-    log("WARN", "search/hyde-truncated", { from: hydeTruncatedFrom, to: HYDE_MAX_CHARS_FOR_EMBED });
-  }
-  log("INFO", "search/before-rerank-pipeline", {
-    hyde_text_chars: hydeTextForEmbed?.length ?? 0,
-    hyde_truncated_from: hydeTruncatedFrom || null,
-  });
+  const pingTimer = setInterval(() => {
+    if (res.writableEnded) return;
+    try { res.write(":ping\n\n"); } catch {}
+  }, 10_000);
+  pingTimer.unref?.();
+
+  const ac = new AbortController();
+  const onClose = () => ac.abort(new Error("client closed connection"));
+  req.on("close", onClose);
 
   let result;
   try {
-    result = await searchAndRerank(trimmed, {
-      perBranchLimit:        BRANCH_LIMIT,
-      groupSize:             GROUP_SIZE,
-      rrfK:                  RRF_K,
-      rrfTopK:               RRF_TOPK_FOR_RERANK,
-      topN,
-      chunkWindow:           CHUNK_WINDOW,
-      maxChars:              MAX_CHARS,
-      rerankMaxDocLength:    RERANK_MAX_DOC_LENGTH ?? undefined,
-      rerankMaxQueryLength:  RERANK_MAX_QUERY_LENGTH ?? undefined,
-      queryForEmbedding:     hydeTextForEmbed ?? undefined,
+    result = await runSearchPipeline(parsed.params, {
+      abortSignal: ac.signal,
+      onStage:     sendEvent,
     });
   } catch (e) {
-    log("ERROR", "search failed", { msg: e?.message ?? String(e) });
-    sendJson(res, 500, { ok: false, error: "search failed", detail: e?.message ?? String(e) });
+    log("ERROR", "stream pipeline failed", { msg: e?.message ?? String(e), stage: e?.stage });
+    sendEvent("error", { stage: e?.stage ?? "pipeline", message: e?.message ?? String(e) });
+    sendEvent("done", { ok: false });
+    clearInterval(pingTimer);
+    req.off("close", onClose);
+    try { res.end(); } catch {}
     return;
   }
-  const elapsed = Date.now() - t0;
+  req.off("close", onClose);
 
-  const compact = (result.rerank?.ranked ?? []).slice(0, topN).map(compactResult);
+  sendEvent("result", result.responseBody);
+  sendEvent("done", { ok: true });
+  clearInterval(pingTimer);
+  try { res.end(); } catch {}
 
-  log("INFO", "search", {
-    search_id: searchId,
-    q_len: trimmed.length,
-    topN,
-    returned: compact.length,
-    total_ms:     elapsed,
-    hyde_ms:      hydeElapsedMs,
-    retrieval_ms: result.timing?.retrieval_ms,
-    hydrate_ms:   result.timing?.hydrate_ms,
-    rerank_ms:    result.timing?.rerank_ms,
-    hyde_used:    hydeText !== null,
-    hyde_chars:   hydeText?.length ?? 0,
-    hyde_model:   hydeModel,
-    hyde_model_version: hydeModelVer,
-    hyde_total_tokens:  hydeUsage?.total_tokens ?? null,
-    hyde_error:   hydeError,
-    use_summary:  useSummary,
-    top_act_ids:  compact.map((c) => c.act_id),
-  });
-
-  const responseBody = {
-    ok:         true,
-    search_id:  searchId,
-    query:      trimmed,
-    topN,
-    elapsed_ms: elapsed,
-    timing:     result.timing ?? null,
-    hyde: {
-      used:          hydeText !== null,
-      model:         hydeModel,              // что запросили
-      model_version: hydeModelVer,           // что вернул API (gemini-3.5-flash → gemini-3.5-flash-001)
-      chars:         hydeText?.length ?? 0,
-      elapsed_ms:    hydeElapsedMs,
-      usage:         hydeUsage,              // prompt/candidates/total tokens
-      finish_reason: hydeFinish,
-      truncated_from: hydeTruncatedFrom || null,
-      error:         hydeError,
-      text:          hydeText,               // полный текст для UI-кнопки и дебага
-    },
-    rerank: {
-      model:         result.rerank?.model ?? null,
-      scored:        result.rerank?.scored ?? 0,
-      skipped_empty: result.rerank?.skipped_empty ?? 0,
-    },
-    results: compact,
-  };
-  sendJson(res, 200, responseBody);
-
-  // Fire-and-forget логирование в ras_pg_logs (отдельный Postgres на HDD).
-  // Идёт ПОСЛЕ ответа клиенту, чтобы не задерживать UX. Все ошибки пула
-  // ловятся внутри logSearch и уходят только в stderr — пайплайн целостность
-  // от логирования не зависит.
-  try {
-    const thinking = (hydeUsage?.total_tokens != null
-                      && hydeUsage?.prompt_tokens != null
-                      && hydeUsage?.candidates_tokens != null)
-      ? hydeUsage.total_tokens - hydeUsage.prompt_tokens - hydeUsage.candidates_tokens
-      : null;
-    void logSearch({
-      search_id:      searchId,
-      ts:             new Date(),
-      chat_id:        clientChatId,
-      user_id:        clientUserId,
-      username:       clientUsername,
-      query:          trimmed,
-      query_chars:    trimmed.length,
-      top_n:          topN,
-      use_hyde:       useHyde,
-      use_summary:    useSummary,
-      hyde_model_req:     hydeModelOpt    ?? (useHyde ? (process.env.RAS_HYDE_MODEL || null) : null),
-      summary_model_req:  summaryModelOpt ?? null,
-      hyde_used:      hydeText !== null,
-      hyde_text:      hydeText,
-      hyde_chars:     hydeText?.length ?? null,
-      hyde_model_actual:   hydeModelVer,
-      hyde_prompt_tokens:     hydeUsage?.prompt_tokens     ?? null,
-      hyde_candidates_tokens: hydeUsage?.candidates_tokens ?? null,
-      hyde_thinking_tokens:   thinking,
-      hyde_total_tokens:      hydeUsage?.total_tokens      ?? null,
-      hyde_finish_reason:     hydeFinish,
-      hyde_elapsed_ms:        hydeElapsedMs,
-      hyde_truncated_from:    hydeTruncatedFrom || null,
-      hyde_error:             hydeError,
-      retrieval_ms:   result.timing?.retrieval_ms ?? null,
-      hydrate_ms:     result.timing?.hydrate_ms   ?? null,
-      rerank_ms:      result.timing?.rerank_ms    ?? null,
-      total_ms:       elapsed,
-      returned_count: compact.length,
-      top_act_ids:    compact.map((c) => c.act_id),
-      results:        JSON.stringify(compact),
-      raw_request:    rawRequest ? JSON.stringify(rawRequest) : null,
-      raw_response:   JSON.stringify(responseBody),
-    });
-  } catch (e) {
-    // Не должно случиться — logSearch ловит свои ошибки сам, но на всякий.
-    log("WARN", "log_search wrap failed", { search_id: searchId, msg: e?.message ?? String(e) });
-  }
+  try { void logSearch(result.logRow); }
+  catch (e) { log("WARN", "log_search wrap failed", { msg: e?.message ?? String(e) }); }
 }
 
 async function handleHyde(req, res, url) {
@@ -703,6 +573,10 @@ const server = http.createServer(async (req, res) => {
       await handleSearch(req, res, url);
       return;
     }
+    if (url.pathname === "/search/stream") {
+      await handleSearchStream(req, res, url);
+      return;
+    }
     if (url.pathname === "/hyde") {
       await handleHyde(req, res, url);
       return;
@@ -710,6 +584,13 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/stats") {
       await handleStats(req, res);
       return;
+    }
+    // Doczilla-compatible API facade (scripts/doczilla-facade.js).
+    // Возвращает true если сам обработал запрос; false — значит pathname
+    // не /doczilla-api/*, продолжаем дефолтный 404.
+    if (url.pathname.startsWith("/doczilla-api/")) {
+      const handled = await handleDoczillaRequest(req, res, url);
+      if (handled) return;
     }
     sendJson(res, 404, { ok: false, error: "not found" });
   } catch (e) {
@@ -744,11 +625,16 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 server.listen(PORT, HOST, () => {
   log(
     "INFO",
-    `listening http://${HOST}:${PORT}  default_topN=${DEFAULT_TOPN}  max_topN=${MAX_TOPN}  ` +
+    `RAS Search — Supply API listening http://${HOST}:${PORT}  default_topN=${DEFAULT_TOPN}  max_topN=${MAX_TOPN}  ` +
     `rrf_topk=${RRF_TOPK_FOR_RERANK} branch_limit=${BRANCH_LIMIT} group_size=${GROUP_SIZE} rrf_k=${RRF_K} ` +
     `max_chars=${MAX_CHARS > 0 ? MAX_CHARS : "off"} ` +
-    `max_doc_length=${RERANK_MAX_DOC_LENGTH ?? "(default)"} ` +
     `stats_refresh_ms=${STATS_REFRESH_MS}`,
   );
   startStatsRefresher();
+  // Doczilla facade startup: warn про auth-stub если нет DOCZILLA_API_TOKEN,
+  // recovery зависших 'running'-отчётов от прошлой инкарнации процесса.
+  doczillaStartupChecks();
+  doczillaStartupRecovery().catch((e) => {
+    log("WARN", "doczilla startup recovery failed", { msg: e?.message ?? String(e) });
+  });
 });
