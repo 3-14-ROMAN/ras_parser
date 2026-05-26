@@ -73,16 +73,32 @@ const DOCZILLA_API_TOKEN = process.env.DOCZILLA_API_TOKEN || null;
 // fillDocz). Настраиваемо через env, дефолт 60 минут.
 const DOCZILLA_RUNNING_STALE_MINUTES = Number(process.env.DOCZILLA_RUNNING_STALE_MINUTES || 60);
 
-// Doczilla-методы, которые мы НЕ поддерживаем (документооборот). Все возвращают
-// единообразный 501-stub. Список из задачи + некоторые типичные синонимы.
+// Doczilla document-методы, которые мы НЕ поддерживаем (документооборот).
+// Все возвращают единообразный 501-stub. Источник — обзор Doczilla API:
+// https://help.doczilla.pro/articles/knowledge_base/api/q/api/qid/8135/qp/1
+// (методы: createDocz, fillDocz, get, getById, getByLink, set, create, move,
+// copy, recycle, restore, share, publish, createVersion, structureRead).
 // ВАЖНО: роутер проверяет UNSUPPORTED_DOCUMENT_METHODS ПОСЛЕ известных нам
 // методов (createDocz, fillDocz, getById, get, structureRead), поэтому
 // "create" в списке не перехватывает "createDocz" — это разные строки после
 // path.slice("/doczilla-api/document/".length).
+//
+// getByLink — Doczilla метод "получить docz по shared-ссылке"; у нас нет share,
+// поэтому 501. edit/publicationApply/publicationReject — нет в обзорной
+// странице, но держим как страховку, чтобы клиент получил понятный 501,
+// а не 404 если дёрнет.
 const UNSUPPORTED_DOCUMENT_METHODS = new Set([
+  "getByLink",
   "move", "copy", "recycle", "restore", "share",
   "publish", "publicationApply", "publicationReject",
   "edit", "createVersion", "set", "create",
+]);
+
+// Doczilla users-методы (отдельная семья URL'ов /doczilla-api/users/*). У RAS
+// Search — Supply нет собственной user-системы (login это compatibility stub),
+// поэтому вся группа возвращает 501. Источник — тот же обзор Doczilla.
+const UNSUPPORTED_USER_METHODS = new Set([
+  "create", "copy", "read", "update", "destroy", "export-report", "preview",
 ]);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -757,6 +773,15 @@ function handleUnsupportedDocumentMethod(req, res, method) {
     { method });
 }
 
+// 501-stub для users-методов Doczilla. RAS Search — Supply не имеет своей
+// user-системы — login это compatibility stub без persistence пользователей.
+function handleUnsupportedUserMethod(req, res, method) {
+  log("INFO", "unsupported_user_method", { method, http_method: req.method });
+  return err(res, 501, "not_implemented",
+    `${PRODUCT_NAME} has no user management system; /doczilla-api/users/* is not supported`,
+    { method });
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 
 /**
@@ -797,6 +822,19 @@ export async function handleDoczillaRequest(req, res, url) {
       }
 
       err(res, 404, "not_found", `Unknown document method "${method}"`);
+      return true;
+    }
+
+    // users/* family — у RAS Search — Supply нет user-системы → вся группа 501.
+    if (path.startsWith("/doczilla-api/users/")) {
+      const method = path.slice("/doczilla-api/users/".length);
+      if (UNSUPPORTED_USER_METHODS.has(method)) {
+        handleUnsupportedUserMethod(req, res, method);
+        return true;
+      }
+      // Неизвестный users-метод — всё равно 501 (а не 404), потому что вся
+      // семья изначально не поддерживается.
+      handleUnsupportedUserMethod(req, res, method);
       return true;
     }
 

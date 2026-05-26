@@ -229,6 +229,33 @@ HTTP_CREATE=$(curl -sS -o /tmp/doczilla_create.json -w "%{http_code}" \
 cat /tmp/doczilla_create.json | jq .
 assert_http "501" "$HTTP_CREATE" "create (unsupported)"
 
+# 11. POST .../document/getByLink → 501 (Doczilla метод для shared-link, у нас нет share)
+step "11. POST /doczilla-api/document/getByLink → ждём 501"
+HTTP_GBL=$(curl -sS -o /tmp/doczilla_gbl.json -w "%{http_code}" \
+  -X POST -H "content-type: application/json" \
+  -d '{"link":"https://example/share/x"}' \
+  "$BASE/doczilla-api/document/getByLink")
+cat /tmp/doczilla_gbl.json | jq .
+assert_http "501" "$HTTP_GBL" "getByLink (unsupported)"
+
+# 12. POST .../users/read → 501 (нет user-системы)
+step "12. POST /doczilla-api/users/read → ждём 501"
+HTTP_USR=$(curl -sS -o /tmp/doczilla_users.json -w "%{http_code}" \
+  -X POST -H "content-type: application/json" \
+  -d '{"userId":"x"}' \
+  "$BASE/doczilla-api/users/read")
+cat /tmp/doczilla_users.json | jq .
+assert_http "501" "$HTTP_USR" "users/read (unsupported)"
+
+# 13. POST .../users/unknownMethod → 501 (вся семья users 501, даже неизвестные методы)
+step "13. POST /doczilla-api/users/whatever → ждём 501 (вся семья users)"
+HTTP_USR2=$(curl -sS -o /tmp/doczilla_users2.json -w "%{http_code}" \
+  -X POST -H "content-type: application/json" \
+  -d '{}' \
+  "$BASE/doczilla-api/users/whatever")
+cat /tmp/doczilla_users2.json | jq .
+assert_http "501" "$HTTP_USR2" "users/whatever (unsupported)"
+
 # Финальный отчёт
 echo
 if [ "$FAIL_COUNT" = "0" ]; then

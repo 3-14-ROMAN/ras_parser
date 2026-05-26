@@ -52,12 +52,26 @@ Endpoint prefix: `/doczilla-api/*`. Mount внутри `scripts/search-api.js`.
 
 ## Неподдержанные методы
 
+Источник списка — обзор Doczilla API:
+`https://help.doczilla.pro/articles/knowledge_base/api/q/api/qid/8135/qp/1`.
+
+### `/doczilla-api/document/*` — 501
+
 Все возвращают **501 not_implemented** с телом
 `{ success: false, error: "not_implemented", message: "...", detail: { method } }`:
 
+- `getByLink` (нет shared-ссылок, потому что нет `share`)
 - `move`, `copy`, `recycle`, `restore`, `share`
 - `publish`, `publicationApply`, `publicationReject`
 - `edit`, `createVersion`, `set`, `create`
+
+### `/doczilla-api/users/*` — 501 (вся семья)
+
+`create`, `copy`, `read`, `update`, `destroy`, `export-report`, `preview` —
+у RAS Search — Supply нет своей user-системы (login это compatibility stub
+без persistence). Любой URL под `/doczilla-api/users/` возвращает **501**.
+
+### Прочее
 
 `get` с `format=docx` или `format=pdf` также возвращает **501**.
 
