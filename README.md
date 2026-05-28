@@ -1,175 +1,274 @@
-# RAS Supply Search — семантический поиск по арбитражным актам
+# RAS Search — Supply
 
-> ## 🤖 Живой бот: **https://t.me/ArbitrSupply_bot**
->
-> **Открой и потыкай руками прямо сейчас.** Напиши запрос на обычном языке —
-> например `взыскание неустойки за просрочку поставки товара` — и бот вернёт
-> релевантные **мотивированные акты арбитражных судов** с краткой выжимкой по
-> каждому. Можно надиктовать запрос голосом (распознаём через Whisper).
+**Демо:** https://t.me/ArbitrSupply_bot
 
----
+RAS Search — Supply это сервис для поиска судебной практики по спорам из договоров поставки. Пользователь описывает ситуацию обычным языком или голосом, система находит релевантные арбитражные акты, ранжирует результаты и формирует краткую выжимку по найденной практике.
 
-## Что это
+Пример запроса в Telegram-боте:
 
-Конвейер полного цикла, который превращает публичную выдачу
-[ras.arbitr.ru](https://ras.arbitr.ru/) (Банк решений арбитражных судов РФ) в
-**семантический поиск по судебной практике**:
+```text
+Покупатель не оплатил поставленный товар, есть подписанные УПД, нужна практика по взысканию задолженности и неустойки
+```
 
-1. **Сбор** — парсер обходит ras.arbitr.ru через мобильный прокси с ротацией
-   IP/оператора/гео, отбирает *итоговые мотивированные акты* по спорам из
-   договоров поставки (категория 3.1) и складывает метаданные в Postgres.
-2. **PDF** — отдельный пул воркеров скачивает PDF актов с kad.arbitr.ru
-   (обходя pravocaptcha и salto-challenge) и извлекает чистый текст.
-3. **Индексация** — текст актов чанкуется, эмбеддится моделью **Jina v4** и
-   складывается в **Qdrant**.
-4. **Поиск** — запрос пользователя расширяется гипотетическим актом (**HyDE**,
-   Gemini), идёт dense-retrieval в Qdrant, результаты **переранжируются**
-   (Jina reranker v3), топ актов уходит в LLM на краткую выжимку.
-5. **Выдача** — всё это отдаётся через **Telegram-бота** и **HTTP Search API**.
+## Назначение
+
+Проект предназначен для быстрого анализа судебной практики по поставочным спорам:
+
+* взыскание задолженности по договору поставки;
+* неустойка за просрочку поставки или оплаты;
+* ненадлежащее качество товара;
+* недопоставка, отказ от приёмки, возврат товара;
+* иные типовые споры между поставщиком и покупателем.
+
+Сервис помогает быстро найти релевантные судебные акты и получить первичное резюме по позиции судов.
+
+## Основные возможности
+
+* Поиск по судебной практике на естественном языке.
+* Поддержка голосовых запросов через Telegram.
+* Семантический поиск по базе арбитражных актов.
+* Ранжирование найденных документов по релевантности.
+* Краткая выжимка по топ найденных актов.
+* HTTP Search API для интеграции с внешними системами.
+* Doczilla-compatible API facade для сценария создания поисковых отчётов.
 
 ## Архитектура
 
+```text
+Telegram Bot / HTTP API
+        |
+        v
+Search API
+        |
+        +--> HyDE / query expansion
+        +--> Retrieval in Qdrant
+        +--> RRF fusion
+        +--> Jina reranker
+        +--> LLM summary
+        |
+        v
+Search results
 ```
- ┌──────────────┐   ┌───────────────┐   ┌────────────────┐   ┌─────────────┐
- │  RAS crawler │──▶│  PDF pipeline  │──▶│   indexing     │──▶│   Qdrant    │
- │  (parser.js) │   │ download+text  │   │  Jina v4 embed │   │ (vectors)   │
- └──────┬───────┘   └───────┬────────┘   └───────┬────────┘   └──────┬──────┘
-        │                   │                    │                   │
-        ▼                   ▼                    ▼                   ▼
- ┌──────────────────────────────────────────────────────────────────────┐
- │                          Postgres  (acts + RAG-state)                  │
- └──────────────────────────────────────────────────────────────────────┘
-                                    ▲
-                                    │
-          ┌─────────────────────────┴───────────────────────────┐
-          │              Search API  (HTTP, :8091)               │
-          │   HyDE → retrieval → rerank → LLM-summary            │
-          └───────────┬──────────────────────────┬──────────────┘
-                      │                           │
-            ┌─────────▼─────────┐       ┌─────────▼─────────────────┐
-            │  Telegram bot     │       │  Inference (GPU, :8000)   │
-            │ (frontend)        │       │  Jina embed v4 + rerank   │
-            │  + Whisper :8001  │       │  v3                       │
-            └───────────────────┘       └───────────────────────────┘
-```
+
+Основные компоненты:
+
+* `frontend/telegram` Telegram-бот.
+* `backend/search` Search API и поисковый pipeline.
+* `backend/embed` retrieval, rerank, индексация и работа с embeddings.
+* `backend/inference` GPU inference service для Jina embeddings и reranker.
+* `backend/db` Postgres-клиенты, схемы и репозитории.
+* `backend/pdf` обработка PDF судебных актов.
+* `backend/parser.js` сбор и обработка данных из источников.
+* `ops` эксплуатационные скрипты, supervisor wrappers, backup и status команды.
+* `docs` дополнительная техническая документация.
+* `data` runtime-данные, модели, временные файлы. Папка не коммитится.
+
+### Технологический стек
+
+* Node.js 20+
+* PostgreSQL 16
+* Qdrant
+* FastAPI
+* Jina embeddings v4
+* Jina reranker v3
+* Whisper для распознавания голосовых запросов
+* Gemini для HyDE и summary generation
+* Telegram Bot API
+* Docker Compose для инфраструктурных сервисов
+* systemd для production services
 
 ## Структура репозитория
 
-```
+```text
 .
-├── backend/                  # вся серверная логика
-│   ├── parser.js             # парсер ras.arbitr.ru (краулер) + вердикт-резолвер
-│   ├── stealthManager.js     # обёртка над Playwright (anti-bot)
-│   ├── outcome_polarity.json # справочник outcome-кодов
-│   ├── network/              # мобильный прокси: ротация IP/оператора/гео, preflight
-│   ├── db/                   # Postgres: схемы, репозитории, клиенты
-│   ├── pdf/                  # скачивание PDF (pravocaptcha/salto) + извлечение текста
-│   ├── embed/                # эмбеддинги: чанкинг, late-chunking, retrieval, rerank
-│   ├── llm/                  # HyDE, переписывание запроса, генерация выжимки/PDF
-│   ├── search/               # Search API + поисковый пайплайн + Doczilla-фасад
-│   ├── indexing/             # batch-задачи индексации в Qdrant, embed-worker
-│   ├── proxy-tools/          # CLI и пробы для управления прокси
-│   ├── tools/                # операционные/диагностические CLI
-│   └── inference/            # Python GPU-сервис: Jina embed v4 + reranker v3 + Whisper STT
+├── backend/
+│   ├── db/
+│   ├── embed/
+│   ├── inference/
+│   ├── llm/
+│   ├── network/
+│   ├── pdf/
+│   ├── search/
+│   ├── indexing/
+│   ├── proxy-tools/
+│   ├── tools/
+│   └── parser.js
 │
 ├── frontend/
-│   └── telegram/             # Telegram-бот (то, что видит пользователь)
+│   └── telegram/
 │
-├── ops/                      # эксплуатация: supervisor-обёртки, бэкапы, статус
-├── docs/                     # документация (Doczilla API, MobileProxy API)
-├── data/                     # 🚫 gitignored — все транзитные данные (модели, parsed_data, debug, tmp)
-├── docker-compose.yml        # Postgres ×2 + Qdrant + Inference
-├── .env.example              # все параметры с дефолтами
-└── CLAUDE.md                 # подробный технический контекст по парсеру/пайплайну
+├── ops/
+├── docs/
+├── data/
+├── docker-compose.yml
+├── package.json
+├── .env.example
+└── README.md
 ```
-
-> Всё тяжёлое и runtime-генерируемое (модели, виртуальные окружения, PDF,
-> логи, снапшоты) лежит вне репозитория — в `data/`, `logs/` и на отдельных
-> дисках, и не коммитится. Репозиторий = только исходники и конфиги.
-
-## Технологии
-
-- **Node.js ≥ 20** (ESM, встроенный fetch) — парсер, индексация, Search API, бот.
-- **Playwright** (Chromium) — обход ras/kad.arbitr.ru.
-- **Postgres 16** — `acts` (метаданные + текст + RAG-состояние) и отдельная база логов поиска.
-- **Qdrant** — векторное хранилище.
-- **Jina embeddings v4 + reranker v3** — GPU-инференс (FastAPI, порт 8000).
-- **Whisper large-v3 (ru)** — голосовой ввод (порт 8001).
-- **Gemini** — HyDE и генерация выжимки.
-- **MobileProxy.Space** — мобильные прокси с ротацией.
 
 ## Быстрый старт
 
+### 1. Установка Node.js зависимостей
+
 ```bash
-# 1. Зависимости
 npm install
 npx playwright install chromium
-
-# 2. Конфиг — заполнить ключи (MP_*, RAS_PG_DSN, TELEGRAM_BOT_TOKEN, GEMINI_*, ...)
-cp .env.example .env
-
-# 3. Инфраструктура (Postgres ×2, Qdrant; inference поднимается отдельно — см. ниже)
-docker compose up -d postgres postgres_logs qdrant
-
-# 4. Миграции схем
-npm run db:migrate            # таблица acts
-npm run db:migrate-logs       # база логов поиска
-npm run db:migrate-reports    # таблица отчётов Doczilla-фасада
 ```
 
-GPU-сервис инференса (`backend/inference/`) — отдельное Python-окружение:
+### 2. Настройка окружения
+
+```bash
+cp .env.example .env
+```
+
+Заполните значения в `.env`:
+
+* PostgreSQL DSN;
+* Qdrant URL;
+* Telegram Bot Token;
+* Gemini API key;
+* параметры inference-сервисов;
+* параметры внешних источников.
+
+### 3. Запуск инфраструктуры
+
+```bash
+docker compose up -d postgres postgres_logs qdrant
+```
+
+### 4. Миграции
+
+```bash
+npm run db:migrate
+npm run db:migrate-logs
+npm run db:migrate-reports
+```
+
+### 5. Inference service
+
+Production inference запускается отдельным Python-окружением из `backend/inference`:
 
 ```bash
 cd backend/inference
 python3.12 -m venv venv
 ./venv/bin/pip install --upgrade pip
-# torch собран под CUDA 11.8 — ставим с нужного индекса колёс:
 ./venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu118
-
-# эмбеддинги + reranker (грузит модель Jina v4 на GPU):
 ./venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000
-# распознавание голоса (модель Whisper в data/models/ или RAS_WHISPER_MODEL_PATH):
+```
+
+Whisper service:
+
+```bash
+cd backend/inference
 ./venv/bin/python -m uvicorn transcribe_worker:app --host 0.0.0.0 --port 8001
 ```
 
-## Сервисы в проде (systemd)
-
-| Сервис | Что делает | Порт | Юнит |
-|---|---|---|---|
-| Telegram bot | пользовательский фронт | — | `ras-tg-bot-supervised` (user) |
-| Search API | HTTP-поиск (HyDE→rerank→summary) | 8091 | `ras-search-api` |
-| Inference | Jina embed v4 + reranker v3 (GPU) | 8000 | `ras-inference` |
-| Whisper | распознавание голоса | 8001 | `ras-whisper` |
-| Embed worker | фоновая индексация в Qdrant | — | `ras-embed-worker` |
-
-Бэкап Postgres — по cron в 03:00 (`ops/backup-pg.sh`). Общий статус — `bash ops/ras-status.sh`.
-
-## Запуск компонентов вручную
+### 6. Search API
 
 ```bash
-npm start                 # парсер ras.arbitr.ru (под supervisor'ом с авто-рестартом)
-npm run download:acts     # скачивание PDF + извлечение текста (пул прокси-воркеров)
-npm run embed:worker      # индексация актов в Qdrant
-npm run search:api        # HTTP Search API на :8091
-npm run telegram:bot      # Telegram-бот
-npm run proxy:list        # состояние прокси (см. также proxy:ip / proxy:operator / proxy:geo)
+npm run search:api
 ```
 
-Полный список команд — в `package.json` (`scripts`).
-
-## Тесты (без сети/GPU)
+### 7. Telegram-бот
 
 ```bash
-npm run test:probe-classifier      # классификатор анти-клоака
-npm run test:quarantine-smoke      # карантин прокси-воркеров
-npm run smoke:proxy-health         # scoring proxy-health
-npm run test:meta-antifraud-smoke  # детектор анти-фрод страниц
+npm run telegram:bot
+```
+
+## Production services
+
+В production используются systemd-сервисы:
+
+| Service                          | Purpose                      | Port |
+| -------------------------------- | ---------------------------- | ---- |
+| `ras-search-api`                 | HTTP Search API              | 8091 |
+| `ras-inference`                  | Jina embeddings и reranker   | 8000 |
+| `ras-whisper`                    | Voice transcription          | 8001 |
+| `ras-tg-bot-supervised` (user)   | Telegram interface           | -    |
+| `ras-embed-worker`               | Background indexing          | -    |
+
+Проверка статуса:
+
+```bash
+sudo systemctl status ras-search-api --no-pager -l
+sudo systemctl status ras-inference --no-pager -l
+sudo systemctl status ras-whisper --no-pager -l
+systemctl --user status ras-tg-bot-supervised --no-pager -l
+sudo systemctl status ras-embed-worker --no-pager -l
+```
+
+Health checks:
+
+```bash
+curl -s http://127.0.0.1:8091/health
+curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8001/health
+```
+
+## API
+
+Основной Search API работает на порту `8091`.
+
+Ключевые endpoints:
+
+```text
+GET  /health
+GET  /stats
+POST /search
+GET  /search/stream
+POST /hyde
+```
+
+Doczilla-compatible facade:
+
+```text
+POST /doczilla-api/login
+GET  /doczilla-api/document/structureRead
+POST /doczilla-api/document/createDocz
+POST /doczilla-api/document/fillDocz
+GET  /doczilla-api/document/getById
+POST /doczilla-api/document/get
+```
+
+Неподдержанные методы Doczilla возвращают `501 Not Implemented`.
+
+## Тесты и проверки
+
+```bash
+npm run test:probe-classifier
+npm run test:quarantine-smoke
+npm run smoke:proxy-health
+npm run test:meta-antifraud-smoke
 npm run test:config-target-override
 ```
 
-## Подробнее
+Doczilla smoke test:
 
-- **`CLAUDE.md`** — глубокий технический контекст: логика отбора актов, аномалии
-  метаданных RAS, вердикт-резолвер, эскалация прокси, watchdog'и, PDF-пайплайн.
-- **`docs/`** — Doczilla-совместимый API-фасад, дамп API MobileProxy.
-- **`.env.example`** — каждый параметр с дефолтом и комментарием.
+```bash
+./ops/doczilla-smoke.sh
+```
+
+Полный список npm-команд см. в `package.json`.
+
+## Runtime data
+
+Runtime-данные не хранятся в git:
+
+* модели;
+* временные файлы;
+* логи;
+* PDF;
+* parsed data;
+* debug output;
+* virtual environments.
+
+Для этого используется папка `data/`, которая указана в `.gitignore`.
+
+## Документация
+
+Дополнительные материалы:
+
+* `docs/doczilla-api.md`
+* `docs/doczilla-acceptance-report.md`
+* `CLAUDE.md`
+* `.env.example`

@@ -1,8 +1,12 @@
-# Network modules
+# backend/network
 
-В этой папке собраны файлы, связанные с сетевыми настройками и работой прокси:
+Network integration layer for external service connectivity.
 
-- `config.js` — env-конфиг прокси/гео/эскалации
-- `proxyClient.js` — клиент MobileProxy SDK и rate-limit
-- `escalator.js` — логика эскалации `changeIp -> changeOperator -> changeGeo`
-- `loadEnv.js` — автозагрузка `.env`
+This module contains utilities for:
+
+* connectivity checks;
+* request routing;
+* network client configuration;
+* operational diagnostics.
+
+Runtime configuration is provided through environment variables. Sensitive values must not be committed to the repository.
