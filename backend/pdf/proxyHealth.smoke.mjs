@@ -17,7 +17,7 @@ import {
   classifyAntiCloakResult,
   combineUrlVerdicts,
   parseAntiCloakTaskResult,
-} from "../scripts/antiCloakClassifier.js";
+} from "../proxy-tools/antiCloakClassifier.js";
 
 const TAG = "proxyHealth.smoke";
 

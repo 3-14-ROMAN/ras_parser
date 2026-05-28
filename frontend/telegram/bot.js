@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/telegram-bot.js — тонкий Telegram бот поверх локального Search API.
+ * frontend/telegram/bot.js — тонкий Telegram бот поверх локального Search API.
  *
  * Архитектура:
  *   user → Telegram → (long polling getUpdates через SOCKS) → этот процесс
@@ -48,7 +48,7 @@ import {
 } from "undici";
 import { SocksClient } from "socks";
 
-import { renderSummaryToPdf } from "../llm/summaryPdfRenderer.js";
+import { renderSummaryToPdf } from "../../backend/llm/summaryPdfRenderer.js";
 
 // ─── env ────────────────────────────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ function modelLabel(id)     { return HYDE_MODELS.find((m) => m.id === id)?.label
 // получает env-дефолты до первого изменения.
 const SETTINGS_FILE = path.resolve(
   process.cwd(),
-  process.env.TG_BOT_SETTINGS_FILE || "parsed_data/tg_bot_settings.json",
+  process.env.TG_BOT_SETTINGS_FILE || "data/parsed_data/tg_bot_settings.json",
 );
 const chatSettings = new Map();
 

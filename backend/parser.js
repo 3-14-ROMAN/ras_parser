@@ -67,9 +67,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PROJECT_DIR = __dirname;
+// Транзитные артефакты (parsed_data/, debug/) живут в gitignored data/ в корне
+// репозитория, а не рядом с исходником. Override — RAS_DATA_DIR.
+const REPO_ROOT = path.resolve(__dirname, "..");
+const DATA_DIR = process.env.RAS_DATA_DIR
+  ? path.resolve(process.env.RAS_DATA_DIR)
+  : path.join(REPO_ROOT, "data");
 
 const BASE_URL = "https://ras.arbitr.ru/";
-const PARSED_DATA_DIR = path.join(PROJECT_DIR, "parsed_data");
+const PARSED_DATA_DIR = path.join(DATA_DIR, "parsed_data");
 const OUT_PATH = path.join(PARSED_DATA_DIR, "document_types.json");
 
 /**
@@ -81,7 +87,7 @@ const OUT_PATH = path.join(PARSED_DATA_DIR, "document_types.json");
  */
 const PARSER_STATE_PATH = path.join(PARSED_DATA_DIR, "parser_state.json");
 
-const DEBUG_DIR = path.join(PROJECT_DIR, "debug");
+const DEBUG_DIR = path.join(DATA_DIR, "debug");
 /**
  * Панель комбобокса «Категория спора» по заголовку секции.
  * Якорь XPath устойчивее `#caseCategory` при дубликатах id / смене разметки.

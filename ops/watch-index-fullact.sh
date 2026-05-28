@@ -14,7 +14,7 @@ while true; do
   echo
   echo "[watch] $(date '+%F %T') indexing..."
 
-  MAX_ACT_CHARS="$MAX_ACT_CHARS" node --env-file=.env scripts/index-acts-qdrant-fullact.js "$LIMIT"
+  MAX_ACT_CHARS="$MAX_ACT_CHARS" node --env-file=.env backend/indexing/index-acts-qdrant-fullact.js "$LIMIT"
 
   echo
   echo "[watch] PG status:"

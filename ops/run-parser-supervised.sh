@@ -56,10 +56,10 @@ while true; do
 
   if [ "$attempt" -eq 1 ]; then
     # Первый запуск: TTY-интерактив, чтобы человек настроил параметры.
-    node --env-file=.env parser.js
+    node --env-file=.env backend/parser.js
   else
     # Рестарт: пропускаем интерактив, параметры из env + state.json.
-    RAS_NONINTERACTIVE=1 node --env-file=.env parser.js
+    RAS_NONINTERACTIVE=1 node --env-file=.env backend/parser.js
   fi
   ec=$?
 

@@ -60,7 +60,7 @@ services:
 
   inference:
     build:
-      context: ./inference
+      context: ./backend/inference
       dockerfile: Dockerfile
     container_name: ras_inference
     restart: unless-stopped

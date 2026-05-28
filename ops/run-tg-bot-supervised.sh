@@ -76,7 +76,7 @@ while true; do
 
   started_at=$(date +%s)
 
-  node --env-file=.env scripts/telegram-bot.js &
+  node --env-file=.env frontend/telegram/bot.js &
   child_pid=$!
   wait "$child_pid"
   ec=$?

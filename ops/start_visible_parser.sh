@@ -115,5 +115,5 @@ cd "$ROOT_DIR"
 if [[ "${START_XVFB}" == "1" ]]; then
   export DISPLAY="$DISPLAY_ID"
 fi
-echo "[run] RAS_HEADLESS=${RAS_HEADLESS:-1} node --env-file=.env parser.js"
-node --env-file=.env parser.js
+echo "[run] RAS_HEADLESS=${RAS_HEADLESS:-1} node --env-file=.env backend/parser.js"
+node --env-file=.env backend/parser.js

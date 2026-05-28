@@ -29,7 +29,7 @@ import {
   classifyAntiCloakResult,
   flattenCandidateCountriesFromGeoList,
   parseAntiCloakTaskResult,
-} from "../scripts/antiCloakClassifier.js";
+} from "../proxy-tools/antiCloakClassifier.js";
 
 const MP_ENDPOINT = "https://mobileproxy.space/api.html";
 
