@@ -61,7 +61,7 @@ import {
   logPdfDownloadAggregateStats,
 } from "./downloader.js";
 import { extractPdfText } from "./extractor.js";
-import { countJinaV3Tokens } from "./jinaV3Tokens.js";
+import { countActTokens } from "./jinaV3Tokens.js";
 import {
   ProxyQuarantineRegistry,
   readQuarantineConfigFromEnv,
@@ -2158,10 +2158,12 @@ async function _processOne({ id, pdfPath }, log, counters, who, metrics) {
     }
     return;
   }
-  // Подсчёт токенов через tokenizer jina-reranker-v3 (POST /count_tokens
-  // к inference). При недоступности inference вернёт null — pipeline не
-  // блокируется, в БД tokens_jina_v3 останется NULL до backfill'а.
-  const tokensJinaV3 = await countJinaV3Tokens(r.text);
+  // Подсчёт токенов через оба tokenizer'а (Jina v3 reranker + Jina v4 embed)
+  // одним POST /count_tokens к inference. При недоступности inference оба
+  // вернут null — pipeline не блокируется, NULL'ы добиваются backfill'ом.
+  // tokens_jina_v3 → гейтинг по RERANKER_MAX_DOC_LENGTH.
+  // token_count    → is_long_act и роутинг full_act / late_chunks.
+  const { jinaV3: tokensJinaV3, jinaV4: tokensJinaV4 } = await countActTokens(r.text);
   if (tokensJinaV3 != null) {
     counters.tokens_sum += tokensJinaV3;
     counters.tokens_counted += 1;
@@ -2176,12 +2178,13 @@ async function _processOne({ id, pdfPath }, log, counters, who, metrics) {
   }
   const markT0 = performance.now();
   try {
-    await markTextExtracted(id, r.text, { tokensJinaV3 });
+    await markTextExtracted(id, r.text, { tokensJinaV3, tokensJinaV4 });
     const markMs = performance.now() - markT0;
     counters.extracted += 1;
     if (metrics) metrics.noteExtractOk({ extractMs: exMs, markMs });
-    const tokTag = tokensJinaV3 != null ? ` tokens=${tokensJinaV3}` : ` tokens=?`;
-    log(`[pipe/${who}] OK id=${id} bytes=${r.bytes}${tokTag}`);
+    const tokTag = tokensJinaV3 != null ? ` tok_v3=${tokensJinaV3}` : ` tok_v3=?`;
+    const tokV4Tag = tokensJinaV4 != null ? ` tok_v4=${tokensJinaV4}` : ` tok_v4=?`;
+    log(`[pipe/${who}] OK id=${id} bytes=${r.bytes}${tokTag}${tokV4Tag}`);
   } catch (e) {
     log(`[pipe/${who}] markTextExtracted: ${e}`);
   }
@@ -2219,10 +2222,11 @@ async function _drainPendingTextFromDb(log) {
       }
       const r = await extractPdfText(row.pdf_path);
       if (r.ok) {
-        const tokensJinaV3 = await countJinaV3Tokens(r.text);
-        await markTextExtracted(row.id, r.text, { tokensJinaV3 });
-        const tokTag = tokensJinaV3 != null ? ` tokens=${tokensJinaV3}` : ` tokens=?`;
-        log(`[pipe/resume] id=${row.id} OK bytes=${r.bytes}${tokTag}`);
+        const { jinaV3: tokensJinaV3, jinaV4: tokensJinaV4 } = await countActTokens(r.text);
+        await markTextExtracted(row.id, r.text, { tokensJinaV3, tokensJinaV4 });
+        const tokTag = tokensJinaV3 != null ? ` tok_v3=${tokensJinaV3}` : ` tok_v3=?`;
+        const tokV4Tag = tokensJinaV4 != null ? ` tok_v4=${tokensJinaV4}` : ` tok_v4=?`;
+        log(`[pipe/resume] id=${row.id} OK bytes=${r.bytes}${tokTag}${tokV4Tag}`);
       } else {
         await markExtractFailed(row.id, `${r.code}: ${r.error}`);
         log(`[pipe/resume] id=${row.id} FAIL ${r.code}: ${r.error}`);

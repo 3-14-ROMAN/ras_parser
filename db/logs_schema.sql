@@ -59,11 +59,30 @@ CREATE TABLE IF NOT EXISTS searches (
   raw_response       JSONB
 );
 
+-- Summary (grounding) результат. Колонки добавляются идемпотентно через
+-- ALTER ... ADD COLUMN IF NOT EXISTS — первый прогон логc-миграции на боевой
+-- БД сделает CREATE без summary_*, второй докатит эти колонки. На свежей БД
+-- CREATE сразу создаёт всё, ALTER'ы ниже становятся no-op.
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_used              BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_text              TEXT;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_chars             INTEGER;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_model_actual      TEXT;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_acts_used         INTEGER;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_prompt_tokens     INTEGER;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_candidates_tokens INTEGER;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_thinking_tokens   INTEGER;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_total_tokens      INTEGER;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_finish_reason     TEXT;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_elapsed_ms        INTEGER;
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS summary_error             TEXT;
+
 CREATE INDEX IF NOT EXISTS searches_ts_idx       ON searches (ts DESC);
 CREATE INDEX IF NOT EXISTS searches_chat_id_idx  ON searches (chat_id, ts DESC) WHERE chat_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS searches_user_id_idx  ON searches (user_id, ts DESC) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS searches_use_hyde_idx ON searches (use_hyde, ts DESC);
 CREATE INDEX IF NOT EXISTS searches_hyde_model_idx ON searches (hyde_model_actual) WHERE hyde_used;
+CREATE INDEX IF NOT EXISTS searches_use_summary_idx ON searches (use_summary, ts DESC);
+CREATE INDEX IF NOT EXISTS searches_summary_model_idx ON searches (summary_model_actual) WHERE summary_used;
 
 -- top_act_ids — GIN для запросов «какие searches вернули act X»
 CREATE INDEX IF NOT EXISTS searches_top_act_ids_gin ON searches USING GIN (top_act_ids);

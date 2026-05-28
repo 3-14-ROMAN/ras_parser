@@ -79,19 +79,32 @@ CREATE TABLE IF NOT EXISTS acts (
     text_extracted_at     TIMESTAMPTZ,
 
     -- ── embedding state machine (см. ниже DO-block для миграции legacy) ──
-    -- token_count       — реальный счёт токенов из инференса (Jina v4 tokenizer).
-    --                     NULL до первого индексирования; заполняется индексером.
+    -- tokens_jina_v4    — счёт токенов через tokenizer jina-embeddings-v4
+    --                     (наш embedder). Считается в момент markTextExtracted
+    --                     (download:acts) одним POST /count_tokens к inference
+    --                     вместе с tokens_jina_v3. См. pdf/jinaV3Tokens.js
+    --                     → countActTokens. NULL если в момент скачивания
+    --                     inference был недоступен → backfill через
+    --                     scripts/backfill-token-count.mjs.
+    --                     ИСПОЛЬЗОВАНИЕ: is_long_act и роутинг full_act/late_chunks.
     -- tokens_jina_v3    — счёт токенов через tokenizer jina-reranker-v3 (Qwen3).
-    --                     Считается в момент markTextExtracted (download:acts)
-    --                     через POST /count_tokens к inference. NULL если в
-    --                     момент скачивания inference был недоступен — тогда
-    --                     значение можно добить отдельным backfill-проходом.
+    --                     Считается там же одним RTT с tokens_jina_v4. NULL
+    --                     если inference (или сам reranker) был недоступен —
+    --                     добивается тем же backfill'ом.
     --                     ИСПОЛЬЗОВАНИЕ: гейтинг по реальному лимиту реранкера
     --                     (RERANKER_MAX_DOC_LENGTH в inference/app.py).
-    -- is_long_act       — TRUE если token_count > 8192 (или, до подсчёта,
-    --                     эвристика по length(act_text) > 32000). Routing:
+    -- token_count       — LEGACY. Раньше использовался под jina v4 token count;
+    --                     перезаписывался индексером после реального /embed
+    --                     (forward-pass count, мог отличаться на ±special).
+    --                     С введением tokens_jina_v4 — фактически дубль; пока
+    --                     оставлен для back-compat читателей (fullAct.js,
+    --                     hydrate.js). На запись больше не идёт от download.
+    -- is_long_act       — TRUE если tokens_jina_v4 > 8000. Если NULL (старые
+    --                     акты / inference был down) — fallback на эвристику
+    --                     length(act_text) > 32000. Routing:
     --                     FALSE → unit_type=full_act (один point на акт)
-    --                     TRUE  → unit_type=chunk    (много point'ов с late chunking)
+    --                     TRUE  → unit_type=chunk    (много point'ов с late chunking +
+    --                                                  colbert per chunk)
     -- vector_status     — 'pending' (в очереди) | 'indexing' (worker взял в обработку)
     --                     'indexed' (точки в Qdrant) | 'error' (см. vector_error).
     -- vector_error      — текст последней ошибки (включая skip-reasons типа
@@ -103,6 +116,7 @@ CREATE TABLE IF NOT EXISTS acts (
     -- indexed_at        — момент успешного indexed-перехода.
     token_count           INTEGER,
     tokens_jina_v3        INTEGER,
+    tokens_jina_v4        INTEGER,
     is_long_act           BOOLEAN,
     vector_status         TEXT NOT NULL DEFAULT 'pending'
         CHECK (vector_status IN ('pending', 'indexing', 'indexed', 'error')),
@@ -122,6 +136,11 @@ CREATE TABLE IF NOT EXISTS acts (
 -- ─────────────────────────────────────────────────────────────────────────────
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS token_count    INTEGER;
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS tokens_jina_v3 INTEGER;
+ALTER TABLE acts ADD COLUMN IF NOT EXISTS tokens_jina_v4 INTEGER;
+-- tokens_jina_v4 заполняется ТОЛЬКО через POST /count_tokens к inference
+-- (Jina v4 tokenizer, без special tokens). Никаких переносов из других
+-- колонок — числа должны быть строго от одного и того же счётчика, без
+-- миксапа с forward-pass значениями из token_count.
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS is_long_act    BOOLEAN;
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS vector_status  TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE acts ADD COLUMN IF NOT EXISTS vector_error   TEXT;
@@ -220,6 +239,15 @@ CREATE INDEX idx_acts_pending_text ON acts (registration_date DESC NULLS LAST, i
 -- (FOR UPDATE SKIP LOCKED — в будущем для параллельных воркеров).
 CREATE INDEX IF NOT EXISTS idx_acts_pending_vector ON acts (registration_date DESC NULLS LAST, id)
     WHERE vector_status = 'pending' AND act_text IS NOT NULL;
+-- Smart-scheduler long-select (см. embed/worker.js processLongPhase): фильтр
+-- pending+long+verdict_keep, sort by tokens_jina_v4 ASC. Без этого partial
+-- index'а SELECT падает в BitmapAnd 5+с на 17k pending rows. С ним — ~10мс.
+CREATE INDEX IF NOT EXISTS idx_acts_pending_long_v4
+    ON acts (tokens_jina_v4 ASC, registration_date DESC NULLS LAST, id)
+    WHERE vector_status = 'pending'
+      AND is_long_act   = TRUE
+      AND verdict_keep  IS TRUE
+      AND act_text IS NOT NULL;
 -- Селектор по статусу (для пагинации и наблюдения за состоянием очереди).
 CREATE INDEX IF NOT EXISTS idx_acts_vector_status   ON acts (vector_status);
 

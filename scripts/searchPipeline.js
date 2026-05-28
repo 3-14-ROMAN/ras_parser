@@ -78,8 +78,36 @@ function toDateString(d) {
   return null;
 }
 
+// Umbrella TypeId + genre GUID'ы, для которых RAS не отдаёт текст исхода в
+// `ContentTypes[1]`, но сам жанр документа уже substantive (мотивированный финал).
+// Подменяем 'unknown' на конкретный жанр-маркер — чтобы UI бота не путал
+// пользователя голым "unknown". См. parser.js:1180 (keep=true для umbrella+empty
+// ContentTypes[1]) и CLAUDE.md «umbrella TypeId».
+const UMBRELLA_TYPE_ID = "23f4baa9-e7cc-407a-aba7-11dd8772aa3b";
+const GENRE_TO_DERIVED_ACTION = new Map([
+  ["08f888a2-83ad-4fdf-8985-f77fe2085f11", "simplified"],   // упрощёнка
+  ["db0af13c-2d10-4677-812e-c55e90a894bd", "additional"],   // доп. решение
+  ["8a67b151-5fb1-4fe0-9068-24a5895d41ba", "additional"],   // доп. постановление
+]);
+
+function _deriveVerdictAction(rawAction, typeId, contentTypesString) {
+  // Подменяем ТОЛЬКО 'unknown' / null. Если уже есть конкретный action — оставляем.
+  const a = rawAction == null ? null : String(rawAction).toLowerCase();
+  if (a && a !== "unknown") return rawAction;
+  if (!typeId || String(typeId).toLowerCase() !== UMBRELLA_TYPE_ID) return rawAction;
+  if (typeof contentTypesString !== "string" || !contentTypesString) return rawAction;
+  const firstGuid = contentTypesString.split(/[,\s]+/)[0]?.toLowerCase();
+  if (!firstGuid) return rawAction;
+  return GENRE_TO_DERIVED_ACTION.get(firstGuid) ?? rawAction;
+}
+
 export function compactResult(r) {
   const meta = r.meta ?? {};
+  const verdictAction = _deriveVerdictAction(
+    meta.verdict_action,
+    meta.type_id,
+    meta.content_types_string,
+  );
   return {
     act_id:              r.act_id,
     case_id:             meta.case_id ?? null,
@@ -89,7 +117,7 @@ export function compactResult(r) {
     type_name:           meta.type_name ?? null,
     true_instance_level: meta.true_instance_level ?? null,
     verdict_keep:        meta.verdict_keep ?? null,
-    verdict_action:      meta.verdict_action ?? null,
+    verdict_action:      verdictAction ?? null,
     pdf_link:            meta.pdf_link ?? null,
     tokens_jina_v4:      meta.tokens_jina_v4 ?? null,
     rerank_score:        r.rerank_score ?? null,

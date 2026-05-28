@@ -93,6 +93,7 @@ function collectMatchedChunkIds(branches) {
   };
   addFromGroups(branches?.long_dense?.groups);
   addFromGroups(branches?.long_sparse?.groups);
+  addFromGroups(branches?.long_colbert?.groups);
   return map;
 }
 
@@ -133,6 +134,7 @@ async function fetchActsForHydration(actIds) {
             act_text                AS act_text,
             is_long_act             AS is_long_act,
             tokens_jina_v3          AS tokens_jina_v3,
+            tokens_jina_v4          AS tokens_jina_v4,
             case_id::text           AS case_id,
             case_number             AS case_number,
             court                   AS court,
@@ -141,7 +143,9 @@ async function fetchActsForHydration(actIds) {
             true_instance_level     AS true_instance_level,
             verdict_keep            AS verdict_keep,
             verdict_action          AS verdict_action,
-            pdf_link                AS pdf_link
+            pdf_link                AS pdf_link,
+            type_id::text           AS type_id,
+            content_types_string    AS content_types_string
        FROM acts
       WHERE id = ANY($1::uuid[])`,
     [actIds],
@@ -156,6 +160,7 @@ async function fetchActsForHydration(actIds) {
       // запросе не дёргать /count_tokens на каждый акт. Может быть null, если
       // акт скачан до фичи или inference был недоступен — rerank.js обработает.
       tokensJinaV3:       row.tokens_jina_v3 ?? null,
+      tokensJinaV4:       row.tokens_jina_v4 ?? null,
       caseId:             row.case_id,
       caseNumber:         row.case_number,
       court:              row.court,
@@ -165,6 +170,8 @@ async function fetchActsForHydration(actIds) {
       verdictKeep:        row.verdict_keep,
       verdictAction:      row.verdict_action,
       pdfLink:            row.pdf_link,
+      typeId:             row.type_id ?? null,
+      contentTypesString: row.content_types_string ?? null,
     });
   }
   return map;
@@ -291,6 +298,7 @@ export async function hydrateForRerank(candidates, branches, opts = {}) {
       // Если NULL (старые акты до фичи) — rerank.js fall-back'нется на
       // /count_tokens, потом на estimateTokens.
       tokens_jina_v3:    row.tokensJinaV3 ?? null,
+      tokens_jina_v4:    row.tokensJinaV4 ?? null,
       meta: {
         case_id:             row.caseId,
         case_number:         row.caseNumber,
@@ -302,6 +310,9 @@ export async function hydrateForRerank(candidates, branches, opts = {}) {
         verdict_action:      row.verdictAction,
         pdf_link:            row.pdfLink,
         is_long_act:         row.isLongAct,
+        tokens_jina_v4:      row.tokensJinaV4 ?? null,
+        type_id:             row.typeId ?? null,
+        content_types_string: row.contentTypesString ?? null,
       },
     });
   }

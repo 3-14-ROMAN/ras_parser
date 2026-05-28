@@ -116,33 +116,53 @@ export async function embedTexts(texts, opts = {}) {
 /**
  * Late chunking через /embed_late_chunks.
  *
- * Контракт (fix 2026-05-18): на сервер шлём **оригинальный** `fullText` + spans
- * чанков `[{chunk_id, start_char, end_char}]`. Сервер тоkенизирует именно
- * `fullText`, один forward pass,
- * mean-pool токенов в спане каждого чанка → 128-dim dense_late. Sparse
- * считается на slice оригинала `fullText[start:end]`.
+ * Контракт (2026-05-23): на сервер шлём **оригинальный** `fullText`. Сервер:
+ *   1. Один forward pass Jina v4 на полном тексте → token-level embeddings
+ *      (с full-document attention).
+ *   2. Balanced paragraph-aware split: chunk_count = ceil(tokens / maxChunkTokens),
+ *      target_per_chunk = ceil(tokens / chunk_count), границы тянутся к
+ *      ближайшему `\n\n` в пределах ±paragraphTolerance × target_per_chunk.
+ *      Без overlap (late chunking → токены уже видят соседние чанки через
+ *      attention).
+ *   3. На каждый chunk:
+ *        - dense_late[i]  = mean-pool 128-dim multivector токенов чанка
+ *        - colbert[i]     = RAW multivector токенов чанка (без mean-pool),
+ *                            если returnColbert=true (по умолчанию)
+ *        - sparse[i]      = sparse TF от slice `fullText[start:end]`
  *
  * @param {string} fullText
  *   Полный текст акта (act.act_text целиком).
- * @param {Array<{ chunk_id: number, start_char: number, end_char: number }>} chunkSpans
- *   Уже посчитанные на Node-стороне (chunkText) спаны.
- * @param {{ task?: string, maxLength?: number, returnSparse?: boolean }} [opts]
+ * @param {Array<{ chunk_id: number, start_char: number, end_char: number }>|null} chunkSpans
+ *   Если null/[], сервер сам строит balanced chunks. Если переданы — explicit.
+ * @param {{
+ *   task?: string,
+ *   maxLength?: number,
+ *   returnSparse?: boolean,
+ *   returnColbert?: boolean,
+ *   maxChunkTokens?: number,
+ *   paragraphTolerance?: number,
+ * }} [opts]
  * @returns {Promise<{
  *   dense_late_vectors: number[][],
- *   sparse_vectors: { indices: number[], values: number[] }[] | null,
- *   token_counts: number[],
- *   full_tokens: number,
- *   full_chars: number,
+ *   colbert_vectors:    number[][][] | null,
+ *   sparse_vectors:     { indices: number[], values: number[] }[] | null,
+ *   token_counts:       number[],
+ *   full_tokens:        number,
+ *   full_chars:         number,
+ *   chunk_mode:         string,
+ *   chunks:             Array<{ id, chunk_id, start, end, start_char, end_char }>,
  * }>}
  *
  * Бросает Error, если сервер вернул error-поле (too_long_for_late_chunking,
  * bad_chunk_span, token_alignment_mismatch и пр.).
  */
 export async function embedLateChunks(fullText, chunkSpans = null, opts = {}) {
-  const task              = opts.task              ?? "retrieval.passage";
-  const maxLength         = opts.maxLength         ?? 32768;
-  const returnSparse      = opts.returnSparse      ?? true;
-  const targetChunkTokens = opts.targetChunkTokens ?? 2000;
+  const task               = opts.task               ?? "retrieval.passage";
+  const maxLength          = opts.maxLength          ?? 32768;
+  const returnSparse       = opts.returnSparse       ?? true;
+  const returnColbert      = opts.returnColbert      ?? true;
+  const maxChunkTokens     = opts.maxChunkTokens     ?? Number(process.env.RAS_LATE_CHUNK_MAX_TOKENS ?? 8000);
+  const paragraphTolerance = opts.paragraphTolerance ?? Number(process.env.RAS_LATE_CHUNK_PARAGRAPH_TOLERANCE ?? 0.12);
 
   if (typeof fullText !== "string" || fullText.length === 0) {
     throw new Error("embedLateChunks: empty fullText");
@@ -155,7 +175,9 @@ export async function embedLateChunks(fullText, chunkSpans = null, opts = {}) {
     task,
     max_length: maxLength,
     return_sparse: returnSparse,
-    target_chunk_tokens: targetChunkTokens,
+    return_colbert: returnColbert,
+    max_chunk_tokens: maxChunkTokens,
+    paragraph_tolerance: paragraphTolerance,
   };
 
   if (hasExplicitSpans) {
@@ -201,16 +223,80 @@ export async function embedLateChunks(fullText, chunkSpans = null, opts = {}) {
     throw new Error(`late_chunks bad token_counts: ${tokenCounts.length} chunks=${chunks.length}`);
   }
 
+  // colbert_vectors — массив [chunks][n_tokens_in_chunk][128]. Может быть
+  // null, если returnColbert=false. Проверяем shape жёстко.
+  let colbertVectors = null;
+  if (Array.isArray(data.colbert_vectors)) {
+    if (data.colbert_vectors.length !== chunks.length) {
+      throw new Error(
+        `late_chunks bad colbert shape: colbert=${data.colbert_vectors.length} chunks=${chunks.length}`,
+      );
+    }
+    colbertVectors = data.colbert_vectors;
+  } else if (returnColbert) {
+    throw new Error(
+      "late_chunks: returnColbert=true но сервер не вернул colbert_vectors — обнови inference",
+    );
+  }
+
   return {
     dense_late_vectors: data.dense_late_vectors,
+    colbert_vectors:    colbertVectors,
     sparse_vectors:     Array.isArray(data.sparse_vectors) ? data.sparse_vectors : null,
     token_counts:       tokenCounts,
     full_tokens:        Number(data.full_tokens) || 0,
     full_chars:         Number(data.full_chars) || 0,
-    chunk_mode:         data.chunk_mode ?? (hasExplicitSpans ? "explicit" : "token_auto"),
-    target_chunk_tokens: Number(data.target_chunk_tokens ?? targetChunkTokens),
+    chunk_mode:         data.chunk_mode ?? (hasExplicitSpans ? "explicit" : "balanced_paragraph_aware"),
+    max_chunk_tokens:   Number(data.max_chunk_tokens ?? maxChunkTokens),
+    paragraph_tolerance: Number(data.paragraph_tolerance ?? paragraphTolerance),
     chunks,
   };
+}
+
+/**
+ * Triggerит lazy-load reranker'а на inference. Idempotent. Использовать
+ * fire-and-forget (без await) в начале /search — пока retrieval + hydrate
+ * качают данные, reranker подгружается в VRAM.
+ *
+ * Не выбрасывает на сетевых ошибках — это best-effort. /rerank сам имеет
+ * auto-load fallback на стороне сервера.
+ *
+ * @returns {Promise<{state:string, elapsed_ms?:number, model_id?:string}|null>}
+ */
+export async function loadReranker() {
+  try {
+    return await inferencePost("/reranker/load", undefined);
+  } catch (e) {
+    // Глушим — это hint, не блокер. /rerank сам разберётся.
+    return null;
+  }
+}
+
+/**
+ * Выгрузить reranker из VRAM. Используется embed-worker'ом после того, как
+ * runtime-флаг search_active очистился. Idempotent.
+ *
+ * @returns {Promise<{state:string, freed_gb?:number}|null>}
+ */
+export async function unloadReranker() {
+  try {
+    return await inferencePost("/reranker/unload", undefined);
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Прочитать /health, вернуть состояние reranker'а ("loaded"|"unloaded"|
+ * "loading"|"ready"|"disabled"|"unknown").
+ */
+export async function getRerankerState() {
+  try {
+    const data = await _fetchJson("GET", `${INFERENCE_URL}/health`, undefined, 5000);
+    return String(data?.reranker_state ?? data?.reranker ?? "unknown");
+  } catch (e) {
+    return "unknown";
+  }
 }
 
 /**
