@@ -1,0 +1,37 @@
+# ── Dependencies ───────────────────────────────────────────────
+node_modules/
+
+# ── Secrets & local environment ────────────────────────────────
+# Real secrets live in .env (never committed). Template is .env.example.
+.env
+.env.*
+!.env.example
+
+# ── Local data, models & transient artifacts ───────────────────
+# Everything heavy / runtime-generated lives under data/ and never
+# ships to the repo. Standalone patterns are belt-and-suspenders in
+# case a process writes one of these at the repo root.
+data/
+models/
+parsed_data/
+tmp/
+debug/
+
+# ── Python virtualenvs & caches ────────────────────────────────
+venv/
+.venv*/
+**/__pycache__/
+*.pyc
+
+# ── Logs ───────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+
+# ── Backups & editor / tooling dirs ────────────────────────────
+*.bak*
+.DS_Store
+.idea/
+.vscode/
+.cursor/
+.claude/

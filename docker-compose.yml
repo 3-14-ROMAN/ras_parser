@@ -1,0 +1,93 @@
+name: ras_parser
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ras_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ras}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ras}
+      POSTGRES_DB: ${POSTGRES_DB:-ras}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - /data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ras} -d ${POSTGRES_DB:-ras}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Отдельный Postgres только под логи поисковых запросов /search.
+  # Volume на HDD (/mnt/ubuntu_hdd) — у логов нет требования к latency,
+  # зато размер растёт, и держать их рядом с боевым acts (на NVMe) нет
+  # смысла. На дефолтном порту 5432 уже сидит ras_pg, этот слушает 5433.
+  postgres_logs:
+    image: postgres:16-alpine
+    container_name: ras_pg_logs
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_LOGS_USER:-ras_logs}
+      POSTGRES_PASSWORD: ${POSTGRES_LOGS_PASSWORD:-ras_logs}
+      POSTGRES_DB: ${POSTGRES_LOGS_DB:-ras_logs}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - /mnt/ubuntu_hdd/ras_logs_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_LOGS_USER:-ras_logs} -d ${POSTGRES_LOGS_DB:-ras_logs}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.0
+    container_name: ras_qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - /home/roman/qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  inference:
+    build:
+      context: ./backend/inference
+      dockerfile: Dockerfile
+    container_name: ras_inference
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - /data/hf_cache:/data/hf_cache
+    environment:
+      EMBED_MODEL_ID: ${EMBED_MODEL_ID:-jinaai/jina-embeddings-v4}
+      RERANK_MODEL_ID: ${RERANK_MODEL_ID:-jinaai/jina-reranker-v3}
+      HF_HOME: ${HF_HOME:-/data/hf_cache}
+      EMBED_DIM: ${EMBED_DIM:-2048}
+      EMBED_BATCH_SIZE: 32
+      RERANK_BATCH_SIZE: 8
+      INFERENCE_PORT: 8000
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - qdrant

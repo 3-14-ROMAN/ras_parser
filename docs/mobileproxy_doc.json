@@ -1,0 +1,2012 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "MobileProxy.Space API",
+    "version": "1.0.0",
+    "description": "Official API for [MobileProxy.Space](https://mobileproxy.space) — private mobile proxies on real GSM devices across 52 countries, 240 cities, and 223 carriers.\n\n## Authentication\n\nAll API requests (except IP rotation) require a Bearer token in the `Authorization` header:\n\n```\nAuthorization: Bearer YOUR_API_TOKEN\n```\n\nGet your token from the [Dashboard](https://mobileproxy.space/en/user.html).\n\n## Localization\n\nSome endpoints support the `Accept-Language` header (`en` or `ru`) to return localized names for countries, cities, etc.\n\n## Rate Limits\n\n- **Identical requests:** no more than once every 5 seconds. Error: `\"Too many lonely requests. Timeout 5 second\"`\n- **All API methods:** max **3 × (number of active proxies)** requests per second. Error: `\"Too many requests per second\"`. Example: 10 proxies → 30 req/s, 100 proxies → 300 req/s.\n- **IP rotation** (`changeip.mobileproxy.space`): **no rate limit**.\n\n## SDKs\n\n- **PHP**: `composer require mobirox/mobileproxy-sdk` — [GitHub](https://github.com/mobileproxy/php-sdk) | [Packagist](https://packagist.org/packages/mobirox/mobileproxy-sdk)\n- **Node.js**: `npm install @mobileproxy/sdk` — [GitHub](https://github.com/mobileproxy/node-sdk) | [npm](https://www.npmjs.com/package/@mobileproxy/sdk)\n- **Python**: `pip install mobileproxy-sdk` — [GitHub](https://github.com/mobileproxy/python-sdk) | [PyPI](https://pypi.org/project/mobileproxy-sdk/)\n",
+    "contact": {
+      "name": "MobileProxy.Space Support",
+      "url": "https://mobileproxy.space/en/contacts.html",
+      "email": "support@mobirox.co.uk"
+    },
+    "license": {
+      "name": "MIT",
+      "url": "https://opensource.org/licenses/MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://mobileproxy.space",
+      "description": "Production API"
+    },
+    {
+      "url": "https://changeip.mobileproxy.space",
+      "description": "IP Rotation endpoint (no rate limit)"
+    }
+  ],
+  "security": [
+    {
+      "BearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Proxy Information",
+      "description": "Get current IP, list active proxies, IP statistics"
+    },
+    {
+      "name": "Proxy Management",
+      "description": "Change credentials, reboot, edit settings"
+    },
+    {
+      "name": "IP Rotation",
+      "description": "Change proxy IP address (separate endpoint, no rate limit)"
+    },
+    {
+      "name": "Equipment & GEO",
+      "description": "Change equipment, list GEOs, operators, countries, cities"
+    },
+    {
+      "name": "Blacklist",
+      "description": "Manage equipment and operator blacklists"
+    },
+    {
+      "name": "Purchasing & Billing",
+      "description": "Buy proxies, refunds, balance, prices, test proxies, transaction history"
+    },
+    {
+      "name": "Utilities",
+      "description": "Anti-cloaking, equipment check, async tasks"
+    }
+  ],
+  "paths": {
+    "/api.html?command=proxy_ip": {
+      "get": {
+        "operationId": "getProxyIp",
+        "summary": "Get proxy IP address",
+        "description": "Find out what IP address your proxy is currently issuing.\nOptionally check if the IP is in spam databases via [IPGuardian.net](https://ipguardian.net).\n",
+        "tags": [
+          "Proxy Information"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "description": "Proxy ID. For multiple proxies, separate with commas: `1,2,3,4`",
+            "schema": {
+              "type": "string",
+              "example": "12345"
+            }
+          },
+          {
+            "name": "check_spam",
+            "in": "query",
+            "required": false,
+            "description": "Set to `true` to check IP against spam databases (IPGuardian.net)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current proxy IP information",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "description": "Operation status: `ok` or `err`",
+                      "example": "ok"
+                    },
+                    "proxy_id": {
+                      "type": "object",
+                      "description": "Object where keys are proxy IDs and values are their current IP addresses",
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "example": {
+                        "12345": "95.153.42.174"
+                      }
+                    },
+                    "ipguardian.net": {
+                      "type": "object",
+                      "description": "Spam check results (only present if `check_spam=true`)",
+                      "properties": {
+                        "found": {
+                          "type": "boolean",
+                          "description": "Whether the IP was found in spam databases"
+                        },
+                        "sources": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "List of databases where IP was found (if applicable)"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitError"
+          }
+        }
+      }
+    },
+    "/api.html?command=get_my_proxy": {
+      "get": {
+        "operationId": "getMyProxy",
+        "summary": "Get active proxies",
+        "description": "Get a list of your active purchased proxies with all details including connection credentials, expiration, GEO, and operator info.",
+        "tags": [
+          "Proxy Information"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": false,
+            "description": "Filter by specific proxy ID(s). Comma-separated for multiple: `1,2,3,4`. Omit for all.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of active proxies",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "list": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Proxy"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_ipstat": {
+      "get": {
+        "operationId": "getIpStats",
+        "summary": "IP statistics by GEO",
+        "description": "Get statistics of mobile proxy IP addresses grouped by GEO.",
+        "tags": [
+          "Proxy Information"
+        ],
+        "responses": {
+          "200": {
+            "description": "IP address statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "ipstat": {
+                      "type": "array",
+                      "description": "Array of IP statistics data",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=change_proxy_login_password": {
+      "get": {
+        "operationId": "changeProxyCredentials",
+        "summary": "Change proxy login/password",
+        "description": "Change the login and password for one or more proxies. If not specified, credentials are auto-generated.",
+        "tags": [
+          "Proxy Management"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "description": "Proxy ID (comma-separated for multiple: `1,2,3,4`)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "proxy_login",
+            "in": "query",
+            "required": false,
+            "description": "New login (only numbers and Latin letters). Auto-generated if omitted.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "proxy_pass",
+            "in": "query",
+            "required": false,
+            "description": "New password (only numbers and Latin letters). Auto-generated if omitted.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Credentials updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "proxy_id": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      },
+                      "description": "Array of proxy IDs"
+                    },
+                    "proxy_login": {
+                      "type": "string",
+                      "description": "New login"
+                    },
+                    "proxy_pass": {
+                      "type": "string",
+                      "description": "New password"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=reboot_proxy": {
+      "get": {
+        "operationId": "rebootProxy",
+        "summary": "Restart proxy",
+        "description": "Reboot the modem/equipment assigned to this proxy.",
+        "tags": [
+          "Proxy Management"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Proxy rebooted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Status message"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=edit_proxy": {
+      "get": {
+        "operationId": "editProxy",
+        "summary": "Edit proxy settings",
+        "description": "Change settings for one or more existing proxies — IP rotation timer, IP-based auth, auto-renewal, auto equipment change, and comments.",
+        "tags": [
+          "Proxy Management"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "description": "Proxy ID (comma-separated for multiple: `1,2,3,4`)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "proxy_reboot_time",
+            "in": "query",
+            "required": false,
+            "description": "IP change timer in minutes. Send `0` to disable.",
+            "schema": {
+              "type": "integer",
+              "example": 15
+            }
+          },
+          {
+            "name": "proxy_ipauth",
+            "in": "query",
+            "required": false,
+            "description": "IP addresses for auth without login/password (comma-separated IPv4). Supports subnets. Send `-1` to disable. Example: `192.168.34.76,123.123.212.0/24`",
+            "schema": {
+              "type": "string",
+              "example": "192.168.1.56,168.192.54.1"
+            }
+          },
+          {
+            "name": "proxy_auto_renewal",
+            "in": "query",
+            "required": false,
+            "description": "Auto-renewal: `1` = enabled (default), `0` = disabled",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ]
+            }
+          },
+          {
+            "name": "proxy_auto_change_equipment",
+            "in": "query",
+            "required": false,
+            "description": "Auto equipment change scope: `0` = off, `1` = unrestricted, `2` = same country, `3` = same region, `4` = same city",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            }
+          },
+          {
+            "name": "proxy_comment",
+            "in": "query",
+            "required": false,
+            "description": "Text comment (max 255 chars)",
+            "schema": {
+              "type": "string",
+              "maxLength": 255
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Settings updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "proxy_id": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      }
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "operationId": "changeIp",
+        "summary": "Change proxy IP address",
+        "description": "Rotate the proxy IP address. **No rate limit** on this endpoint.\n\nDoes **not** require Authorization header — only the proxy key and a valid User-Agent.\n\nThe proxy key is found in your dashboard: My Proxies → Change IP column.\n",
+        "tags": [
+          "IP Rotation"
+        ],
+        "security": [],
+        "servers": [
+          {
+            "url": "https://changeip.mobileproxy.space"
+          }
+        ],
+        "parameters": [
+          {
+            "name": "proxy_key",
+            "in": "query",
+            "required": true,
+            "description": "Proxy key (varchar(32)), found in the Change IP link under My Proxies",
+            "schema": {
+              "type": "string",
+              "maxLength": 32,
+              "example": "abcdegghijklmnopqrstuvwxyz123456"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "description": "Response format: `json` for JSON, `0` for plain text",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "0"
+              ],
+              "default": "json"
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "description": "Must be a real browser User-Agent (not a bot)",
+            "schema": {
+              "type": "string",
+              "example": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "IP changed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "description": "`ok` or `err`",
+                      "example": "ok"
+                    },
+                    "code": {
+                      "type": "integer",
+                      "description": "200 on success, other codes indicate specific errors",
+                      "example": 200
+                    },
+                    "new_ip": {
+                      "type": "string",
+                      "description": "New IP address",
+                      "example": "95.153.42.175"
+                    },
+                    "rt": {
+                      "type": "string",
+                      "description": "Time taken to change IP"
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Error description (on failure)"
+                    },
+                    "proxy_id": {
+                      "type": "integer",
+                      "description": "Proxy ID"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=change_equipment": {
+      "get": {
+        "operationId": "changeEquipment",
+        "summary": "Change equipment",
+        "description": "Switch the modem/SIM card assigned to a proxy. Optionally filter by operator, GEO, country, city, or specific equipment ID. Can add current equipment to blacklist.",
+        "tags": [
+          "Equipment & GEO"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "description": "Proxy ID (comma-separated for multiple: `1,2,3,4`)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "operator",
+            "in": "query",
+            "required": false,
+            "description": "Operator name (from `get_operators_list`)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "geoid",
+            "in": "query",
+            "required": false,
+            "description": "GEO ID (from `get_geo_list`)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id_country",
+            "in": "query",
+            "required": false,
+            "description": "Country ID (from `get_id_country`)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id_city",
+            "in": "query",
+            "required": false,
+            "description": "City ID (from `get_id_city`)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "eid",
+            "in": "query",
+            "required": false,
+            "description": "Specific equipment ID",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "add_to_black_list",
+            "in": "query",
+            "required": false,
+            "description": "Add current equipment to blacklist before switching. `1` = yes, `0` = no",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ]
+            }
+          },
+          {
+            "name": "check_after_change",
+            "in": "query",
+            "required": false,
+            "description": "Set to `true` to get the new IP address in the response",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            }
+          },
+          {
+            "name": "check_spam",
+            "in": "query",
+            "required": false,
+            "description": "Set to `true` to check new IP against spam databases (IPGuardian.net)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Equipment change result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "message": {
+                      "type": "object",
+                      "description": "Successful changes: keys = proxy IDs, values = success messages",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "description": "Failed changes: keys = proxy IDs, values = failure reasons",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "checked": {
+                      "type": "object",
+                      "description": "IP check results (if `check_after_change=true`): keys = proxy IDs, values = IP addresses",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "ipguardian.net": {
+                      "type": "object",
+                      "description": "Spam check results (if `check_spam=true`)"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_geo_operator_list": {
+      "get": {
+        "operationId": "getAvailableEquipment",
+        "summary": "Get available equipment by GEO",
+        "description": "Get available equipment grouped by GEO and operator, with count of free ports.",
+        "tags": [
+          "Equipment & GEO"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": false,
+            "description": "If specified, shows servers you can switch this proxy's GEO to",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "equipments_back_list",
+            "in": "query",
+            "required": false,
+            "description": "If present, excludes equipment from the blacklist",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "operators_back_list",
+            "in": "query",
+            "required": false,
+            "description": "If present, excludes operators from the blacklist",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "show_count_null",
+            "in": "query",
+            "required": false,
+            "description": "Show items with 0 available count. Default: false",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Available equipment grouped by GEO",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "geo_operator_list": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "geoid": {
+                            "type": "integer"
+                          },
+                          "geo_caption": {
+                            "type": "string"
+                          },
+                          "id_city": {
+                            "type": "integer",
+                            "description": "City ID (from `get_id_city`)"
+                          },
+                          "id_country": {
+                            "type": "integer",
+                            "description": "Country ID (from `get_id_country`)"
+                          },
+                          "count_free": {
+                            "type": "object",
+                            "description": "Object: keys = operator names, values = available equipment count",
+                            "additionalProperties": {
+                              "type": "integer"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_geo_list": {
+      "get": {
+        "operationId": "getGeoList",
+        "summary": "Get available GEOs",
+        "description": "Get list of available GEOs with free port counts. Optionally filter by proxy for GEO-switching options.",
+        "tags": [
+          "Equipment & GEO"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": false,
+            "description": "If specified, shows GEOs you can switch this proxy to",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "geoid",
+            "in": "query",
+            "required": false,
+            "description": "GEO ID(s) to filter. Comma-separated for multiple: `1,2,3,4`",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of available GEOs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "geoid": {
+                        "type": "integer"
+                      },
+                      "geo_caption": {
+                        "type": "string"
+                      },
+                      "ISO": {
+                        "type": "string",
+                        "description": "Country ISO code"
+                      },
+                      "count_free": {
+                        "type": "integer",
+                        "description": "Number of free ports"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_operators_list": {
+      "get": {
+        "operationId": "getOperators",
+        "summary": "Get operators",
+        "description": "Get list of mobile operators, optionally filtered by GEO with free port counts.",
+        "tags": [
+          "Equipment & GEO"
+        ],
+        "parameters": [
+          {
+            "name": "geoid",
+            "in": "query",
+            "required": false,
+            "description": "GEO ID(s). Comma-separated for multiple: `1,2,3,4`",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of operators",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "operator": {
+                        "type": "string",
+                        "description": "Operator name"
+                      },
+                      "id_country": {
+                        "type": "integer"
+                      },
+                      "count_free": {
+                        "type": "integer",
+                        "description": "Number of free ports"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_id_country": {
+      "get": {
+        "operationId": "getCountries",
+        "summary": "Get countries",
+        "description": "Get list of all countries. Supports `Accept-Language` header (`en` or `ru`).",
+        "tags": [
+          "Equipment & GEO"
+        ],
+        "parameters": [
+          {
+            "name": "only_avaliable",
+            "in": "query",
+            "required": false,
+            "description": "If set to `1`, returns only countries with available equipment and their counts",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                1
+              ]
+            }
+          },
+          {
+            "name": "Accept-Language",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "en",
+                "ru"
+              ],
+              "default": "ru"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of countries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "id_country": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id_country": {
+                            "type": "integer"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "iso": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_id_city": {
+      "get": {
+        "operationId": "getCities",
+        "summary": "Get cities",
+        "description": "Get list of all cities. Supports `Accept-Language` header (`en` or `ru`).",
+        "tags": [
+          "Equipment & GEO"
+        ],
+        "parameters": [
+          {
+            "name": "Accept-Language",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "en",
+                "ru"
+              ],
+              "default": "ru"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of cities",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "id_city": {
+                      "type": "object",
+                      "description": "Object: keys = city IDs, values = arrays with city ID, country name, and city name",
+                      "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_black_list": {
+      "get": {
+        "operationId": "getBlackList",
+        "summary": "Get blacklist",
+        "description": "Get the blacklist of equipment and operators for a proxy.",
+        "tags": [
+          "Blacklist"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "description": "Proxy ID (comma-separated for multiple: `1,2,3,4`)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Blacklist entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "black_list_equipment": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "black_list_id": {
+                            "type": "integer",
+                            "description": "Blacklist entry ID"
+                          },
+                          "eid": {
+                            "type": "integer",
+                            "description": "Equipment ID"
+                          },
+                          "proxy_id": {
+                            "type": "integer"
+                          },
+                          "operator_id": {
+                            "type": "integer"
+                          },
+                          "geoid": {
+                            "type": "integer"
+                          }
+                        }
+                      }
+                    },
+                    "black_list_operators": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "operator_black_list_id": {
+                            "type": "integer",
+                            "description": "Blacklist entry ID"
+                          },
+                          "proxy_id": {
+                            "type": "integer"
+                          },
+                          "operator_id": {
+                            "type": "integer"
+                          },
+                          "operator_name": {
+                            "type": "string"
+                          },
+                          "id_country": {
+                            "type": "integer"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=add_operator_to_black_list": {
+      "get": {
+        "operationId": "addOperatorToBlackList",
+        "summary": "Add operator to blacklist",
+        "description": "Block a specific operator for a proxy.",
+        "tags": [
+          "Blacklist"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "operator_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SuccessResponse"
+          }
+        }
+      }
+    },
+    "/api.html?command=remove_operator_black_list": {
+      "get": {
+        "operationId": "removeOperatorFromBlackList",
+        "summary": "Remove operator from blacklist",
+        "description": "Unblock an operator. If no parameters specified, clears the entire operator blacklist.",
+        "tags": [
+          "Blacklist"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": false,
+            "description": "Proxy ID (comma-separated for multiple)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "operator_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SuccessResponse"
+          }
+        }
+      }
+    },
+    "/api.html?command=remove_black_list": {
+      "get": {
+        "operationId": "removeFromBlackList",
+        "summary": "Remove equipment from blacklist",
+        "description": "Remove equipment from blacklist. If no parameters specified, clears the entire equipment blacklist.",
+        "tags": [
+          "Blacklist"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": false,
+            "description": "Proxy ID (comma-separated for multiple)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "black_list_id",
+            "in": "query",
+            "required": false,
+            "description": "Blacklist entry ID",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "eid",
+            "in": "query",
+            "required": false,
+            "description": "Equipment ID",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SuccessResponse"
+          }
+        }
+      }
+    },
+    "/api.html?command=buyproxy": {
+      "get": {
+        "operationId": "buyProxy",
+        "summary": "Purchase or extend proxy",
+        "description": "Purchase a new proxy or extend an existing one. Use `amount_only=true` to get the price without actually buying.",
+        "tags": [
+          "Purchasing & Billing"
+        ],
+        "parameters": [
+          {
+            "name": "id_country",
+            "in": "query",
+            "required": true,
+            "description": "Country ID (from `get_id_country`)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "period",
+            "in": "query",
+            "required": false,
+            "description": "Rental period in days. Default: 30",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                1,
+                7,
+                30,
+                90,
+                365
+              ],
+              "default": 30
+            }
+          },
+          {
+            "name": "num",
+            "in": "query",
+            "required": false,
+            "description": "Number of proxies to purchase. Default: 1",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "name": "operator",
+            "in": "query",
+            "required": false,
+            "description": "Preferred operator (from `get_operators_list`)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "geoid",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "id_city",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "coupons_code",
+            "in": "query",
+            "required": false,
+            "description": "Discount coupon code",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "auto_renewal",
+            "in": "query",
+            "required": false,
+            "description": "Auto-renewal: `1` = on (default), `0` = off",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ],
+              "default": 1
+            }
+          },
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": false,
+            "description": "Extend existing proxy ID(s). Comma-separated for multiple.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "amount_only",
+            "in": "query",
+            "required": false,
+            "description": "If `true`, returns the price without purchasing",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Purchase result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "proxy_id": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      },
+                      "description": "Array of purchased/extended proxy IDs"
+                    },
+                    "amount": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Amount charged from balance"
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Status message"
+                    },
+                    "proxy_data": {
+                      "type": "array",
+                      "description": "Purchased proxy details (same format as `get_my_proxy`)",
+                      "items": {
+                        "$ref": "#/components/schemas/Proxy"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=refund_proxy": {
+      "get": {
+        "operationId": "refundProxy",
+        "summary": "Refund proxy",
+        "description": "Request a refund for a proxy.",
+        "tags": [
+          "Purchasing & Billing"
+        ],
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SuccessResponse"
+          }
+        }
+      }
+    },
+    "/api.html?command=get_balance": {
+      "get": {
+        "operationId": "getBalance",
+        "summary": "Get account balance",
+        "description": "Get your current account balance.",
+        "tags": [
+          "Purchasing & Billing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Account balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "balance": {
+                      "type": "number",
+                      "description": "Current account balance",
+                      "example": 1500.5
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_price": {
+      "get": {
+        "operationId": "getPrices",
+        "summary": "Get prices",
+        "description": "Get proxy prices for specific countries. Supports `Accept-Language` header and currency parameter.",
+        "tags": [
+          "Purchasing & Billing"
+        ],
+        "parameters": [
+          {
+            "name": "id_country",
+            "in": "query",
+            "required": true,
+            "description": "Country ID(s). Comma-separated for multiple: `1,2,3,4`",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "currency",
+            "in": "query",
+            "required": false,
+            "description": "Currency: `usd` or `rub` (default: `rub`)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "usd",
+                "rub"
+              ],
+              "default": "rub"
+            }
+          },
+          {
+            "name": "Accept-Language",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "en",
+                "ru"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Price list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "price": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id_country": {
+                            "type": "integer"
+                          },
+                          "iso": {
+                            "type": "string",
+                            "description": "Country ISO code"
+                          },
+                          "amount": {
+                            "type": "number",
+                            "description": "Price amount"
+                          },
+                          "country_name": {
+                            "type": "string"
+                          },
+                          "period": {
+                            "type": "integer",
+                            "description": "Period in days"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_test_proxy": {
+      "get": {
+        "operationId": "getTestProxy",
+        "summary": "Get free test proxy",
+        "description": "Get a free 2-hour trial proxy for testing.",
+        "tags": [
+          "Purchasing & Billing"
+        ],
+        "parameters": [
+          {
+            "name": "geoid",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "operator",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Test proxy details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=get_history": {
+      "get": {
+        "operationId": "getHistory",
+        "summary": "Get transaction history",
+        "description": "Get the history of balance transactions (payments, purchases, refunds).",
+        "tags": [
+          "Purchasing & Billing"
+        ],
+        "parameters": [
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "description": "Offset for pagination. Default: 0",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          {
+            "name": "length",
+            "in": "query",
+            "required": false,
+            "description": "Number of records to return. Default: 50",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transaction history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "history": {
+                      "type": "array",
+                      "description": "Array of transaction records",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=see_the_url_from_different_IPs": {
+      "post": {
+        "operationId": "viewUrlFromDifferentIps",
+        "summary": "View URL from different IPs",
+        "description": "Anti-cloaking tool — fetch a URL's content using IP addresses from different countries.\nCreates an async task. Use `getTaskResult` to retrieve the results after `approximate_end_time`.\nIf `id_country` is omitted, the page is fetched from all available countries.\n",
+        "tags": [
+          "Utilities"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "url"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "description": "URL to fetch",
+                    "example": "https://example.com"
+                  },
+                  "id_country": {
+                    "type": "string",
+                    "description": "Country ID(s), comma-separated. Omit for all countries.",
+                    "example": "1,2,3"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Task created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Error description (on failure)"
+                    },
+                    "tasks_id": {
+                      "type": "integer",
+                      "description": "Task ID"
+                    },
+                    "task_check_url": {
+                      "type": "string",
+                      "description": "URL to check task result"
+                    },
+                    "approximate_end_time": {
+                      "type": "string",
+                      "description": "Approximate completion time — query results after this"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=tasks": {
+      "get": {
+        "operationId": "getTaskResult",
+        "summary": "Get task result",
+        "description": "Get the result of an async task. If `tasks_id` is omitted, returns all user tasks.",
+        "tags": [
+          "Utilities"
+        ],
+        "parameters": [
+          {
+            "name": "tasks_id",
+            "in": "query",
+            "required": false,
+            "description": "Task ID (from `see_the_url_from_different_IPs`). Omit to get all tasks.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "tasks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "tasks_id": {
+                            "type": "integer"
+                          },
+                          "tasks_start_time": {
+                            "type": "string",
+                            "description": "Task start time"
+                          },
+                          "tasks_end_time": {
+                            "type": "string",
+                            "description": "Task completion time"
+                          },
+                          "tasks_status": {
+                            "type": "integer",
+                            "description": "Status: `0` = created, `1` = in progress, `2` = completed",
+                            "enum": [
+                              0,
+                              1,
+                              2
+                            ]
+                          },
+                          "tasks_result": {
+                            "type": "object",
+                            "description": "Results: keys = country IDs, values = arrays with URL and page content"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api.html?command=eid_avaliable": {
+      "get": {
+        "operationId": "checkEquipmentAvailability",
+        "summary": "Check equipment availability",
+        "description": "Check if specific equipment (modem) is occupied or available for rent.",
+        "tags": [
+          "Utilities"
+        ],
+        "parameters": [
+          {
+            "name": "eid",
+            "in": "query",
+            "required": true,
+            "description": "Equipment ID(s). Comma-separated for multiple: `1,2,3,4`",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Equipment availability",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "description": "`ok` or `err`",
+                      "example": "ok"
+                    },
+                    "eid": {
+                      "type": "object",
+                      "description": "Keys = equipment IDs, values: `0` = occupied, `1` = available",
+                      "additionalProperties": {
+                        "type": "integer",
+                        "enum": [
+                          0,
+                          1
+                        ]
+                      },
+                      "example": {
+                        "123": 1,
+                        "456": 0
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API token from your dashboard. Pass as `Authorization: Bearer YOUR_TOKEN`.\n"
+      }
+    },
+    "schemas": {
+      "Proxy": {
+        "type": "object",
+        "description": "Active proxy details",
+        "properties": {
+          "proxy_id": {
+            "type": "integer",
+            "description": "Proxy ID"
+          },
+          "proxy_exp": {
+            "type": "string",
+            "description": "Expiration date and time"
+          },
+          "proxy_login": {
+            "type": "string",
+            "description": "Login for proxy authentication"
+          },
+          "proxy_pass": {
+            "type": "string",
+            "description": "Password for proxy authentication"
+          },
+          "proxy_hostname": {
+            "type": "string",
+            "description": "Proxy server address"
+          },
+          "proxy_host_ip": {
+            "type": "string",
+            "description": "Proxy server IP address"
+          },
+          "proxy_independent_http_hostname": {
+            "type": "string",
+            "description": "Equipment-independent HTTP proxy address"
+          },
+          "proxy_independent_http_host_ip": {
+            "type": "string",
+            "description": "Equipment-independent HTTP proxy IP"
+          },
+          "proxy_independent_socks5_hostname": {
+            "type": "string",
+            "description": "Equipment-independent SOCKS5 proxy address"
+          },
+          "proxy_independent_socks5_host_ip": {
+            "type": "string",
+            "description": "Equipment-independent SOCKS5 proxy IP"
+          },
+          "proxy_independent_port": {
+            "type": "integer",
+            "description": "Equipment-independent port"
+          },
+          "proxy_http_port": {
+            "type": "integer",
+            "description": "HTTP port"
+          },
+          "proxy_socks5_port": {
+            "type": "integer",
+            "description": "SOCKS5 port"
+          },
+          "proxy_operator": {
+            "type": "string",
+            "description": "Mobile operator name"
+          },
+          "proxy_geo": {
+            "type": "string",
+            "description": "Proxy GEO location"
+          },
+          "proxy_auto_renewal": {
+            "type": "integer",
+            "description": "Auto-renewal: `1` = on (default), `0` = off",
+            "enum": [
+              0,
+              1
+            ]
+          },
+          "proxy_change_ip_url": {
+            "type": "string",
+            "description": "URL to change IP address"
+          },
+          "proxy_reboot_time": {
+            "type": "integer",
+            "description": "IP change timer (minutes)"
+          },
+          "proxy_ipauth": {
+            "type": "string",
+            "description": "IP addresses for passwordless auth"
+          },
+          "proxy_groups_name": {
+            "type": "string",
+            "description": "Group name (if grouped)"
+          },
+          "proxy_auto_change_equipment": {
+            "type": "integer",
+            "description": "Auto equipment change: `0`=off, `1`=any, `2`=country, `3`=region, `4`=city",
+            "enum": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ]
+          },
+          "eid": {
+            "type": "integer",
+            "description": "Equipment ID"
+          },
+          "geoid": {
+            "type": "integer",
+            "description": "GEO ID"
+          },
+          "id_country": {
+            "type": "integer",
+            "description": "Country ID"
+          },
+          "proxy_self": {
+            "type": "string",
+            "description": "Self-hosted flag"
+          },
+          "proxy_testing": {
+            "type": "string",
+            "description": "Testing flag"
+          },
+          "proxy_comment": {
+            "type": "string",
+            "description": "Text comment"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error message",
+            "example": "Too many requests per second"
+          }
+        }
+      }
+    },
+    "responses": {
+      "SuccessResponse": {
+        "description": "Operation completed successfully",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "example": "ok"
+                }
+              }
+            }
+          }
+        }
+      },
+      "RateLimitError": {
+        "description": "Rate limit exceeded",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "tooManyPerSecond": {
+                "value": {
+                  "error": "Too many requests per second"
+                }
+              },
+              "tooManyIdentical": {
+                "value": {
+                  "error": "Too many lonely requests. Timeout 5 second"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
