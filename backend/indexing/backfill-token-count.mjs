@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * scripts/backfill-token-count.mjs — добить tokens_jina_v4 / tokens_jina_v3
+ * backend/indexing/backfill-token-count.mjs — добить tokens_jina_v4 / tokens_jina_v3
  * для уже скачанных актов, у которых хотя бы одно из чисел NULL.
  *
  * Запуск:
- *   node --env-file=.env scripts/backfill-token-count.mjs
+ *   node --env-file=.env backend/indexing/backfill-token-count.mjs
  *
  * ENV:
  *   RAS_BACKFILL_BATCH     размер пачки за UPDATE (default 200)

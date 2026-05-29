@@ -11,7 +11,7 @@
  * Когда вызывать:
  *   1) parser.js после _saveDecisionLinks — если резолвер только что флипнул
  *      какие-то акты в keep=false, мы их подбираем синхронно.
- *   2) Standalone-скрипт `scripts/cleanup-invalid-acts.js` — для one-shot
+ *   2) Standalone-скрипт `backend/tools/cleanup-invalid-acts.js` — для one-shot
  *      sweep'а (например, после введения этого механизма для legacy-сирот).
  *
  * Идемпотентность: повторный вызов на «уже чистой» БД ничего не делает (запрос

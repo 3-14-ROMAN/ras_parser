@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// scripts/index-long-budgeted.mjs — one-off budgeted overnight indexer
+// backend/indexing/index-long-budgeted.mjs — one-off budgeted overnight indexer
 // для длинных актов (is_long_act=TRUE) в выбранном диапазоне токенов.
 //
 // Зачем: production worker (embed/worker.js) индексирует по фиксированному
@@ -37,7 +37,7 @@
 //   --stop-on-error=1        останавливаться при первой ошибке batch'а
 //
 // Пример:
-//   node --env-file=.env scripts/index-long-budgeted.mjs \
+//   node --env-file=.env backend/indexing/index-long-budgeted.mjs \
 //     --limit=300 --min-tokens=8001 --max-tokens=15000 \
 //     --max-parallel=3 --budget=30000
 import { selectPendingLongInTokenRange, markEmbedError, isActVerdictKeep } from "../db/actsRepo.js";

@@ -5,7 +5,7 @@ set -euo pipefail
 # В начале спрашивает: показывать экран или нет. Если нет — Xvfb/VNC не поднимаются.
 #
 # Usage:
-#   scripts/start_visible_parser.sh
+#   ops/start_visible_parser.sh
 # Optional env:
 #   DISPLAY_NUM=99
 #   SCREEN_GEOMETRY=1920x1080x24

@@ -233,7 +233,7 @@ function _asJsonb(v) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Очередь PDF-pipeline (download → extract). Используется scripts/download-acts.js.
+// Очередь PDF-pipeline (download → extract). Используется backend/tools/download-acts.js.
 //
 // Стейт-машина одной строки `acts` по полям этого модуля:
 //

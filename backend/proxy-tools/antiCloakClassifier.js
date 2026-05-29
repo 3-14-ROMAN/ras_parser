@@ -1,5 +1,5 @@
 /**
- * scripts/antiCloakClassifier.js — defensive parser/classifier для ответа
+ * backend/proxy-tools/antiCloakClassifier.js — defensive parser/classifier для ответа
  * MobileProxy.Space anti-cloaking task (`see_the_url_from_different_IPs`).
  *
  * Контракт API нестабильный — поля встречаются под разными именами в разных

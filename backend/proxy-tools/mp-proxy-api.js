@@ -6,11 +6,11 @@
  * Дополнительно: ip (rotate), list (get_geo_operator_list).
  *
  * Запуск (из корня репозитория):
- *   node --env-file=.env scripts/mp-proxy-api.js operator
- *   node --env-file=.env scripts/mp-proxy-api.js geo
- *   node --env-file=.env scripts/mp-proxy-api.js geo --raw
- *   node --env-file=.env scripts/mp-proxy-api.js ip
- *   node --env-file=.env scripts/mp-proxy-api.js list
+ *   node --env-file=.env backend/proxy-tools/mp-proxy-api.js operator
+ *   node --env-file=.env backend/proxy-tools/mp-proxy-api.js geo
+ *   node --env-file=.env backend/proxy-tools/mp-proxy-api.js geo --raw
+ *   node --env-file=.env backend/proxy-tools/mp-proxy-api.js ip
+ *   node --env-file=.env backend/proxy-tools/mp-proxy-api.js list
  *
  * По умолчанию cooldown между сменами оборудования отключён (0),
  * чтобы ручной запрос не ждал лишних секунд. Флаг --respect-cooldown
@@ -31,7 +31,7 @@ import { RasProxyClient } from "../network/proxyClient.js";
 function usage() {
   process.stderr.write(
     `Использование:
-  node --env-file=.env scripts/mp-proxy-api.js <команда> [опции]
+  node --env-file=.env backend/proxy-tools/mp-proxy-api.js <команда> [опции]
 
 Команды:
   operator   — сменить оператора в текущем гео (L2 эскалатора)

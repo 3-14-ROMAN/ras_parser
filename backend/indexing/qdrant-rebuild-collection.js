@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/qdrant-rebuild-collection.js — пересборка Qdrant-коллекции `ras_acts`.
+ * backend/indexing/qdrant-rebuild-collection.js — пересборка Qdrant-коллекции `ras_acts`.
  *
  * Зачем: миграция Шага 1 (model fixation) ломает старую vector-схему
  *   {colbert, muvera}
@@ -24,11 +24,11 @@
  *      обратно в 'pending', чтобы индексер пересобрал точки.
  *
  * Запуск:
- *   node --env-file=.env scripts/qdrant-rebuild-collection.js
+ *   node --env-file=.env backend/indexing/qdrant-rebuild-collection.js
  *
  * После прогона:
  *   npm run db:migrate          # no-op, проверка схемы
- *   node --env-file=.env scripts/index-acts-qdrant-fullact.js 5    # smoke
+ *   node --env-file=.env backend/indexing/index-acts-qdrant-fullact.js 5    # smoke
  */
 
 import process from "node:process";

@@ -8,7 +8,7 @@ Doczilla API (`/doczilla-api/document/*`). Цель — дать внешним 
 свои клиенты: знакомые методы `createDocz` / `fillDocz` / `getById` / `get` /
 `structureRead`, знакомая структура ответов `{ success, data | error, message }`.
 
-Endpoint prefix: `/doczilla-api/*`. Mount внутри `scripts/search-api.js`.
+Endpoint prefix: `/doczilla-api/*`. Mount внутри `backend/search/search-api.js`.
 
 ## Что это НЕ
 
@@ -277,5 +277,5 @@ curl -sS -X POST -H "content-type: application/json" \
 npm run search:api
 # В другом:
 npm run db:migrate-reports       # один раз, идемпотентно
-./scripts/doczilla-smoke.sh
+./ops/doczilla-smoke.sh
 ```

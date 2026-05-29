@@ -1,8 +1,8 @@
 /**
- * scripts/searchPipeline.js — чистый pipeline поиска без HTTP-обвязки.
+ * backend/search/searchPipeline.js — чистый pipeline поиска без HTTP-обвязки.
  *
- * Извлечён из scripts/search-api.js (где он был приватной функцией) ради
- * переиспользования из scripts/doczilla-facade.js. Логика поиска НЕ менялась —
+ * Извлечён из backend/search/search-api.js (где он был приватной функцией) ради
+ * переиспользования из backend/search/doczilla-facade.js. Логика поиска НЕ менялась —
  * это безопасный refactor-вытащить.
  *
  * Pipeline: HyDE (опционально) → searchAndRerank → summary (опционально).
@@ -12,8 +12,8 @@
  * logRow — готовая строка для INSERT в ras_pg_logs.searches.
  *
  * Вызывается из:
- *   - scripts/search-api.js → /search, /search/stream
- *   - scripts/doczilla-facade.js → POST /doczilla-api/document/fillDocz
+ *   - backend/search/search-api.js → /search, /search/stream
+ *   - backend/search/doczilla-facade.js → POST /doczilla-api/document/fillDocz
  */
 
 import crypto from "node:crypto";

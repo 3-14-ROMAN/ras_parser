@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/profile-search-pipeline.js — диагностический замер времени
+ * backend/tools/profile-search-pipeline.js — диагностический замер времени
  * на каждом этапе search pipeline. НЕ ХОДИТ через withSearchLease, чтобы
  * не вешать прод-сервис /search; вызывает все branch-функции напрямую.
  *
@@ -12,10 +12,10 @@
  * limit/prefetch, elapsed_ms; плюс embedQuery, RRF merge, hydrate, rerank.
  *
  * Запуск:
- *   node --env-file=.env scripts/profile-search-pipeline.js
+ *   node --env-file=.env backend/tools/profile-search-pipeline.js
  *
  * Опц.: своя строка запроса:
- *   QUERY="хочу взыскать долг" node --env-file=.env scripts/profile-search-pipeline.js
+ *   QUERY="хочу взыскать долг" node --env-file=.env backend/tools/profile-search-pipeline.js
  */
 
 import {

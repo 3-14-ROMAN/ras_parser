@@ -288,7 +288,7 @@ export async function embedChunkActBatch(batchSize, log = console.log) {
   return { batchSize: batch.length, indexed, errored, staleVerdict, totalChunks };
 }
 
-// Public alias для one-off скриптов (см. scripts/index-long-budgeted.mjs):
+// Public alias для one-off скриптов (см. backend/indexing/index-long-budgeted.mjs):
 // они сами выбирают акты по своим критериям (token range, parallel budget),
 // им нужен только тонкий wrapper на одну индексацию.
 export { indexOne as indexOneLongAct };

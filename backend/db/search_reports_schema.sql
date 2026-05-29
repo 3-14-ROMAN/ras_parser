@@ -1,5 +1,5 @@
 -- db/search_reports_schema.sql — таблица search_reports для Doczilla-совместимого
--- API facade'а (см. scripts/doczilla-facade.js). Идемпотентна.
+-- API facade'а (см. backend/search/doczilla-facade.js). Идемпотентна.
 --
 -- Применить:
 --   docker exec -i ras_pg psql -U ras -d ras < db/search_reports_schema.sql

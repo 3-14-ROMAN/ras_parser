@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS acts (
     --                     вместе с tokens_jina_v3. См. pdf/jinaV3Tokens.js
     --                     → countActTokens. NULL если в момент скачивания
     --                     inference был недоступен → backfill через
-    --                     scripts/backfill-token-count.mjs.
+    --                     backend/indexing/backfill-token-count.mjs.
     --                     ИСПОЛЬЗОВАНИЕ: is_long_act и роутинг full_act/late_chunks.
     -- tokens_jina_v3    — счёт токенов через tokenizer jina-reranker-v3 (Qwen3).
     --                     Считается там же одним RTT с tokens_jina_v4. NULL
@@ -254,7 +254,7 @@ CREATE INDEX IF NOT EXISTS idx_acts_vector_status   ON acts (vector_status);
 CREATE INDEX IF NOT EXISTS idx_acts_metadata_gin    ON acts USING GIN (raw_metadata jsonb_path_ops);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Координация прокси между процессами (parser.js ↔ scripts/download-acts.js).
+-- Координация прокси между процессами (parser.js ↔ backend/tools/download-acts.js).
 -- Без неё оба процесса могут вцепиться в один MP_PROXY_KEY и крутить changeIp
 -- друг на друга → разнос куки/IP, лишний расход cooldown'ов.
 --

@@ -20,7 +20,7 @@
  *   - "tiny"           — тело подозрительно короткое (<TINY_BODY_BYTES)
  *   - "unknown"        — content-type не распознан, маркеров нет
  *
- * Маркеры намеренно дублируются с scripts/antiCloakClassifier.js: тут
+ * Маркеры намеренно дублируются с backend/proxy-tools/antiCloakClassifier.js: тут
  * — узкий single-purpose классификатор без зависимостей от чужого формата
  * (item/raw/bodyMinBytes), его проще покрыть unit-тестом.
  */

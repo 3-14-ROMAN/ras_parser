@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/doczilla-smoke.sh — smoke-тест Doczilla facade'а для RAS Search — Supply.
+# ops/doczilla-smoke.sh — smoke-тест Doczilla facade'а для RAS Search — Supply.
 #
 # Покрывает:
 #   1.  login (dev-open или с apiKey, если задан DOCZILLA_API_TOKEN)
@@ -19,7 +19,7 @@
 # Использование:
 #   1) Запустить API: npm run search:api
 #   2) Применить миграцию (один раз): npm run db:migrate-reports
-#   3) ./scripts/doczilla-smoke.sh
+#   3) ./ops/doczilla-smoke.sh
 #
 # ENV:
 #   BASE  — base URL (default: http://127.0.0.1:8091)

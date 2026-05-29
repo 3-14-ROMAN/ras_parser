@@ -3,7 +3,7 @@
 
 **Дата:** 2026-05-26
 **Версия:** commits `3609a64`, `2bd4da0` на `main`
-**Endpoint prefix:** `/doczilla-api/*` (внутри `scripts/search-api.js`, порт 8091)
+**Endpoint prefix:** `/doczilla-api/*` (внутри `backend/search/search-api.js`, порт 8091)
 
 ---
 
@@ -108,8 +108,8 @@ Jina rerank + опциональный Gemini Summary, синхронно (~10�
 | **Auth — dev-open mode**                 | при незаданном `DOCZILLA_API_TOKEN` любой `apiKey`/`login` проходит; в startup-логе печатается WARN |
 | **Стабильные HTTP коды**                 | 200 / 400 bad_request / 401 unauthorized / 404 not_found / 405 method_not_allowed / 409 report_not_completed / 500 internal_error / 501 not_implemented |
 | **Стабильные error codes**               | `bad_request`, `unauthorized`, `not_found`, `report_not_completed`, `not_implemented`, `internal_error`, `method_not_allowed`, `unsupported_template` |
-| **Smoke-тест**                           | `./scripts/doczilla-smoke.sh` — **14 assertions** (login, structureRead 404, get 409, fillDocz 400/404, real fillDocz, getById, get json+html, проверки XSS, get pdf 501, move 501, create 501, getByLink 501, users/read 501, users/whatever 501) |
-| **Regression старых endpoints**          | `/health`, `/stats`, `/hyde`, `/search`, `/search/stream` — все работают после рефакторинга (`scripts/searchPipeline.js` извлечён из `search-api.js` без изменений логики) |
+| **Smoke-тест**                           | `./ops/doczilla-smoke.sh` — **14 assertions** (login, structureRead 404, get 409, fillDocz 400/404, real fillDocz, getById, get json+html, проверки XSS, get pdf 501, move 501, create 501, getByLink 501, users/read 501, users/whatever 501) |
+| **Regression старых endpoints**          | `/health`, `/stats`, `/hyde`, `/search`, `/search/stream` — все работают после рефакторинга (`backend/search/searchPipeline.js` извлечён из `search-api.js` без изменений логики) |
 | **DB schema идемпотентна**               | `npm run db:migrate-reports` — повторный запуск не ломает существующие данные |
 | **Защита тонкой схемы аутентификации**   | facade-routes (createDocz/fillDocz/get) НЕ проверяют token; защита публичного endpoint'а — на уровне reverse-proxy/firewall (отдельный слой, не зона facade) |
 
@@ -178,9 +178,9 @@ sudo systemctl restart ras-search-api
 
 ### Acceptance smoke:
 ```bash
-./scripts/doczilla-smoke.sh
+./ops/doczilla-smoke.sh
 # с токеном:
-DOCZILLA_API_TOKEN=<секретный-токен> ./scripts/doczilla-smoke.sh
+DOCZILLA_API_TOKEN=<секретный-токен> ./ops/doczilla-smoke.sh
 ```
 
 ### Curl quickstart:
@@ -259,11 +259,11 @@ curl -sS -X POST -H "content-type: application/json" \
 
 ## Связанные файлы
 
-- `scripts/doczilla-facade.js` — основной код facade
-- `scripts/searchPipeline.js` — извлечённый pipeline (используется и /search, и fillDocz)
-- `scripts/search-api.js` — HTTP-сервер, mount /doczilla-api/* → facade
+- `backend/search/doczilla-facade.js` — основной код facade
+- `backend/search/searchPipeline.js` — извлечённый pipeline (используется и /search, и fillDocz)
+- `backend/search/search-api.js` — HTTP-сервер, mount /doczilla-api/* → facade
 - `db/searchReportsRepo.js` — CRUD над `search_reports`
 - `db/search_reports_schema.sql` — миграция (идемпотентна)
-- `scripts/doczilla-smoke.sh` — acceptance smoke (14 assertions)
+- `ops/doczilla-smoke.sh` — acceptance smoke (14 assertions)
 - `docs/doczilla-api.md` — детальная документация для интегратора
 - `docs/doczilla-acceptance-report.md` — этот документ

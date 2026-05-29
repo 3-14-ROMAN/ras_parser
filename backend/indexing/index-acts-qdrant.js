@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * scripts/index-acts-qdrant.js — CLI: одна пачка chunk-индексации (длинные акты).
+ * backend/indexing/index-acts-qdrant.js — CLI: одна пачка chunk-индексации (длинные акты).
  *
- * Тонкая обёртка над embed/chunk.js. Worker — `scripts/embed-worker.js`
+ * Тонкая обёртка над embed/chunk.js. Worker — `backend/indexing/embed-worker.js`
  * (бесконечный цикл); этот скрипт — для разового прогона / smoke / отладки.
  *
  * Запуск:
- *   node --env-file=.env scripts/index-acts-qdrant.js [LIMIT]
+ *   node --env-file=.env backend/indexing/index-acts-qdrant.js [LIMIT]
  *   npm run embed:chunk -- 2
  *
  * ВАЖНО: chunk-индексация использует только REAL late chunking:

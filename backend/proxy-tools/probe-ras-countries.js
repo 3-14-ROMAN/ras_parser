@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/probe-ras-countries.js — country-level разведка через MobileProxy
+ * backend/proxy-tools/probe-ras-countries.js — country-level разведка через MobileProxy
  * Anti-cloaking API (`see_the_url_from_different_IPs`).
  *
  * Цель: до запуска тяжёлого download:acts найти страны, у которых пул IP

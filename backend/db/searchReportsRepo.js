@@ -1,7 +1,7 @@
 /**
  * db/searchReportsRepo.js — CRUD над таблицей search_reports.
  *
- * Используется Doczilla-фасадом (scripts/doczilla-facade.js): создание
+ * Используется Doczilla-фасадом (backend/search/doczilla-facade.js): создание
  * "Doczilla docz" → запуск поиска → отдача результата по getById/get.
  *
  * Все методы кидают исключение при сетевой/sql-ошибке — caller (HTTP-handler)

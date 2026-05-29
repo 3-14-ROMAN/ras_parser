@@ -86,7 +86,7 @@ const PDF_TIMING = (process.env.RAS_PDF_TIMING ?? "0") === "1";
 /**
  * No-progress watchdog. Если ни один PDF не сохранён за STUCK_TIMEOUT_MS —
  * логируем warning. Если за STUCK_FATAL_MS — кидаем ошибку, и supervisor в
- * scripts/download-acts.js перезапустит весь пайплайн (закроет Chromium-ы,
+ * backend/tools/download-acts.js перезапустит весь пайплайн (закроет Chromium-ы,
  * пересоздаст пул, освободит lease — чистый рестарт). Это страховка от ситуации,
  * когда все воркеры залипли в карантине / прокси-сервер тихо умер / PG ушла
  * в read-only.

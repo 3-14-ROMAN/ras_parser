@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/search-api.js — локальный HTTP API над embed/retrieval.js::searchAndRerank.
+ * backend/search/search-api.js — локальный HTTP API над embed/retrieval.js::searchAndRerank.
  *
  * Минимальный node:http сервер, два эндпоинта:
  *
@@ -67,7 +67,7 @@
  *   RAS_SEARCH_API_DEFAULT_TOPN 5
  *
  *   плюс все RAS_RERANK_* / RAS_RRF_* — пробрасываются как параметры
- *   searchAndRerank один-в-один, см. scripts/search-qdrant-rerank.js.
+ *   searchAndRerank один-в-один, см. backend/search/search-qdrant-rerank.js.
  */
 
 import http from "node:http";
@@ -585,7 +585,7 @@ const server = http.createServer(async (req, res) => {
       await handleStats(req, res);
       return;
     }
-    // Doczilla-compatible API facade (scripts/doczilla-facade.js).
+    // Doczilla-compatible API facade (backend/search/doczilla-facade.js).
     // Возвращает true если сам обработал запрос; false — значит pathname
     // не /doczilla-api/*, продолжаем дефолтный 404.
     if (url.pathname.startsWith("/doczilla-api/")) {
