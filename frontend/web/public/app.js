@@ -57,8 +57,9 @@ const el = {
   settings:     $("#settingsPanel"),
   progress:     $("#progress"),
   results:      $("#results"),
-  dbStatus:     $("#dbStatus"),
-  dbStatusText: $("#dbStatusText"),
+  menuStats:    $("#menuStats"),
+  exampleQuery: $("#exampleQuery"),
+  statusBody:   $("#statusBody"),
   // settings controls
   topN:         $("#topN"),
   topNOut:      $("#topNOut"),
@@ -120,6 +121,22 @@ function fmtElapsed(ms) {
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s} сек`;
   return `${Math.floor(s / 60)} мин ${s % 60} сек`;
+}
+function fmtPct(p) {
+  if (p === null || p === undefined || !Number.isFinite(Number(p))) return "—";
+  return Number(p).toFixed(2) + "%";
+}
+// «X назад» — как formatAgo в боте.
+function formatAgo(ms) {
+  ms = Number(ms);
+  if (!Number.isFinite(ms) || ms < 0) return "только что";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s} с`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} мин`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} ч`;
+  return `${Math.floor(h / 24)} д`;
 }
 function escapeHtml(s) {
   if (s === null || s === undefined) return "";
@@ -247,23 +264,38 @@ function wireSettings() {
 
 // ─── stats / db pill ─────────────────────────────────────────────────────────
 
+let _lastStats = null;
+
 async function refreshStats() {
   try {
     const r = await fetch("/api/stats", { headers: { accept: "application/json" } });
     const j = await r.json();
-    if (j.warming_up) {
-      el.dbStatus.className = "db-pill is-warm";
-      el.dbStatusText.textContent = "база прогревается…";
-    } else if (Number.isFinite(Number(j.qdrant_acts))) {
-      el.dbStatus.className = "db-pill is-live";
-      el.dbStatusText.innerHTML = `в поиске <b>${fmtNum(j.qdrant_acts)}</b> актов`;
+    _lastStats = j;
+    // Строка статистики в меню — дословно как buildMenuText в боте.
+    if (!j.warming_up && Number.isFinite(Number(j.qdrant_acts))) {
+      el.menuStats.innerHTML = `База пополняется. Сейчас в поиске <b>${fmtNum(j.qdrant_acts)}</b> судебных актов.`;
+      el.menuStats.classList.remove("hidden");
     } else {
-      throw new Error("no count");
+      el.menuStats.classList.add("hidden");
     }
   } catch {
-    el.dbStatus.className = "db-pill is-down";
-    el.dbStatusText.textContent = "база недоступна";
+    _lastStats = null;
+    el.menuStats.classList.add("hidden");
   }
+}
+
+// Статус базы — formatStats из бота.
+function renderStatus() {
+  const s = _lastStats;
+  if (!s) { el.statusBody.textContent = "Статистика недоступна, попробуйте позже."; return; }
+  if (s.warming_up) { el.statusBody.textContent = "⏳ Статистика обновляется, попробуйте через минуту."; return; }
+  el.statusBody.innerHTML = [
+    `🔗 Собрано ссылок: <b>${fmtNum(s.total_links)}</b>`,
+    `✅ Валидных ссылок: <b>${fmtNum(s.valid_links)}</b>`,
+    `📄 Скачано текстов: <b>${fmtNum(s.downloaded_acts)}</b> · ${fmtPct(s.downloaded_pct_of_valid)}`,
+    `🪄 В векторной базе: <b>${fmtNum(s.qdrant_acts)}</b> · ${fmtPct(s.qdrant_pct_of_downloaded)}`,
+    `🕒 Обновлено: ${formatAgo(s.age_ms)} назад`,
+  ].map((l) => `<div class="statbox__row">${l}</div>`).join("");
 }
 
 // ─── progress (live SSE stages) ──────────────────────────────────────────────
@@ -272,7 +304,7 @@ function buildStages() {
   const stages = [];
   if (settings.use_hyde)    stages.push({ id: "hyde",    ico: "🪄", label: "LLM подготавливает запрос" });
   stages.push({ id: "search", ico: "🔎", label: "Ищу по базе судебных актов" });
-  if (settings.use_summary) stages.push({ id: "summary", ico: "⚖️", label: "LLM анализирует найденные акты" });
+  if (settings.use_summary) stages.push({ id: "summary", ico: "⚖️", label: "LLM анализирует тексты найденных актов" });
   return stages;
 }
 
@@ -427,7 +459,7 @@ function actCard(r, i) {
 
   const links = [];
   if (r.pdf_link) {
-    links.push(`<a class="act__link" href="${escapeHtml(r.pdf_link)}" target="_blank" rel="noopener noreferrer">🔗 PDF акта</a>`);
+    links.push(`<a class="act__link" href="${escapeHtml(r.pdf_link)}" target="_blank" rel="noopener noreferrer">🔗 Открыть PDF</a>`);
   }
   const kad = kadCardUrl(r.case_id);
   if (kad) links.push(`<a class="act__link" href="${escapeHtml(kad)}" target="_blank" rel="noopener noreferrer">🗂 Карточка дела</a>`);
@@ -640,6 +672,7 @@ async function onVoiceStop() {
 // ─── modals ──────────────────────────────────────────────────────────────────
 
 function openModal(name) {
+  if (name === "status") renderStatus();
   const m = document.getElementById("modal-" + name);
   if (m) m.classList.remove("hidden");
 }
@@ -665,11 +698,12 @@ function init() {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); doSearch(); }
   });
 
-  // example
+  // example (как /test в боте — подставляет пример и запускает поиск)
+  el.exampleQuery.textContent = TEST_QUERY;
   el.exampleBtn.addEventListener("click", () => {
     el.query.value = TEST_QUERY;
     el.query.dispatchEvent(new Event("input"));
-    el.query.focus();
+    doSearch();
   });
 
   // voice
@@ -686,15 +720,6 @@ function init() {
   document.querySelectorAll("[data-close]").forEach((b) =>
     b.addEventListener("click", closeModals));
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModals(); });
-  // example chips inside modal
-  document.querySelectorAll(".example").forEach((b) =>
-    b.addEventListener("click", () => {
-      el.query.value = b.textContent.trim();
-      el.query.dispatchEvent(new Event("input"));
-      closeModals();
-      el.query.focus();
-      el.query.scrollIntoView({ behavior: "smooth", block: "center" });
-    }));
 
   // stats
   refreshStats();
