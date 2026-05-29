@@ -31,6 +31,7 @@
     "cleanup:invalid": "node --env-file=.env backend/tools/cleanup-invalid-acts.js",
     "telegram:bot": "node --env-file=.env frontend/telegram/bot.js",
     "telegram:bot:supervised": "bash ops/run-tg-bot-supervised.sh",
+    "web": "node --env-file=.env frontend/web/server.js",
     "test:probe-classifier": "node backend/proxy-tools/probe-classifier.test.mjs",
     "test:meta-antifraud-smoke": "node backend/network/metadataResponseDetect.test.mjs",
     "test:config-target-override": "node backend/network/config.target-override.test.mjs",

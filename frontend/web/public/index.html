@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>RAS Search — Supply · поиск арбитражной практики</title>
+  <meta name="description" content="Семантический поиск арбитражной практики по спорам из договоров поставки." />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="RAS Search Supply">
+      <span class="brand__mark">⚖️</span>
+      <span class="brand__name">RAS&nbsp;Search <b>Supply</b></span>
+    </a>
+    <div class="topbar__right">
+      <span class="db-pill" id="dbStatus" title="Наполнение поисковой базы">
+        <span class="db-pill__dot"></span>
+        <span id="dbStatusText">проверяю базу…</span>
+      </span>
+      <nav class="topnav">
+        <button class="topnav__btn" data-modal="help">💡 Инструкция</button>
+        <button class="topnav__btn" data-modal="examples">🧩 Примеры</button>
+        <button class="topnav__btn" data-modal="info">ℹ️ О поиске</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="hero" id="hero">
+      <h1 class="hero__title">Поиск арбитражной практики по&nbsp;договорам&nbsp;поставки</h1>
+      <p class="hero__sub">
+        Опишите ситуацию обычным языком: кто спорит, что произошло, какие документы есть
+        и какой результат нужен. Поиск семантический — формулировки можно свои.
+      </p>
+    </section>
+
+    <section class="searchbox" id="searchbox">
+      <textarea
+        id="queryInput"
+        class="searchbox__input"
+        rows="4"
+        maxlength="2000"
+        placeholder="Например: покупатель внёс предоплату по договору поставки, поставщик не поставил товар в срок. Есть платёжное поручение и претензия. Покупатель требует вернуть аванс и проценты по ст. 487 ГК РФ."
+        spellcheck="true"
+      ></textarea>
+
+      <div class="searchbox__bar">
+        <div class="searchbox__left">
+          <button id="exampleBtn" class="btn btn--ghost" type="button" title="Подставить пример запроса">📝 Пример</button>
+          <button id="voiceBtn" class="btn btn--ghost" type="button" title="Голосовой ввод">🎤 Голос</button>
+          <button id="settingsBtn" class="btn btn--ghost" type="button" aria-expanded="false" aria-controls="settingsPanel">⚙️ Настройки</button>
+          <span id="charCount" class="charcount">0 / 2000</span>
+        </div>
+        <button id="searchBtn" class="btn btn--primary" type="button">🔎 Искать</button>
+      </div>
+
+      <!-- voice recording bar -->
+      <div id="voiceBar" class="voicebar hidden">
+        <span class="voicebar__rec"><span class="voicebar__dot"></span> Запись…</span>
+        <span id="voiceTimer" class="voicebar__timer">0:00</span>
+        <button id="voiceStopBtn" class="btn btn--primary btn--sm" type="button">⏹ Остановить и распознать</button>
+        <button id="voiceCancelBtn" class="btn btn--ghost btn--sm" type="button">Отмена</button>
+      </div>
+
+      <!-- settings -->
+      <div id="settingsPanel" class="settings hidden">
+        <div class="settings__row">
+          <label class="settings__label" for="topN">📊 Количество актов в выдаче</label>
+          <div class="settings__control">
+            <input type="range" id="topN" min="1" max="50" step="1" />
+            <output id="topNOut" class="settings__out">9</output>
+          </div>
+        </div>
+
+        <div class="settings__row settings__row--toggle">
+          <label class="settings__label" for="useHyde">🤖 HyDE — переписать запрос под язык акта</label>
+          <label class="switch"><input type="checkbox" id="useHyde" /><span class="switch__slider"></span></label>
+        </div>
+        <div class="settings__row settings__sub" id="hydeModelRow">
+          <label class="settings__label" for="hydeModel">🪄 Модель HyDE</label>
+          <select id="hydeModel" class="settings__select"></select>
+        </div>
+
+        <div class="settings__row settings__row--toggle">
+          <label class="settings__label" for="useSummary">📋 Summary — краткий вывод по практике</label>
+          <label class="switch"><input type="checkbox" id="useSummary" /><span class="switch__slider"></span></label>
+        </div>
+        <div class="settings__row settings__sub" id="summaryTopNRow">
+          <label class="settings__label" for="summaryTopN">📥 Актов в Summary</label>
+          <div class="settings__control">
+            <input type="range" id="summaryTopN" min="1" max="50" step="1" />
+            <output id="summaryTopNOut" class="settings__out">4</output>
+          </div>
+        </div>
+        <div class="settings__row settings__sub" id="summaryModelRow">
+          <label class="settings__label" for="summaryModel">🪄 Модель Summary</label>
+          <select id="summaryModel" class="settings__select"></select>
+        </div>
+
+        <p class="settings__hint">Настройки сохраняются в этом браузере.</p>
+      </div>
+    </section>
+
+    <!-- live progress -->
+    <section id="progress" class="progress hidden" aria-live="polite"></section>
+
+    <!-- results -->
+    <section id="results" class="results"></section>
+  </main>
+
+  <footer class="footer">
+    <p>
+      RAS Search — Supply · поиск по решениям арбитражных судов РФ (ras.arbitr.ru).
+      Выдача носит справочный характер и не заменяет чтение судебных актов.
+    </p>
+  </footer>
+
+  <!-- ───────── modals ───────── -->
+  <div class="modal hidden" id="modal-help" role="dialog" aria-modal="true" aria-labelledby="modal-help-title">
+    <div class="modal__backdrop" data-close></div>
+    <div class="modal__card">
+      <button class="modal__x" data-close aria-label="Закрыть">✕</button>
+      <h2 id="modal-help-title">💡 Инструкция</h2>
+      <p>Напишите ситуацию обычным языком или отправьте голосовое сообщение.</p>
+      <h3>✍️ Чтобы поиск был точнее, укажите:</h3>
+      <ul>
+        <li>кто спорит: покупатель или поставщик;</li>
+        <li>что произошло: неоплата, просрочка, дефект, отказ принять товар или вернуть деньги;</li>
+        <li>какие есть документы: договор, УПД, акт приёмки, претензия, переписка, экспертиза;</li>
+        <li>какой результат нужен: взыскать долг, вернуть оплату, найти практику в пользу покупателя или поставщика;</li>
+        <li>важные детали: вид товара, скрытые недостатки, монтаж, экспертиза, статья ГК РФ.</li>
+      </ul>
+      <h3>📖 Как читать результат</h3>
+      <p>Сначала идёт краткий вывод 📋 (Summary) по найденной практике — он для быстрой ориентации, но не заменяет чтение актов.</p>
+      <p>Ниже — список найденных актов. Читать лучше сверху вниз: первый акт обычно ближе всего к запросу, дальше совпадения могут быть слабее.</p>
+      <p>Поиск находит похожие документы, но не проверяет, подходят ли они юридически. Окончательный вывод делайте по текстам самих судебных актов.</p>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="modal-examples" role="dialog" aria-modal="true" aria-labelledby="modal-examples-title">
+    <div class="modal__backdrop" data-close></div>
+    <div class="modal__card">
+      <button class="modal__x" data-close aria-label="Закрыть">✕</button>
+      <h2 id="modal-examples-title">🧩 Примеры запросов</h2>
+      <p class="muted">Нажмите на пример, чтобы подставить его в строку поиска.</p>
+      <button class="example" type="button">Покупатель подписал УПД без замечаний, но после монтажа выявил скрытые недостатки оборудования. Нужны дела в пользу покупателя и какие экспертизы помогли.</button>
+      <button class="example" type="button">Поставщик взыскал оплату по договору поставки, покупатель ссылался на недостатки товара и отсутствие качества. Нужны решения, где суд отказал покупателю.</button>
+      <button class="example" type="button">Просрочка поставки, покупатель требует неустойку и убытки. Нужны дела, где суд снизил неустойку по статье 333 ГК РФ.</button>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="modal-info" role="dialog" aria-modal="true" aria-labelledby="modal-info-title">
+    <div class="modal__backdrop" data-close></div>
+    <div class="modal__card">
+      <button class="modal__x" data-close aria-label="Закрыть">✕</button>
+      <h2 id="modal-info-title">ℹ️ Как устроен поиск</h2>
+      <p>RAS Search — Supply помогает искать арбитражную практику по спорам из договоров поставки.</p>
+      <p>База формируется из решений арбитражных судов (ras.arbitr.ru) и включает только акты по существу спора с мотивировочной частью. Технические и промежуточные акты (например, определения об отложении заседания) в базу не попадают. Алгоритм отслеживает движение дела в первой, апелляционной и кассационной инстанциях и оставляет в поиске только финальный акт — отменённые решения нижестоящих судов исключаются.</p>
+      <h3>Что такое векторный поиск (RAG)</h3>
+      <p>Обычный поиск ищет точные совпадения слов. Векторный поиск работает с фабулой дела: переводит текст в смысловые векторы и находит нужную практику, даже если вы и суд описали ситуацию разными словами.</p>
+      <h3>Как проходит поиск</h3>
+      <ol>
+        <li>Вы отправляете текстовый запрос или голосовое сообщение.</li>
+        <li>Голос распознаётся моделью <code>whisper-large-v3-russian</code>; распознанный текст можно подтвердить или исправить.</li>
+        <li>Исходный запрос сохраняется как главный вопрос пользователя.</li>
+        <li>Если включён HyDE, Gemini переписывает запрос в стиль судебного акта.</li>
+        <li><code>jina-embeddings-v4</code> превращает текст в поисковые векторы.</li>
+        <li>Qdrant ищет похожие акты по нескольким каналам: смысловому, словарному и multivector.</li>
+        <li>RRF объединяет каналы — выше поднимаются акты, найденные сразу несколькими способами.</li>
+        <li><code>jina-reranker-v3</code> перечитывает найденные акты и сортирует по близости к исходному запросу.</li>
+        <li>Если включён Summary, Gemini читает топ актов и формирует краткий вывод.</li>
+      </ol>
+      <h3>🤖 Что такое HyDE</h3>
+      <p>HyDE (Hypothetical Document Embeddings) — мы ищем не короткий запрос, а гипотетический пример документа, который должен найтись. LLM переписывает запрос в эталонный фрагмент судебного акта, и уже он идёт в векторный поиск. Реранкер при этом получает исходный запрос пользователя.</p>
+      <h3>📋 Что такое Summary</h3>
+      <p>Summary — краткий вывод по найденной практике. Он строится только на актах, которые нашёл поиск. Если акты нерелевантны, Summary тоже нужно проверять.</p>
+      <h3>🪄 Используемые модели</h3>
+      <ul>
+        <li>голос: <code>antony66/whisper-large-v3-russian</code></li>
+        <li>embedding: <code>jinaai/jina-embeddings-v4</code></li>
+        <li>reranker: <code>jinaai/jina-reranker-v3</code></li>
+        <li>HyDE и Summary: API-модели <code>gemini-*</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
