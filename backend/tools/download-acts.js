@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/download-acts.js — entry-point для пайплайна download → extract.
+ * backend/tools/download-acts.js — entry-point для пайплайна download → extract.
  *
  * Берёт из таблицы `acts` строки с `verdict_keep=TRUE AND pdf_downloaded=FALSE`,
  * скачивает PDF с kad.arbitr.ru (прогрев Playwright → опционально HTTP GET через
@@ -12,7 +12,7 @@
  *   npm run download:acts
  *     # или напрямую (см. package.json для xvfb-обёртки):
  *   xvfb-run -a --server-args="-screen 0 1366x900x24" \
- *     node --env-file=.env scripts/download-acts.js
+ *     node --env-file=.env backend/tools/download-acts.js
  *
  * Headful (RAS_PDF_HEADLESS=0, по умолчанию) — pravocaptcha проверяет
  * canvas-fingerprint, headless chromium иногда срывается на image-captcha
@@ -65,7 +65,7 @@ function usage() {
   process.stderr.write(
     `Использование:
   npm run download:acts
-  xvfb-run -a node --env-file=.env scripts/download-acts.js [--workdir <path>] [--ids <uuid,...>]
+  xvfb-run -a node --env-file=.env backend/tools/download-acts.js [--workdir <path>] [--ids <uuid,...>]
 
 Опции:
   --workdir <path>   куда складывать PDF (по умолчанию ${DEFAULT_WORKDIR})

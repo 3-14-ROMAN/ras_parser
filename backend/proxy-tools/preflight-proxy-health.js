@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/preflight-proxy-health.js — диагностический CLI поверх
+ * backend/proxy-tools/preflight-proxy-health.js — диагностический CLI поверх
  * `pdf/proxyHealth.js`. Тот же probe, что встроен в pipeline (download:acts),
  * только запускается отдельно: печатает таблицу + CSV в stdout.
  *

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/search-qdrant-rerank.js — CLI: полный pipeline до финального top-N.
+ * backend/search/search-qdrant-rerank.js — CLI: полный pipeline до финального top-N.
  *
  *   query → 4 retrieval-ветки → RRF top-50 → hydrate (PG) → Jina reranker → top-N
  *
@@ -10,7 +10,7 @@
  *   • финальный top-N после reranker'а с снипетами
  *
  * Запуск:
- *   node --env-file=.env scripts/search-qdrant-rerank.js "взыскание задолженности"
+ *   node --env-file=.env backend/search/search-qdrant-rerank.js "взыскание задолженности"
  *   npm run embed:rerank -- "взыскание задолженности"
  *
  * ENV:

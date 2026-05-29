@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Supervisor для telegram-bot.js: рестартит процесс при ненулевых exit-кодах
 # (включая 1 от "exiting for systemd restart" при недоступности Telegram —
-# см. pollLoop() в scripts/telegram-bot.js).
+# см. pollLoop() в frontend/telegram/bot.js).
 #
 # Зачем отдельный supervisor вместо systemd: ras-telegram-bot.service
 # нейтрализован drop-in'ом (см. /etc/systemd/system/ras-telegram-bot.service.d/),
@@ -10,7 +10,7 @@
 # семантику, но независим от systemd.
 #
 # Запуск (под nohup, чтобы пережить логаут):
-#   nohup bash scripts/run-tg-bot-supervised.sh >> logs/telegram-bot.log 2>&1 < /dev/null & disown
+#   nohup bash ops/run-tg-bot-supervised.sh >> logs/telegram-bot.log 2>&1 < /dev/null & disown
 #
 # Поведение:
 #   - Чистый exit=0 / SIGINT (130) / SIGTERM (143) → выход без рестарта.

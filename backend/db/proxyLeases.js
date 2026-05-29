@@ -1,6 +1,6 @@
 /**
  * db/proxyLeases.js — координация занятых прокси между parser.js и
- * scripts/download-acts.js. Без этого оба процесса могут схватить один и
+ * backend/tools/download-acts.js. Без этого оба процесса могут схватить один и
  * тот же `MP_PROXY_KEY` и крутить changeIp/смену оператора друг под друга,
  * сжигая cooldowns и куки.
  *

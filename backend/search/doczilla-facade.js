@@ -1,5 +1,5 @@
 /**
- * scripts/doczilla-facade.js — Doczilla-compatible API facade поверх
+ * backend/search/doczilla-facade.js — Doczilla-compatible API facade поверх
  * RAS Search — Supply.
  *
  * Зачем: внешним интеграторам, которые уже умеют ходить в Doczilla API

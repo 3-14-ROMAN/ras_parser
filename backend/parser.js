@@ -4179,7 +4179,7 @@ function _parseDateFromEnv(raw, label) {
  *
  * Возвращает true только если stdin привязан к TTY И не задан опт-аут
  * `RAS_NONINTERACTIVE=1`. На supervised-рестартах (см.
- * `scripts/run-parser-supervised.sh`) `RAS_NONINTERACTIVE=1` ставится для
+ * `ops/run-parser-supervised.sh`) `RAS_NONINTERACTIVE=1` ставится для
  * `attempt>=2`, чтобы парсер не зависал на `_ask()` промптах в Cursor-
  * терминале с прицепленным stdin. Первый запуск в TTY остаётся
  * интерактивным — даём человеку настроить параметры.

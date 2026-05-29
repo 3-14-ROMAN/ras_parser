@@ -2,7 +2,7 @@
  * pdf/proxyHealth.js — pre-flight probe ras.arbitr.ru через MobileProxy.Space
  * Anti-cloak API. Используется ДВУМЯ потребителями:
  *
- *   - `scripts/preflight-proxy-health.js` — диагностический CLI, печатает таблицу
+ *   - `backend/proxy-tools/preflight-proxy-health.js` — диагностический CLI, печатает таблицу
  *     и выдаёт CSV с recommended-странами в stdout.
  *   - `pdf/pipeline.js` — встроенный preflight. Если `RAS_PDF_PREFLIGHT_GEO=1` и
  *     есть `MP_API_TOKEN`, runPipeline ДО старта worker loop'а:

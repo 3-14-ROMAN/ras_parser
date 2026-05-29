@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * scripts/index-acts-qdrant-fullact.js — CLI: одна пачка full-act индексации.
+ * backend/indexing/index-acts-qdrant-fullact.js — CLI: одна пачка full-act индексации.
  *
- * Тонкая обёртка над embed/fullAct.js. Worker — `scripts/embed-worker.js`
+ * Тонкая обёртка над embed/fullAct.js. Worker — `backend/indexing/embed-worker.js`
  * (бесконечный цикл); этот скрипт — для разового прогона / smoke / отладки.
  *
  * Запуск:
- *   node --env-file=.env scripts/index-acts-qdrant-fullact.js [LIMIT]
+ *   node --env-file=.env backend/indexing/index-acts-qdrant-fullact.js [LIMIT]
  *   npm run embed:fullact -- 10
  */
 

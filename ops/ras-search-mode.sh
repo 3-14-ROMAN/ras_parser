@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/ras-search-mode.sh — переключатель между indexing-mode и search-mode.
+# ops/ras-search-mode.sh — переключатель между indexing-mode и search-mode.
 #
 # Indexing-mode (default): reranker выгружен (~1.5 GB VRAM свободно),
 #   embed-worker гонит batch до 32k токенов.
@@ -8,9 +8,9 @@
 #   VRAM на reranker).
 #
 # Использование:
-#   ./scripts/ras-search-mode.sh on    # включить reranker (для поиска)
-#   ./scripts/ras-search-mode.sh off   # выгрузить (для индексации)
-#   ./scripts/ras-search-mode.sh status
+#   ./ops/ras-search-mode.sh on    # включить reranker (для поиска)
+#   ./ops/ras-search-mode.sh off   # выгрузить (для индексации)
+#   ./ops/ras-search-mode.sh status
 #
 set -euo pipefail
 

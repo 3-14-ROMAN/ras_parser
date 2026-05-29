@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/proxy-leases.js — ручное управление таблицей `proxy_leases`.
+ * backend/proxy-tools/proxy-leases.js — ручное управление таблицей `proxy_leases`.
  *
  * Зачем: парсер падает с «все proxy_key заняты» после kill -9 / SIGKILL —
  * heartbeat не успел снять lease, expires_at улетел в будущее. Этот тул
@@ -14,7 +14,7 @@
  * Запуск:
  *   npm run proxy:leases:status
  *   npm run proxy:leases:cleanup
- *   node --env-file=.env scripts/proxy-leases.js release-key <full-key>
+ *   node --env-file=.env backend/proxy-tools/proxy-leases.js release-key <full-key>
  *
  * Без PG (RAS_PG_DSN не задан): говорит об этом и выходит с кодом 2.
  */
@@ -33,7 +33,7 @@ function usage() {
     `Использование:
   npm run proxy:leases:status
   npm run proxy:leases:cleanup [-- --role pdf]
-  node --env-file=.env scripts/proxy-leases.js release-key <proxy_key>
+  node --env-file=.env backend/proxy-tools/proxy-leases.js release-key <proxy_key>
 
 Команды:
   status                    JSON-снимок таблицы proxy_leases (этот хост помечен,

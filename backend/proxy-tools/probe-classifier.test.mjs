@@ -1,7 +1,7 @@
 /**
  * Unit-тесты anti-cloak classifier'а (без сети / API).
  *
- * Запуск: `npm run test:probe-classifier` (или `node scripts/probe-classifier.test.mjs`).
+ * Запуск: `npm run test:probe-classifier` (или `node backend/proxy-tools/probe-classifier.test.mjs`).
  *
  * Проверяет:
  *   1) classifyAntiCloakResult: нормальный RAS html → recommended=true

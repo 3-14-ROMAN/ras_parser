@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/probe-geo.js — диагностический пробник «какие страны/гео реально
+ * backend/proxy-tools/probe-geo.js — диагностический пробник «какие страны/гео реально
  * открывают kad.arbitr.ru без 451».
  *
  * Для каждой страны из PROBE_COUNTRIES (default: 1,22,82,145 — РФ/BY/KZ/KG):

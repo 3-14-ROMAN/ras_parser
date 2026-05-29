@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * scripts/embed-worker.js — CLI-обёртка над embed/worker.js.
+ * backend/indexing/embed-worker.js — CLI-обёртка над embed/worker.js.
  *
  * Запуск:
- *   node --env-file=.env scripts/embed-worker.js
+ *   node --env-file=.env backend/indexing/embed-worker.js
  *   npm run embed:worker
  *
  * ENV:

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/search-qdrant-rrf.js — CLI: 4-ветвенный retrieval + RRF.
+ * backend/search/search-qdrant-rrf.js — CLI: 4-ветвенный retrieval + RRF.
  *
  * Тонкая обёртка над embed/retrieval.js — печатает per-branch top-5 и
  * финальный RRF top-N. Пайплайн merge'а и сами ветки — в модуле,
@@ -8,7 +8,7 @@
  * будущего HTTP-API.
  *
  * Запуск:
- *   node --env-file=.env scripts/search-qdrant-rrf.js "взыскание задолженности"
+ *   node --env-file=.env backend/search/search-qdrant-rrf.js "взыскание задолженности"
  *   npm run embed:search -- "взыскание задолженности"
  *
  * ENV:

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * scripts/cleanup-invalid-acts.js — one-shot sweep по актам с
+ * backend/tools/cleanup-invalid-acts.js — one-shot sweep по актам с
  * `verdict_keep IS FALSE`, у которых остались RAG-артефакты (act_text,
  * pdf-файл, points в Qdrant). Удаляет артефакты, метаданные оставляет.
  *
@@ -9,7 +9,7 @@
  *   - вручную если что-то пошло не так / для отладки.
  *
  * Запуск:
- *   node --env-file=.env scripts/cleanup-invalid-acts.js
+ *   node --env-file=.env backend/tools/cleanup-invalid-acts.js
  *   npm run cleanup:invalid
  *
  * ENV:
