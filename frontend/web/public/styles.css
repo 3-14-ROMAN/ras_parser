@@ -250,28 +250,6 @@ body {
 .recbar.is-cancel { background: color-mix(in srgb, var(--deny-soft) 94%, transparent); }
 .recbar.is-cancel .recbar__hint { color: var(--deny); font-weight: 600; }
 
-/* разбор голоса: послушать запись + текст уже в поле */
-.vrev {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-top: 10px;
-  padding: 10px 12px;
-  background: var(--accent-soft);
-  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
-  border-radius: var(--radius-sm);
-}
-.vrev__ico { font-size: 18px; flex: none; }
-.vrev__audio { height: 36px; flex: 1 1 220px; min-width: 180px; max-width: 360px; }
-.vrev__note { font-size: 13px; color: var(--text-soft); flex: 1 1 160px; min-width: 150px; }
-.vrev__close {
-  margin-left: auto; flex: none;
-  border: 0; background: transparent; color: var(--text-mute);
-  cursor: pointer; font-size: 15px; width: 28px; height: 28px; border-radius: 7px;
-}
-.vrev__close:hover { background: var(--surface); color: var(--text); }
-
 .searchbox__bar {
   display: flex;
   align-items: center;
@@ -378,15 +356,16 @@ input[type="range"]::-moz-range-thumb {
 .settings__range { color: var(--text-mute); font-weight: 400; font-size: 12.5px; }
 
 /* пример запроса (как в меню бота) */
+/* пример — намеренно «плоская» подсказка (пунктир + приглушённый фон),
+   чтобы не путалась с реальным полем ввода (особенно в тёмной теме) */
 .example-card {
   text-align: left;
   max-width: 620px;
   margin: 18px auto 0;
   padding: 12px 14px;
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  border: 1px dashed var(--border-2);
   border-radius: var(--radius-sm);
-  box-shadow: var(--shadow);
 }
 .example-card__title { display: block; font-weight: 600; font-size: 13.5px; margin-bottom: 8px; color: var(--text-soft); }
 .example-card__q {
@@ -678,9 +657,15 @@ details.log[open] > summary::after { transform: rotate(180deg); }
   .searchbox__left { justify-content: space-between; }
   #searchBtn { width: 100%; justify-content: center; padding: 12px; font-size: 16px; }
 
-  .settings__row { gap: 10px; padding: 11px 2px; }
-  .settings__select { max-width: 56vw; }
-  input[type="range"] { width: clamp(96px, 38vw, 170px); }
+  /* настройки на телефоне: слайдер/селект — на всю ширину под лейблом */
+  .settings { padding: 4px 12px 10px; }
+  .settings__row { gap: 8px 10px; padding: 11px 2px; flex-wrap: wrap; }
+  .settings__sub { padding-left: 8px; }
+  .settings__label { flex: 1 1 auto; }
+  .settings__control { width: 100%; justify-content: space-between; }
+  .settings__out { min-width: 42px; }
+  .settings__select { max-width: none; width: 100%; }
+  input[type="range"] { width: auto; flex: 1; }
 
   /* модалки — на весь экран, так удобнее читать длинные тексты */
   .modal { padding: 0; }

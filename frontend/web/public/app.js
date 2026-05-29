@@ -76,9 +76,6 @@ const el = {
   voiceBar:     $("#voiceBar"),
   voiceTimer:   $("#voiceTimer"),
   voiceHint:    $("#voiceHint"),
-  voiceReview:  $("#voiceReview"),
-  voiceAudio:   $("#voiceAudio"),
-  voiceReviewClose: $("#voiceReviewClose"),
 };
 
 // ─── settings (localStorage) ─────────────────────────────────────────────────
@@ -600,7 +597,6 @@ async function doSearch() {
   if (query.length < 3) { toast("Опишите ситуацию подробнее (минимум несколько слов)."); el.query.focus(); return; }
   if (query.length > 2000) { toast("Запрос слишком длинный (максимум 2000 символов)."); return; }
 
-  hideVoiceReview();
   _searching = true;
   el.searchBtn.disabled = true;
   el.searchBtn.textContent = "Идёт поиск…";
@@ -695,7 +691,6 @@ function cleanupVoiceStream() {
 async function micDown(e) {
   if (_voice.active || _voice.starting) return;
   e.preventDefault();
-  hideVoiceReview(); // новая запись — прошлый разбор больше не нужен
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
     toast("Голосовой ввод недоступен в этом браузере.");
     return;
@@ -774,11 +769,9 @@ async function finishVoice() {
     const j = await r.json();
     const text = (j?.text || "").trim();
     if (!text) throw new Error(j?.detail || j?.error || "пустой результат");
-    // Текст в поле + панель «послушать запись и проверить» (не ищем сразу —
-    // даём прослушать/поправить, поиск по кнопке «Искать»).
+    // Просто диктовка: распознанный текст уходит прямо в поле поиска.
     el.query.value = text;
     el.query.dispatchEvent(new Event("input"));
-    showVoiceReview(blob);
     el.query.focus();
   } catch (e) {
     toast("Не удалось распознать голос: " + (e?.message || e));
@@ -786,20 +779,6 @@ async function finishVoice() {
     el.voiceBtn.classList.remove("is-busy");
     el.voiceBtn.disabled = false;
   }
-}
-
-function showVoiceReview(blob) {
-  hideVoiceReview();
-  _voice.reviewUrl = URL.createObjectURL(blob);
-  el.voiceAudio.src = _voice.reviewUrl;
-  el.voiceReview.classList.remove("hidden");
-}
-
-function hideVoiceReview() {
-  el.voiceReview.classList.add("hidden");
-  try { el.voiceAudio.pause(); } catch {}
-  el.voiceAudio.removeAttribute("src");
-  if (_voice.reviewUrl) { URL.revokeObjectURL(_voice.reviewUrl); _voice.reviewUrl = null; }
 }
 
 // ─── modals ──────────────────────────────────────────────────────────────────
@@ -831,12 +810,13 @@ function init() {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); doSearch(); }
   });
 
-  // example (как /test в боте — подставляет пример и запускает поиск)
+  // example — просто вставляет пример в поле поиска (без авто-поиска)
   el.exampleQuery.textContent = TEST_QUERY;
   el.exampleBtn.addEventListener("click", () => {
     el.query.value = TEST_QUERY;
     el.query.dispatchEvent(new Event("input"));
-    doSearch();
+    el.query.focus();
+    document.getElementById("field")?.scrollIntoView({ behavior: "smooth", block: "center" });
   });
 
   // voice: зажми-говори-отпусти (Pointer Events — мышь и тач одинаково)
@@ -847,7 +827,6 @@ function init() {
   el.voiceBtn.addEventListener("lostpointercapture", micUp);
   // долгое нажатие на мобиле не должно открывать контекст-меню/выделение
   el.voiceBtn.addEventListener("contextmenu", (e) => e.preventDefault());
-  el.voiceReviewClose.addEventListener("click", hideVoiceReview);
 
   // modals
   document.querySelectorAll("[data-modal]").forEach((b) =>

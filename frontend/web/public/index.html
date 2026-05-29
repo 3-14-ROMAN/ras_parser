@@ -43,7 +43,7 @@
       <div class="example-card">
         <span class="example-card__title">Пример запроса:</span>
         <code class="example-card__q" id="exampleQuery"></code>
-        <button id="exampleBtn" class="btn btn--ghost btn--sm" type="button">▶️ Запустить пример</button>
+        <button id="exampleBtn" class="btn btn--ghost btn--sm" type="button">✏️ Вставить пример в поиск</button>
       </div>
     </section>
 
@@ -73,16 +73,8 @@
         <div id="voiceBar" class="recbar hidden" aria-hidden="true">
           <span class="recbar__dot"></span>
           <span id="voiceTimer" class="recbar__timer">0:00</span>
-          <span id="voiceHint" class="recbar__hint">Отпустите — распознать · уведите вверх — отмена</span>
+          <span id="voiceHint" class="recbar__hint">Отпустите — вставить текст · уведите вверх — отмена</span>
         </div>
-      </div>
-
-      <!-- результат распознавания голоса: послушать + текст уже в поле -->
-      <div id="voiceReview" class="vrev hidden">
-        <span class="vrev__ico">🎧</span>
-        <audio id="voiceAudio" class="vrev__audio" controls preload="metadata"></audio>
-        <span class="vrev__note">Распознано и вставлено в поле — проверьте и нажмите «Искать».</span>
-        <button id="voiceReviewClose" class="vrev__close" type="button" aria-label="Скрыть">✕</button>
       </div>
 
       <div class="searchbox__bar">
