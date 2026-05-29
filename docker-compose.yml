@@ -58,7 +58,22 @@ services:
       timeout: 3s
       retries: 10
 
+  # ── Inference (OPTIONAL / legacy containerized path) ───────────────────────
+  # PRODUCTION inference does NOT run from this compose service. It runs via
+  # systemd (ras-inference.service) out of backend/inference/venv as
+  # `uvicorn app:app` — i.e. app.py — exposing the full multivector + sparse +
+  # late-chunk + reranker API that the search pipeline depends on. Whisper STT
+  # is a sibling systemd unit (ras-whisper.service, transcribe_worker.py:8001).
+  # See README → "Inference service" / "Production services".
+  #
+  # The Dockerfile here builds the OLDER backend/inference/server.py prototype
+  # (dense-only /embed + basic /rerank), which the current pipeline cannot use
+  # as-is. It is kept for reference and gated behind the "gpu-docker" profile so
+  # a bare `docker compose up -d` does NOT kick off a heavy CUDA build of an
+  # incompatible image. To start it explicitly (e.g. to modernize it):
+  #   docker compose --profile gpu-docker up -d inference
   inference:
+    profiles: ["gpu-docker"]
     build:
       context: ./backend/inference
       dockerfile: Dockerfile
