@@ -1,0 +1,11 @@
+# Keep the build context tiny — only app.py / transcribe_worker.py /
+# requirements.txt are needed (see Dockerfile COPY). Without this, the 5.7G
+# venv/ + multi-MB *.log get shipped to the daemon on every build.
+venv/
+__pycache__/
+*.pyc
+*.log
+.pytest_cache/
+server.py
+Dockerfile
+.dockerignore
