@@ -59,14 +59,30 @@
           spellcheck="true"
         ></textarea>
         <button id="voiceBtn" class="mic" type="button"
-                aria-label="Удерживайте для записи голоса" title="Удерживайте для записи голоса">🎤</button>
+                aria-label="Удерживайте для записи голоса" title="Удерживайте для записи голоса">
+          <svg class="mic__icon" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="9" y="2" width="6" height="12" rx="3"></rect>
+            <path d="M5 11a7 7 0 0 0 14 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+            <line x1="12" y1="18" x2="12" y2="22" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line>
+            <line x1="8" y1="22" x2="16" y2="22" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line>
+          </svg>
+          <span class="mic__spin" aria-hidden="true"></span>
+        </button>
 
         <!-- оверлей записи поверх поля -->
         <div id="voiceBar" class="recbar hidden" aria-hidden="true">
           <span class="recbar__dot"></span>
           <span id="voiceTimer" class="recbar__timer">0:00</span>
-          <span id="voiceHint" class="recbar__hint">Отпустите — отправить · уведите вверх — отмена</span>
+          <span id="voiceHint" class="recbar__hint">Отпустите — распознать · уведите вверх — отмена</span>
         </div>
+      </div>
+
+      <!-- результат распознавания голоса: послушать + текст уже в поле -->
+      <div id="voiceReview" class="vrev hidden">
+        <span class="vrev__ico">🎧</span>
+        <audio id="voiceAudio" class="vrev__audio" controls preload="metadata"></audio>
+        <span class="vrev__note">Распознано и вставлено в поле — проверьте и нажмите «Искать».</span>
+        <button id="voiceReviewClose" class="vrev__close" type="button" aria-label="Скрыть">✕</button>
       </div>
 
       <div class="searchbox__bar">

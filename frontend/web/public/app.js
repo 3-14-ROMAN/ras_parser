@@ -76,6 +76,9 @@ const el = {
   voiceBar:     $("#voiceBar"),
   voiceTimer:   $("#voiceTimer"),
   voiceHint:    $("#voiceHint"),
+  voiceReview:  $("#voiceReview"),
+  voiceAudio:   $("#voiceAudio"),
+  voiceReviewClose: $("#voiceReviewClose"),
 };
 
 // ─── settings (localStorage) ─────────────────────────────────────────────────
@@ -527,13 +530,56 @@ function renderResults(resp) {
     el.results.scrollIntoView({ behavior: "smooth", block: "start" });
     return;
   }
+  const canPdf = !!(resp.summary && resp.summary.used && resp.summary.text);
   const head = `<div class="results__head">
-    <span class="results__count">Найдено актов: ${results.length}</span>
-    <span class="results__meta">за ${fmtElapsed(resp.elapsed_ms || 0)}${resp.hyde?.used ? " · HyDE вкл" : ""}</span>
+    <div class="results__title">
+      <span class="results__count">Найдено актов: ${results.length}</span>
+      <span class="results__meta">за ${fmtElapsed(resp.elapsed_ms || 0)}${resp.hyde?.used ? " · HyDE" : ""}</span>
+    </div>
+    ${canPdf ? `<button class="btn btn--ghost btn--sm" id="pdfBtn">📄 Скачать PDF</button>` : ""}
   </div>`;
   const cards = `<div class="card">${results.map((r, i) => actCard(r, i + 1)).join("")}</div>`;
   el.results.innerHTML = head + summaryCard(resp) + cards + logDetails(resp);
+  const pb = document.getElementById("pdfBtn");
+  if (pb) pb.addEventListener("click", () => downloadPdf(pb));
   el.results.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Выгрузка PDF (оформление как у бота: шапка с запросом, Summary, список актов).
+async function downloadPdf(btn) {
+  if (!_lastResponse || !_lastResponse.summary?.used) {
+    toast("PDF доступен только при включённом Summary.");
+    return;
+  }
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner"></span> Готовлю PDF…`;
+  try {
+    const r = await fetch("/api/pdf", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(_lastResponse),
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || `HTTP ${r.status}`);
+    }
+    const blob = await r.blob();
+    const sid = String(_lastResponse.search_id || "summary").replace(/[^a-zA-Z0-9_-]/g, "");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ras-summary_${sid}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) {
+    toast("Не удалось сделать PDF: " + (e?.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
 }
 
 function renderError(msg) {
@@ -546,6 +592,7 @@ function renderError(msg) {
 // ─── search flow ─────────────────────────────────────────────────────────────
 
 let _searching = false;
+let _lastResponse = null;   // для выгрузки PDF
 
 async function doSearch() {
   if (_searching) return;
@@ -553,6 +600,7 @@ async function doSearch() {
   if (query.length < 3) { toast("Опишите ситуацию подробнее (минимум несколько слов)."); el.query.focus(); return; }
   if (query.length > 2000) { toast("Запрос слишком длинный (максимум 2000 символов)."); return; }
 
+  hideVoiceReview();
   _searching = true;
   el.searchBtn.disabled = true;
   el.searchBtn.textContent = "Идёт поиск…";
@@ -561,6 +609,7 @@ async function doSearch() {
 
   try {
     const resp = await streamSearch(query, (name) => onStage(name));
+    _lastResponse = resp;
     stopProgress();
     renderResults(resp);
   } catch (e) {
@@ -646,6 +695,7 @@ function cleanupVoiceStream() {
 async function micDown(e) {
   if (_voice.active || _voice.starting) return;
   e.preventDefault();
+  hideVoiceReview(); // новая запись — прошлый разбор больше не нужен
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
     toast("Голосовой ввод недоступен в этом браузере.");
     return;
@@ -724,15 +774,32 @@ async function finishVoice() {
     const j = await r.json();
     const text = (j?.text || "").trim();
     if (!text) throw new Error(j?.detail || j?.error || "пустой результат");
+    // Текст в поле + панель «послушать запись и проверить» (не ищем сразу —
+    // даём прослушать/поправить, поиск по кнопке «Искать»).
     el.query.value = text;
     el.query.dispatchEvent(new Event("input"));
-    doSearch(); // как в Telegram: отпустил — отправил
+    showVoiceReview(blob);
+    el.query.focus();
   } catch (e) {
     toast("Не удалось распознать голос: " + (e?.message || e));
   } finally {
     el.voiceBtn.classList.remove("is-busy");
     el.voiceBtn.disabled = false;
   }
+}
+
+function showVoiceReview(blob) {
+  hideVoiceReview();
+  _voice.reviewUrl = URL.createObjectURL(blob);
+  el.voiceAudio.src = _voice.reviewUrl;
+  el.voiceReview.classList.remove("hidden");
+}
+
+function hideVoiceReview() {
+  el.voiceReview.classList.add("hidden");
+  try { el.voiceAudio.pause(); } catch {}
+  el.voiceAudio.removeAttribute("src");
+  if (_voice.reviewUrl) { URL.revokeObjectURL(_voice.reviewUrl); _voice.reviewUrl = null; }
 }
 
 // ─── modals ──────────────────────────────────────────────────────────────────
@@ -780,6 +847,7 @@ function init() {
   el.voiceBtn.addEventListener("lostpointercapture", micUp);
   // долгое нажатие на мобиле не должно открывать контекст-меню/выделение
   el.voiceBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+  el.voiceReviewClose.addEventListener("click", hideVoiceReview);
 
   // modals
   document.querySelectorAll("[data-modal]").forEach((b) =>

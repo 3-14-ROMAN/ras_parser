@@ -209,6 +209,16 @@ body {
   -webkit-touch-callout: none;
 }
 .mic:hover { filter: brightness(1.06); }
+.mic__icon { width: 23px; height: 23px; fill: currentColor; pointer-events: none; }
+.mic__spin {
+  display: none;
+  width: 19px; height: 19px; border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, .45);
+  border-top-color: #fff;
+  animation: spin .7s linear infinite;
+}
+.mic.is-busy .mic__icon { display: none; }
+.mic.is-busy .mic__spin { display: block; }
 .mic.is-rec {
   background: linear-gradient(180deg, #e5615455, var(--deny));
   transform: scale(1.32);
@@ -239,6 +249,28 @@ body {
 .recbar__hint { font-size: 13.5px; color: var(--text-soft); }
 .recbar.is-cancel { background: color-mix(in srgb, var(--deny-soft) 94%, transparent); }
 .recbar.is-cancel .recbar__hint { color: var(--deny); font-weight: 600; }
+
+/* разбор голоса: послушать запись + текст уже в поле */
+.vrev {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  border-radius: var(--radius-sm);
+}
+.vrev__ico { font-size: 18px; flex: none; }
+.vrev__audio { height: 36px; flex: 1 1 220px; min-width: 180px; max-width: 360px; }
+.vrev__note { font-size: 13px; color: var(--text-soft); flex: 1 1 160px; min-width: 150px; }
+.vrev__close {
+  margin-left: auto; flex: none;
+  border: 0; background: transparent; color: var(--text-mute);
+  cursor: pointer; font-size: 15px; width: 28px; height: 28px; border-radius: 7px;
+}
+.vrev__close:hover { background: var(--surface); color: var(--text); }
 
 .searchbox__bar {
   display: flex;
@@ -444,9 +476,10 @@ input[type="range"]::-moz-range-thumb {
 .results { margin-top: 22px; display: flex; flex-direction: column; gap: 14px; }
 
 .results__head {
-  display: flex; align-items: baseline; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
   gap: 12px; flex-wrap: wrap;
 }
+.results__title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .results__count { font-weight: 700; font-size: 16px; }
 .results__meta { font-size: 13px; color: var(--text-mute); }
 

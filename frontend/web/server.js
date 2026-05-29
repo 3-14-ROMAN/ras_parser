@@ -35,6 +35,12 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+// PDF-отчёт рендерим тем же модулем, что и Telegram-бот (Playwright→PDF),
+// чтобы оформление было один-в-один: шапка с запросом/HyDE/моделью,
+// Summary, список актов, дисклеймер. Держим в веб-тире, чтобы не
+// дёргать общий search-api (его рестарт задел бы бота).
+import { renderSummaryToPdf } from "../../backend/llm/summaryPdfRenderer.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
 
@@ -173,12 +179,74 @@ async function serveStatic(req, res, pathname) {
   }
 }
 
+// ─── PDF (как у бота) ────────────────────────────────────────────────────────
+function readBody(req, limit = 4 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) { reject(new Error("body too large")); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+async function handlePdf(req, res) {
+  if (req.method !== "POST") { sendJson(res, 405, { ok: false, error: "method not allowed" }); return; }
+  let body;
+  try {
+    const raw = await readBody(req);
+    body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+  } catch (e) {
+    sendJson(res, 400, { ok: false, error: "invalid body: " + (e?.message ?? e) });
+    return;
+  }
+  const summary = body.summary;
+  if (!summary || !summary.used || typeof summary.text !== "string" || !summary.text.trim()) {
+    sendJson(res, 400, { ok: false, error: "PDF доступен только когда включён Summary" });
+    return;
+  }
+  try {
+    const pdf = await renderSummaryToPdf({
+      query:        body.query || "",
+      summary,
+      hyde:         body.hyde ?? null,
+      searchId:     body.search_id ?? null,
+      results:      Array.isArray(body.results) ? body.results : [],
+      summaryActsN: summary.acts_used ?? body.summary_top_n ?? null,
+    });
+    const sid = String(body.search_id || "").replace(/[^a-zA-Z0-9_-]/g, "") || "summary";
+    res.writeHead(200, {
+      "content-type":        "application/pdf",
+      "content-length":      pdf.length,
+      "content-disposition": `attachment; filename="ras-summary_${sid}.pdf"`,
+      "cache-control":       "no-store",
+    });
+    res.end(pdf);
+  } catch (e) {
+    log("ERROR", "pdf render failed", { msg: e?.message ?? String(e) });
+    if (!res.headersSent) sendJson(res, 500, { ok: false, error: "pdf failed", detail: e?.message ?? String(e) });
+  }
+}
+
 const server = http.createServer((req, res) => {
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
   } catch {
     sendJson(res, 400, { ok: false, error: "bad request" });
+    return;
+  }
+
+  // PDF рендерим локально в веб-тире (не проксируем).
+  if (url.pathname === "/api/pdf") {
+    handlePdf(req, res).catch((e) => {
+      log("ERROR", "pdf handler crashed", { msg: e?.message ?? String(e) });
+      if (!res.headersSent) sendJson(res, 500, { ok: false, error: "internal" });
+    });
     return;
   }
 
