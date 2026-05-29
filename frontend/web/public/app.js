@@ -75,8 +75,7 @@ const el = {
   // voice
   voiceBar:     $("#voiceBar"),
   voiceTimer:   $("#voiceTimer"),
-  voiceStopBtn: $("#voiceStopBtn"),
-  voiceCancelBtn: $("#voiceCancelBtn"),
+  voiceHint:    $("#voiceHint"),
 };
 
 // ─── settings (localStorage) ─────────────────────────────────────────────────
@@ -576,10 +575,10 @@ async function doSearch() {
   }
 }
 
-// ─── voice (MediaRecorder → /api/transcribe) ─────────────────────────────────
-
-let _mediaRecorder = null, _voiceChunks = [], _voiceStream = null;
-let _voiceTimerId = null, _voiceStart = 0;
+// ─── voice: hold-to-talk (как в Telegram) ────────────────────────────────────
+// Зажал кнопку → запись; отпустил → распознаём и сразу ищем; увёл палец вверх
+// (или слишком короткий тап) → отмена. Pointer Events = единый код мышь+тач.
+// Требует HTTPS для getUserMedia (на проде есть; на localhost тоже работает).
 
 function abToBase64(ab) {
   const bytes = new Uint8Array(ab);
@@ -591,62 +590,130 @@ function abToBase64(ab) {
   return btoa(bin);
 }
 
-async function startVoice() {
+const CANCEL_DRAG_PX = 60;       // увести палец вверх на столько px = отмена
+const MIN_HOLD_MS    = 350;      // короче — случайный тап, не запись
+const MAX_HOLD_MS    = 120_000;  // потолок длительности
+
+const _voice = {
+  mr: null, chunks: [], stream: null,
+  timerId: null, startMs: 0, startY: 0,
+  active: false, starting: false, cancel: false, willCancel: false,
+};
+
+function fmtVoiceTimer(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function showRecUI() {
+  el.voiceBtn.classList.add("is-rec");
+  el.voiceBtn.classList.remove("is-cancel");
+  el.voiceBar.classList.remove("hidden", "is-cancel");
+  el.voiceTimer.textContent = "0:00";
+  if (el.voiceHint) el.voiceHint.textContent = "Отпустите — отправить · уведите вверх — отмена";
+  clearInterval(_voice.timerId);
+  _voice.timerId = setInterval(() => {
+    const dt = Date.now() - _voice.startMs;
+    el.voiceTimer.textContent = fmtVoiceTimer(dt);
+    if (dt >= MAX_HOLD_MS) endHold(false);
+  }, 200);
+}
+
+function hideRecUI() {
+  clearInterval(_voice.timerId); _voice.timerId = null;
+  el.voiceBtn.classList.remove("is-rec", "is-cancel");
+  el.voiceBar.classList.add("hidden");
+  el.voiceBar.classList.remove("is-cancel");
+}
+
+function setCancelState(on) {
+  if (_voice.cancel === on) return;
+  _voice.cancel = on;
+  el.voiceBtn.classList.toggle("is-cancel", on);
+  el.voiceBar.classList.toggle("is-cancel", on);
+  if (el.voiceHint) {
+    el.voiceHint.textContent = on
+      ? "Отпустите для отмены"
+      : "Отпустите — отправить · уведите вверх — отмена";
+  }
+}
+
+function cleanupVoiceStream() {
+  if (_voice.stream) _voice.stream.getTracks().forEach((t) => t.stop());
+  _voice.stream = null; _voice.mr = null; _voice.chunks = [];
+}
+
+async function micDown(e) {
+  if (_voice.active || _voice.starting) return;
+  e.preventDefault();
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
     toast("Голосовой ввод недоступен в этом браузере.");
     return;
   }
+  _voice.starting = true;
+  _voice.cancel = false;
+  _voice.willCancel = false;
+  _voice.startY = e.clientY ?? 0;
+  try { el.voiceBtn.setPointerCapture(e.pointerId); } catch {}
+
+  let stream;
   try {
-    _voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch {
-    toast("Не удалось получить доступ к микрофону.");
+    _voice.starting = false;
+    toast("Нет доступа к микрофону.");
     return;
   }
-  _voiceChunks = [];
-  _mediaRecorder = new MediaRecorder(_voiceStream);
-  _mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) _voiceChunks.push(e.data); };
-  _mediaRecorder.onstop = onVoiceStop;
-  _mediaRecorder.start();
+  // палец отпустили, пока спрашивали разрешение микрофона
+  if (!_voice.starting) { stream.getTracks().forEach((t) => t.stop()); return; }
 
-  el.voiceBar.classList.remove("hidden");
-  el.voiceBtn.classList.add("is-active");
-  _voiceStart = Date.now();
-  el.voiceTimer.textContent = "0:00";
-  clearInterval(_voiceTimerId);
-  _voiceTimerId = setInterval(() => {
-    const s = Math.floor((Date.now() - _voiceStart) / 1000);
-    el.voiceTimer.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-    if (s >= 120) stopVoice(); // safety cap 2 мин
-  }, 250);
+  _voice.stream = stream;
+  _voice.chunks = [];
+  _voice.mr = new MediaRecorder(stream);
+  _voice.mr.ondataavailable = (ev) => { if (ev.data && ev.data.size) _voice.chunks.push(ev.data); };
+  _voice.mr.onstop = finishVoice;
+  _voice.mr.start();
+  _voice.active = true;
+  _voice.starting = false;
+  _voice.startMs = Date.now();
+  showRecUI();
 }
 
-function teardownVoiceUi() {
-  clearInterval(_voiceTimerId); _voiceTimerId = null;
-  el.voiceBar.classList.add("hidden");
-  el.voiceBtn.classList.remove("is-active");
+function micMove(e) {
+  if (!_voice.active) return;
+  const dy = (e.clientY ?? 0) - _voice.startY;
+  setCancelState(dy < -CANCEL_DRAG_PX);
 }
 
-function stopVoice() {
-  if (_mediaRecorder && _mediaRecorder.state !== "inactive") _mediaRecorder.stop();
-  teardownVoiceUi();
+function micUp() {
+  // отпустили во время запроса разрешения (быстрый тап) — отменяем pending старт
+  if (_voice.starting && !_voice.active) {
+    _voice.starting = false;
+    toast("Удерживайте кнопку, чтобы записать голос.");
+    return;
+  }
+  if (!_voice.active) return;
+  const tooShort = (Date.now() - _voice.startMs) < MIN_HOLD_MS;
+  endHold(_voice.cancel || tooShort, tooShort);
 }
 
-function cancelVoice() {
-  if (_mediaRecorder) _mediaRecorder.onstop = null;
-  if (_mediaRecorder && _mediaRecorder.state !== "inactive") _mediaRecorder.stop();
-  if (_voiceStream) _voiceStream.getTracks().forEach((t) => t.stop());
-  _voiceStream = null; _mediaRecorder = null; _voiceChunks = [];
-  teardownVoiceUi();
+function endHold(cancel, tooShort) {
+  if (!_voice.active) return;
+  _voice.active = false;
+  _voice.willCancel = !!cancel;
+  hideRecUI();
+  if (tooShort) toast("Удерживайте кнопку, чтобы записать голос.");
+  if (_voice.mr && _voice.mr.state !== "inactive") _voice.mr.stop(); // → finishVoice
+  else cleanupVoiceStream();
 }
 
-async function onVoiceStop() {
-  if (_voiceStream) _voiceStream.getTracks().forEach((t) => t.stop());
-  _voiceStream = null;
-  const blob = new Blob(_voiceChunks, { type: _voiceChunks[0]?.type || "audio/webm" });
-  _voiceChunks = [];
+async function finishVoice() {
+  const blob = new Blob(_voice.chunks, { type: _voice.chunks[0]?.type || "audio/webm" });
+  cleanupVoiceStream();
+  if (_voice.willCancel) return;
   if (!blob.size) { toast("Пустая запись."); return; }
+  el.voiceBtn.classList.add("is-busy");
   el.voiceBtn.disabled = true;
-  el.voiceBtn.textContent = "⏳ Распознаю…";
   try {
     const ab = await blob.arrayBuffer();
     const r = await fetch("/api/transcribe", {
@@ -659,13 +726,12 @@ async function onVoiceStop() {
     if (!text) throw new Error(j?.detail || j?.error || "пустой результат");
     el.query.value = text;
     el.query.dispatchEvent(new Event("input"));
-    el.query.focus();
-    toast("Распознано — проверьте текст и нажмите «Искать».", "ok");
+    doSearch(); // как в Telegram: отпустил — отправил
   } catch (e) {
     toast("Не удалось распознать голос: " + (e?.message || e));
   } finally {
+    el.voiceBtn.classList.remove("is-busy");
     el.voiceBtn.disabled = false;
-    el.voiceBtn.textContent = "🎤 Голос";
   }
 }
 
@@ -706,13 +772,14 @@ function init() {
     doSearch();
   });
 
-  // voice
-  el.voiceBtn.addEventListener("click", () => {
-    if (_mediaRecorder && _mediaRecorder.state === "recording") stopVoice();
-    else startVoice();
-  });
-  el.voiceStopBtn.addEventListener("click", stopVoice);
-  el.voiceCancelBtn.addEventListener("click", cancelVoice);
+  // voice: зажми-говори-отпусти (Pointer Events — мышь и тач одинаково)
+  el.voiceBtn.addEventListener("pointerdown", micDown);
+  el.voiceBtn.addEventListener("pointerup", micUp);
+  el.voiceBtn.addEventListener("pointermove", micMove);
+  el.voiceBtn.addEventListener("pointercancel", () => endHold(true));
+  el.voiceBtn.addEventListener("lostpointercapture", micUp);
+  // долгое нажатие на мобиле не должно открывать контекст-меню/выделение
+  el.voiceBtn.addEventListener("contextmenu", (e) => e.preventDefault());
 
   // modals
   document.querySelectorAll("[data-modal]").forEach((b) =>

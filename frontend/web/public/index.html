@@ -38,33 +38,43 @@
         кто спорит, что произошло, какие документы есть и какой результат нужен.
       </p>
       <p class="menu__stats hidden" id="menuStats"></p>
+
+      <!-- пример запроса (как в меню бота) -->
+      <div class="example-card">
+        <span class="example-card__title">Пример запроса:</span>
+        <code class="example-card__q" id="exampleQuery"></code>
+        <button id="exampleBtn" class="btn btn--ghost btn--sm" type="button">▶️ Запустить пример</button>
+      </div>
     </section>
 
     <section class="searchbox" id="searchbox">
-      <textarea
-        id="queryInput"
-        class="searchbox__input"
-        rows="4"
-        maxlength="2000"
-        placeholder="Опишите ситуацию: кто спорит, что произошло, какие документы есть и какой результат нужен."
-        spellcheck="true"
-      ></textarea>
+      <!-- поле ввода с микрофоном справа (зажать — записать, как в Telegram) -->
+      <div class="field" id="field">
+        <textarea
+          id="queryInput"
+          class="field__input"
+          rows="4"
+          maxlength="2000"
+          placeholder="Опишите ситуацию: кто спорит, что произошло, какие документы есть и какой результат нужен."
+          spellcheck="true"
+        ></textarea>
+        <button id="voiceBtn" class="mic" type="button"
+                aria-label="Удерживайте для записи голоса" title="Удерживайте для записи голоса">🎤</button>
+
+        <!-- оверлей записи поверх поля -->
+        <div id="voiceBar" class="recbar hidden" aria-hidden="true">
+          <span class="recbar__dot"></span>
+          <span id="voiceTimer" class="recbar__timer">0:00</span>
+          <span id="voiceHint" class="recbar__hint">Отпустите — отправить · уведите вверх — отмена</span>
+        </div>
+      </div>
 
       <div class="searchbox__bar">
         <div class="searchbox__left">
-          <button id="voiceBtn" class="btn btn--ghost" type="button" title="Голосовой ввод">🎤 Голос</button>
           <button id="settingsBtn" class="btn btn--ghost" type="button" aria-expanded="false" aria-controls="settingsPanel">⚙️ Настройки</button>
           <span id="charCount" class="charcount">0 / 2000</span>
         </div>
         <button id="searchBtn" class="btn btn--primary" type="button">🔎 Искать</button>
-      </div>
-
-      <!-- voice recording bar -->
-      <div id="voiceBar" class="voicebar hidden">
-        <span class="voicebar__rec"><span class="voicebar__dot"></span> Запись…</span>
-        <span id="voiceTimer" class="voicebar__timer">0:00</span>
-        <button id="voiceStopBtn" class="btn btn--primary btn--sm" type="button">⏹ Распознать</button>
-        <button id="voiceCancelBtn" class="btn btn--ghost btn--sm" type="button">Отмена</button>
       </div>
 
       <!-- settings (поля как в боте) -->
@@ -103,13 +113,6 @@
         </div>
 
         <p class="settings__hint">Все настройки сохраняются в вашем браузере.</p>
-      </div>
-
-      <!-- Пример запроса (как в меню бота) -->
-      <div class="example-card">
-        <div class="example-card__title">Пример запроса:</div>
-        <code class="example-card__q" id="exampleQuery"></code>
-        <button id="exampleBtn" class="btn btn--ghost btn--sm" type="button">▶️ Запустить пример</button>
       </div>
     </section>
 
