@@ -1,6 +1,9 @@
 # RAS Search — Supply
 
-**Демо:** https://t.me/ArbitrSupply_bot
+**Демо-версии:**
+
+* 🌐 Веб-приложение — https://rassearchsupply.tech
+* 🤖 Telegram-бот — https://t.me/ArbitrSupply_bot
 
 RAS Search — Supply это сервис для поиска судебной практики по спорам из договоров поставки. Пользователь описывает ситуацию обычным языком или голосом, система находит релевантные арбитражные акты, ранжирует результаты и формирует краткую выжимку по найденной практике.
 
@@ -25,7 +28,8 @@ RAS Search — Supply это сервис для поиска судебной �
 ## Основные возможности
 
 * Поиск по судебной практике на естественном языке.
-* Поддержка голосовых запросов через Telegram.
+* Веб-приложение и Telegram-бот с единой логикой поиска.
+* Поддержка голосовых запросов (Telegram и веб, hold-to-talk).
 * Семантический поиск по базе арбитражных актов.
 * Ранжирование найденных документов по релевантности.
 * Краткая выжимка по топ найденных актов.
@@ -53,6 +57,7 @@ Search results
 Основные компоненты:
 
 * `frontend/telegram` Telegram-бот.
+* `frontend/web` Веб-приложение (зеркало бота) и тонкий node-прокси.
 * `backend/search` Search API и поисковый pipeline.
 * `backend/embed` retrieval, rerank, индексация и работа с embeddings.
 * `backend/inference` GPU inference service для Jina embeddings и reranker.
@@ -95,7 +100,8 @@ Search results
 │   └── parser.js
 │
 ├── frontend/
-│   └── telegram/
+│   ├── telegram/
+│   └── web/
 │
 ├── ops/
 ├── docs/
@@ -175,6 +181,16 @@ npm run search:api
 npm run telegram:bot
 ```
 
+### 8. Веб-приложение
+
+```bash
+npm run web
+```
+
+Веб-приложение слушает порт `8080` и проксирует запросы в Search API (`8091`)
+и Whisper (`8001`) на том же origin. Голосовой ввод требует HTTPS (в production
+обеспечивается обратным прокси).
+
 ## Production services
 
 В production используются systemd-сервисы:
@@ -184,6 +200,7 @@ npm run telegram:bot
 | `ras-search-api`                 | HTTP Search API              | 8091 |
 | `ras-inference`                  | Jina embeddings и reranker   | 8000 |
 | `ras-whisper`                    | Voice transcription          | 8001 |
+| `ras-web`                        | Веб-приложение               | 8080 |
 | `ras-tg-bot-supervised` (user)   | Telegram interface           | -    |
 | `ras-embed-worker`               | Background indexing          | -    |
 

@@ -26,6 +26,7 @@ venv/
 # ── Logs ───────────────────────────────────────────────────────
 logs/
 *.log
+*.log.*
 npm-debug.log*
 
 # ── Backups & editor / tooling dirs ────────────────────────────
