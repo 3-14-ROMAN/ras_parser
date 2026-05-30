@@ -604,7 +604,13 @@ details.log[open] > summary::after { transform: rotate(180deg); }
 
 /* ───────── modal ───────── */
 .modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 18px; }
-.modal__backdrop { position: absolute; inset: 0; background: rgba(10,15,30,.5); backdrop-filter: blur(2px); }
+/* без backdrop-filter: blur — он заставлял браузер пере-композитить размытие на
+   каждом кадре скролла карточки (жёсткий лаг). Просто затемняем фон. */
+.modal__backdrop { position: absolute; inset: 0; background: rgba(10,15,30,.62); }
+/* пока модалка открыта: фон не скроллим и снимаем дорогой blur у шапки (она всё
+   равно перекрыта) — иначе скролл длинной «Информации» дёргается. */
+body.modal-open { overflow: hidden; }
+body.modal-open .topbar { backdrop-filter: none; }
 .modal__card {
   position: relative;
   background: var(--surface);
@@ -613,6 +619,8 @@ details.log[open] > summary::after { transform: rotate(180deg); }
   box-shadow: var(--shadow-lg);
   max-width: 620px; width: 100%;
   max-height: 86vh; overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 26px clamp(18px, 4vw, 30px) 30px;
   animation: pop .18s ease;
 }

@@ -820,9 +820,11 @@ function openModal(name) {
   if (name === "status") renderStatus();
   const m = document.getElementById("modal-" + name);
   if (m) m.classList.remove("hidden");
+  document.body.classList.add("modal-open");
 }
 function closeModals() {
   document.querySelectorAll(".modal").forEach((m) => m.classList.add("hidden"));
+  document.body.classList.remove("modal-open");
 }
 
 // ─── init ────────────────────────────────────────────────────────────────────
