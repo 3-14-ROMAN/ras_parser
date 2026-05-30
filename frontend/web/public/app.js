@@ -50,6 +50,7 @@ const $ = (sel) => document.querySelector(sel);
 const el = {
   query:        $("#queryInput"),
   charCount:    $("#charCount"),
+  queryClear:   $("#queryClear"),
   searchBtn:    $("#searchBtn"),
   exampleBtn:   $("#exampleBtn"),
   voiceBtn:     $("#voiceBtn"),
@@ -76,6 +77,7 @@ const el = {
   voiceBar:     $("#voiceBar"),
   voiceTimer:   $("#voiceTimer"),
   voiceHint:    $("#voiceHint"),
+  voiceCancel:  $("#voiceCancel"),
 };
 
 // ─── settings (localStorage) ─────────────────────────────────────────────────
@@ -635,14 +637,18 @@ function abToBase64(ab) {
   return btoa(bin);
 }
 
-const CANCEL_DRAG_PX = 60;       // увести палец вверх на столько px = отмена
+// Жесты как в Telegram: зажал → запись; увёл вверх → «без рук» (lock, можно
+// отпустить палец и продолжать говорить); увёл влево → отмена; отпустил на месте
+// → готово. В режиме lock запись идёт пока не нажмёшь ⏹ или ✕.
+const LOCK_DRAG_PX   = 48;       // увести вверх на столько px = lock (hands-free)
+const CANCEL_DRAG_PX = 80;       // увести влево на столько px = отмена
 const MIN_HOLD_MS    = 350;      // короче — случайный тап, не запись
 const MAX_HOLD_MS    = 120_000;  // потолок длительности
 
 const _voice = {
   mr: null, chunks: [], stream: null,
-  timerId: null, startMs: 0, startY: 0,
-  active: false, starting: false, cancel: false, willCancel: false,
+  timerId: null, startMs: 0, startX: 0, startY: 0,
+  active: false, starting: false, locked: false, cancel: false, willCancel: false,
 };
 
 function fmtVoiceTimer(ms) {
@@ -650,12 +656,16 @@ function fmtVoiceTimer(ms) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
+const HINT_HOLD   = "Вверх — без рук · влево — отмена · отпустить — готово";
+const HINT_LOCKED = "Запись без рук · нажмите ⏹ — готово, ✕ — отмена";
+const HINT_CANCEL = "Отпустите для отмены";
+
 function showRecUI() {
   el.voiceBtn.classList.add("is-rec");
-  el.voiceBtn.classList.remove("is-cancel");
-  el.voiceBar.classList.remove("hidden", "is-cancel");
+  el.voiceBtn.classList.remove("is-cancel", "is-locked");
+  el.voiceBar.classList.remove("hidden", "is-cancel", "is-locked");
   el.voiceTimer.textContent = "0:00";
-  if (el.voiceHint) el.voiceHint.textContent = "Отпустите — отправить · уведите вверх — отмена";
+  if (el.voiceHint) el.voiceHint.textContent = HINT_HOLD;
   clearInterval(_voice.timerId);
   _voice.timerId = setInterval(() => {
     const dt = Date.now() - _voice.startMs;
@@ -666,9 +676,9 @@ function showRecUI() {
 
 function hideRecUI() {
   clearInterval(_voice.timerId); _voice.timerId = null;
-  el.voiceBtn.classList.remove("is-rec", "is-cancel");
+  el.voiceBtn.classList.remove("is-rec", "is-cancel", "is-locked");
   el.voiceBar.classList.add("hidden");
-  el.voiceBar.classList.remove("is-cancel");
+  el.voiceBar.classList.remove("is-cancel", "is-locked");
 }
 
 function setCancelState(on) {
@@ -676,11 +686,19 @@ function setCancelState(on) {
   _voice.cancel = on;
   el.voiceBtn.classList.toggle("is-cancel", on);
   el.voiceBar.classList.toggle("is-cancel", on);
-  if (el.voiceHint) {
-    el.voiceHint.textContent = on
-      ? "Отпустите для отмены"
-      : "Отпустите — отправить · уведите вверх — отмена";
-  }
+  if (el.voiceHint) el.voiceHint.textContent = on ? HINT_CANCEL : HINT_HOLD;
+}
+
+// Перейти в hands-free: можно отпустить палец, запись продолжается до ⏹/✕.
+function enterLocked() {
+  if (_voice.locked) return;
+  _voice.locked = true;
+  _voice.cancel = false;
+  el.voiceBtn.classList.remove("is-cancel");
+  el.voiceBtn.classList.add("is-locked");
+  el.voiceBar.classList.remove("is-cancel");
+  el.voiceBar.classList.add("is-locked");
+  if (el.voiceHint) el.voiceHint.textContent = HINT_LOCKED;
 }
 
 function cleanupVoiceStream() {
@@ -689,6 +707,8 @@ function cleanupVoiceStream() {
 }
 
 async function micDown(e) {
+  // В режиме lock сама кнопка — это ⏹ «стоп»: тап завершает запись.
+  if (_voice.active && _voice.locked) { e.preventDefault(); endHold(false); return; }
   if (_voice.active || _voice.starting) return;
   e.preventDefault();
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
@@ -696,8 +716,10 @@ async function micDown(e) {
     return;
   }
   _voice.starting = true;
+  _voice.locked = false;
   _voice.cancel = false;
   _voice.willCancel = false;
+  _voice.startX = e.clientX ?? 0;
   _voice.startY = e.clientY ?? 0;
   try { el.voiceBtn.setPointerCapture(e.pointerId); } catch {}
 
@@ -725,9 +747,16 @@ async function micDown(e) {
 }
 
 function micMove(e) {
-  if (!_voice.active) return;
+  if (!_voice.active || _voice.locked) return;
   const dy = (e.clientY ?? 0) - _voice.startY;
-  setCancelState(dy < -CANCEL_DRAG_PX);
+  const dx = (e.clientX ?? 0) - _voice.startX;
+  // Вверх (приоритет) → lock. Влево → отмена. Иначе обычное удержание.
+  if (dy < -LOCK_DRAG_PX) {
+    enterLocked();
+    try { el.voiceBtn.releasePointerCapture(e.pointerId); } catch {}
+    return;
+  }
+  setCancelState(dx < -CANCEL_DRAG_PX);
 }
 
 function micUp() {
@@ -737,7 +766,8 @@ function micUp() {
     toast("Удерживайте кнопку, чтобы записать голос.");
     return;
   }
-  if (!_voice.active) return;
+  // В режиме lock отпускание пальца НЕ останавливает запись (hands-free).
+  if (!_voice.active || _voice.locked) return;
   const tooShort = (Date.now() - _voice.startMs) < MIN_HOLD_MS;
   endHold(_voice.cancel || tooShort, tooShort);
 }
@@ -745,6 +775,7 @@ function micUp() {
 function endHold(cancel, tooShort) {
   if (!_voice.active) return;
   _voice.active = false;
+  _voice.locked = false;
   _voice.willCancel = !!cancel;
   hideRecUI();
   if (tooShort) toast("Удерживайте кнопку, чтобы записать голос.");
@@ -766,9 +797,11 @@ async function finishVoice() {
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({ audio_base64: abToBase64(ab) }),
     });
-    const j = await r.json();
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j?.detail || j?.error || `status ${r.status}`);
     const text = (j?.text || "").trim();
-    if (!text) throw new Error(j?.detail || j?.error || "пустой результат");
+    // Тишина / отфильтрованная галлюцинация — воркер вернул пустой text.
+    if (!text) { toast("🎤 Не расслышал — говорите чётче и ближе к микрофону."); return; }
     // Просто диктовка: распознанный текст уходит прямо в поле поиска.
     el.query.value = text;
     el.query.dispatchEvent(new Event("input"));
@@ -819,14 +852,30 @@ function init() {
     document.getElementById("field")?.scrollIntoView({ behavior: "smooth", block: "center" });
   });
 
-  // voice: зажми-говори-отпусти (Pointer Events — мышь и тач одинаково)
+  // voice: зажми-говори-отпусти + lock (Pointer Events — мышь и тач одинаково)
   el.voiceBtn.addEventListener("pointerdown", micDown);
   el.voiceBtn.addEventListener("pointerup", micUp);
   el.voiceBtn.addEventListener("pointermove", micMove);
-  el.voiceBtn.addEventListener("pointercancel", () => endHold(true));
-  el.voiceBtn.addEventListener("lostpointercapture", micUp);
+  // pointercancel в режиме lock НЕ должен ронять запись (палец уже отпущен)
+  el.voiceBtn.addEventListener("pointercancel", () => { if (!_voice.locked) endHold(true); });
   // долгое нажатие на мобиле не должно открывать контекст-меню/выделение
   el.voiceBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+  // ✕ в баре записи — отмена (в т.ч. в режиме hands-free)
+  if (el.voiceCancel) el.voiceCancel.addEventListener("click", () => endHold(true));
+
+  // ✕ очистить поле ввода целиком
+  const syncClearBtn = () => {
+    if (el.queryClear) el.queryClear.classList.toggle("hidden", el.query.value.length === 0);
+  };
+  el.query.addEventListener("input", syncClearBtn);
+  syncClearBtn();
+  if (el.queryClear) {
+    el.queryClear.addEventListener("click", () => {
+      el.query.value = "";
+      el.query.dispatchEvent(new Event("input"));
+      el.query.focus();
+    });
+  }
 
   // modals
   document.querySelectorAll("[data-modal]").forEach((b) =>

@@ -52,6 +52,53 @@ WHISPER_MODEL_PATH = os.environ.get(
 )
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ── Anti-hallucination ────────────────────────────────────────────────────────
+# Whisper на тишине/шуме галлюцинирует связный текст ("Спасибо за просмотр",
+# "Я не могу сказать, что я не могу сказать..." и т.п.). Две линии защиты:
+#   1. Energy-gate: если RMS аудио ниже порога — речи нет, не гоняем модель.
+#   2. Text-filter: режем повторяющиеся петли и известные фразы-галлюцинации.
+# Пороги в нормализованном float32 [-1, 1]: речь RMS ~0.02-0.15, тихая комната
+# RMS ~0.001-0.005. Дефолт 0.006 ловит "ничего не сказал", не режет тихую речь.
+SILENCE_RMS = float(os.environ.get("RAS_WHISPER_SILENCE_RMS", "0.006"))
+SILENCE_PEAK = float(os.environ.get("RAS_WHISPER_SILENCE_PEAK", "0.02"))
+
+# Нормализованные подстроки типовых галлюцинаций Whisper на тишине (RU/служебные).
+_HALLUCINATION_SUBSTRINGS = (
+    "субтитры",
+    "субтитр",
+    "редактор субтитров",
+    "корректор",
+    "amara.org",
+    "продолжение следует",
+    "спасибо за просмотр",
+    "спасибо за внимание",
+    "подписывайтесь на канал",
+    "ставьте лайк",
+    "до новых встреч",
+)
+
+
+def _normalize_for_filter(text: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in text)
+
+
+def _looks_hallucinated(text: str) -> bool:
+    """Эвристика галлюцинации: пусто / петля-повтор / типовая фраза-заглушка."""
+    norm = _normalize_for_filter(text).strip()
+    if not norm:
+        return True
+    for sub in _HALLUCINATION_SUBSTRINGS:
+        if sub in norm:
+            return True
+    words = norm.split()
+    # Петля ("я не могу сказать, что я не могу сказать ..."): мало уникальных слов.
+    if len(words) >= 6:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.35:
+            return True
+    return False
+
+
 # ── State ─────────────────────────────────────────────────────────────────────
 
 whisper_model = None
@@ -277,10 +324,31 @@ def transcribe(req: TranscribeReq):
             _offload_to_cpu()
             raise HTTPException(400, f"audio too long ({duration_sec:.0f}s > 120s)")
 
+        # ── Energy-gate: тишина → речи нет, модель не гоняем (иначе галлюцинирует).
+        peak = float(np.max(np.abs(audio_np))) if audio_np.size else 0.0
+        rms = float(np.sqrt(np.mean(np.square(audio_np)))) if audio_np.size else 0.0
         print(
-            f"[whisper/req] bytes={len(audio_bytes)} duration={duration_sec:.1f}s",
+            f"[whisper/req] bytes={len(audio_bytes)} duration={duration_sec:.1f}s "
+            f"rms={rms:.5f} peak={peak:.4f}",
             flush=True,
         )
+        if rms < SILENCE_RMS and peak < SILENCE_PEAK:
+            _offload_to_cpu()
+            elapsed_ms = int((time.perf_counter() - t0_total) * 1000)
+            print(
+                f"[whisper/done] no_speech (silence) rms={rms:.5f} peak={peak:.4f} "
+                f"duration={duration_sec:.1f}s total_ms={elapsed_ms}",
+                flush=True,
+            )
+            return {
+                "text": "",
+                "no_speech": True,
+                "reason": "silence",
+                "language": req.language,
+                "duration_sec": round(duration_sec, 2),
+                "elapsed_ms": elapsed_ms,
+                "generate_ms": 0,
+            }
 
         # ── Mel spectrogram + generate ────────────────────────────────────
         try:
@@ -308,15 +376,23 @@ def transcribe(req: TranscribeReq):
             # Step 6: ВСЕГДА освобождаем VRAM
             _offload_to_cpu()
 
+    # ── Text-filter: петля-повтор / типовая фраза-галлюцинация → пусто. ───────
+    no_speech = False
+    if _looks_hallucinated(text):
+        no_speech = True
+        print(f"[whisper/filter] dropped hallucination text={text!r:.120}", flush=True)
+        text = ""
+
     elapsed_ms = int((time.perf_counter() - t0_total) * 1000)
     print(
-        f"[whisper/done] text={text!r:.120} len={len(text)} "
+        f"[whisper/done] text={text!r:.120} len={len(text)} no_speech={no_speech} "
         f"duration={duration_sec:.1f}s gen_ms={gen_ms:.0f} total_ms={elapsed_ms}",
         flush=True,
     )
 
     return {
         "text": text,
+        "no_speech": no_speech,
         "language": req.language,
         "duration_sec": round(duration_sec, 2),
         "elapsed_ms": elapsed_ms,

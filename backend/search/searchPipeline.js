@@ -24,7 +24,10 @@ import { generateFinalAnswer } from "../llm/summaryGenerator.js";
 
 // ── Конфиг (читается из env один раз при загрузке модуля) ────────────────────
 export const DEFAULT_TOPN = Number(process.env.RAS_SEARCH_API_DEFAULT_TOPN || 5);
-export const MAX_TOPN     = Number(process.env.RAS_SEARCH_API_MAX_TOPN     || 20);
+// Потолок актов в выдаче. Равен RRF_TOPK_FOR_RERANK — больше реранкер физически
+// не видит (кандидатский пул = 50). UI (web/bot) предлагает до 50, поэтому сервер
+// тоже должен принимать до 50, иначе topN=50 молча режется и юзер получает меньше.
+export const MAX_TOPN     = Number(process.env.RAS_SEARCH_API_MAX_TOPN     || 50);
 
 export const RRF_TOPK_FOR_RERANK = Number(process.env.RAS_RRF_TOPK_FOR_RERANK ?? 50);
 export const BRANCH_LIMIT        = Number(process.env.RAS_RRF_BRANCH_LIMIT    ?? 100);

@@ -746,11 +746,13 @@ async function callTranscribeApi(audioBuffer) {
     agent:     whisperAgent,
     timeoutMs: 30000,
   });
-  if (status !== 200 || !body?.text) {
+  // Пустой text — легитимный ответ (тишина/галлюцинация отфильтрована воркером),
+  // его разбирает вызывающий код ("не распознал речь"). Кидаем только на не-200.
+  if (status !== 200) {
     const detail = body?.detail || body?.error || `status=${status}`;
     throw new Error(`transcribe failed: ${detail}`);
   }
-  return body; // { text, language, duration_sec, elapsed_ms, generate_ms }
+  return body; // { text, no_speech, language, duration_sec, elapsed_ms, generate_ms }
 }
 
 // ─── форматирование ─────────────────────────────────────────────────────────

@@ -58,6 +58,8 @@
           placeholder="Опишите ситуацию: кто спорит, что произошло, какие документы есть и какой результат нужен."
           spellcheck="true"
         ></textarea>
+        <button id="queryClear" class="field__clear hidden" type="button"
+                aria-label="Очистить поле" title="Очистить поле">✕</button>
         <button id="voiceBtn" class="mic" type="button"
                 aria-label="Удерживайте для записи голоса" title="Удерживайте для записи голоса">
           <svg class="mic__icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -73,7 +75,8 @@
         <div id="voiceBar" class="recbar hidden" aria-hidden="true">
           <span class="recbar__dot"></span>
           <span id="voiceTimer" class="recbar__timer">0:00</span>
-          <span id="voiceHint" class="recbar__hint">Отпустите — вставить текст · уведите вверх — отмена</span>
+          <span id="voiceHint" class="recbar__hint">Вверх — без рук · влево — отмена · отпустить — готово</span>
+          <button id="voiceCancel" class="recbar__cancel" type="button" aria-label="Отменить запись" title="Отменить запись">✕</button>
         </div>
       </div>
 

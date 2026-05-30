@@ -226,6 +226,10 @@ body {
 }
 .mic.is-cancel { background: linear-gradient(180deg, #7b8494, #5b6675); transform: scale(1.15); }
 .mic.is-busy { opacity: .6; cursor: default; }
+/* lock (hands-free): кнопка превращается в ⏹ «стоп», тап — завершить запись */
+.mic.is-locked { background: linear-gradient(180deg, #e56154, var(--deny)); transform: scale(1.18); }
+.mic.is-locked .mic__icon { display: none; }
+.mic.is-locked::after { content: ""; width: 15px; height: 15px; border-radius: 3px; background: #fff; }
 @keyframes micpulse {
   0%, 100% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--deny) 24%, transparent), 0 6px 18px color-mix(in srgb, var(--deny) 45%, transparent); }
   50%      { box-shadow: 0 0 0 13px transparent, 0 6px 18px color-mix(in srgb, var(--deny) 30%, transparent); }
@@ -249,6 +253,30 @@ body {
 .recbar__hint { font-size: 13.5px; color: var(--text-soft); }
 .recbar.is-cancel { background: color-mix(in srgb, var(--deny-soft) 94%, transparent); }
 .recbar.is-cancel .recbar__hint { color: var(--deny); font-weight: 600; }
+.recbar.is-locked .recbar__hint { color: var(--deny); font-weight: 600; }
+/* ✕ отмены записи (видимо в hands-free, когда палец уже отпущен) */
+.recbar__cancel {
+  margin-left: auto; flex: none;
+  width: 30px; height: 30px;
+  border: 0; border-radius: 50%;
+  background: color-mix(in srgb, var(--deny) 16%, transparent);
+  color: var(--deny); font-size: 15px; line-height: 1;
+  display: grid; place-items: center; cursor: pointer;
+  transition: background .15s;
+}
+.recbar__cancel:hover { background: color-mix(in srgb, var(--deny) 30%, transparent); }
+
+/* ✕ очистить поле ввода целиком */
+.field__clear {
+  position: absolute; top: 10px; right: 12px;
+  width: 26px; height: 26px; z-index: 2;
+  border: 0; border-radius: 50%;
+  background: color-mix(in srgb, var(--text-mute) 20%, transparent);
+  color: var(--text-soft); font-size: 13px; line-height: 1;
+  display: grid; place-items: center; cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.field__clear:hover { background: color-mix(in srgb, var(--deny) 22%, transparent); color: var(--deny); }
 
 .searchbox__bar {
   display: flex;
