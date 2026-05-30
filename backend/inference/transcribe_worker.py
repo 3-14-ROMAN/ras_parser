@@ -61,25 +61,45 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # RMS ~0.001-0.005. Дефолт 0.006 ловит "ничего не сказал", не режет тихую речь.
 SILENCE_RMS = float(os.environ.get("RAS_WHISPER_SILENCE_RMS", "0.006"))
 SILENCE_PEAK = float(os.environ.get("RAS_WHISPER_SILENCE_PEAK", "0.02"))
+# Запрет повторять n-граммы при генерации — рубит петли-галлюцинации в зародыше.
+# 0 = выкл. 3 безопасно для диктовки фабулы (точные 3-словные повторы крайне редки).
+NO_REPEAT_NGRAM = int(os.environ.get("RAS_WHISPER_NO_REPEAT_NGRAM", "3"))
 
-# Нормализованные подстроки типовых галлюцинаций Whisper на тишине (RU/служебные).
+# Стем-подстроки типовых галлюцинаций Whisper на тишине/шуме (YouTube/служебные).
+# Берём корни, а не целые фразы: модель вставляет лишние слова ("подписывайтесь
+# на НАШ канал"), поэтому "подписыва" надёжнее точной фразы.
 _HALLUCINATION_SUBSTRINGS = (
-    "субтитры",
     "субтитр",
-    "редактор субтитров",
-    "корректор",
     "amara.org",
+    "редактор субтитр",
+    "корректор",
     "продолжение следует",
-    "спасибо за просмотр",
-    "спасибо за внимание",
-    "подписывайтесь на канал",
+    "за просмотр",          # "спасибо за просмотр"
+    "приятного просмотра",
+    "за внимание",          # "спасибо за внимание"
+    "подписыва",            # "подписывайтесь на (наш) канал"
     "ставьте лайк",
+    "лайк и подпис",
+    "колокольчик",
     "до новых встреч",
 )
 
 
 def _normalize_for_filter(text: str) -> str:
     return "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in text)
+
+
+def _has_repeated_ngram(words, n=3, min_repeats=3) -> bool:
+    """True, если какая-то n-грамма повторяется >= min_repeats раз (петля)."""
+    if len(words) < n * min_repeats:
+        return False
+    counts = {}
+    for i in range(len(words) - n + 1):
+        gram = " ".join(words[i : i + n])
+        counts[gram] = counts.get(gram, 0) + 1
+        if counts[gram] >= min_repeats:
+            return True
+    return False
 
 
 def _looks_hallucinated(text: str) -> bool:
@@ -91,11 +111,15 @@ def _looks_hallucinated(text: str) -> bool:
         if sub in norm:
             return True
     words = norm.split()
-    # Петля ("я не могу сказать, что я не могу сказать ..."): мало уникальных слов.
-    if len(words) >= 6:
-        unique_ratio = len(set(words)) / len(words)
-        if unique_ratio < 0.35:
-            return True
+    if len(words) < 6:
+        return False
+    # Петля типа "я не могу сказать, что я не могу сказать ...": либо мало
+    # уникальных слов целиком, либо повторяющаяся 3-грамма (ловит петлю даже
+    # когда вокруг неё есть другой текст).
+    if len(set(words)) / len(words) < 0.35:
+        return True
+    if _has_repeated_ngram(words, n=3, min_repeats=3):
+        return True
     return False
 
 
@@ -356,14 +380,17 @@ def transcribe(req: TranscribeReq):
                 audio_np, sampling_rate=16000, return_tensors="pt"
             ).input_features.to(DEVICE, dtype=torch.float16)
 
+            gen_kwargs = dict(
+                language=req.language,
+                task="transcribe",
+                max_new_tokens=440,
+            )
+            if NO_REPEAT_NGRAM > 0:
+                gen_kwargs["no_repeat_ngram_size"] = NO_REPEAT_NGRAM
+
             t0_gen = time.perf_counter()
             with torch.inference_mode():
-                predicted_ids = whisper_model.generate(
-                    input_features,
-                    language=req.language,
-                    task="transcribe",
-                    max_new_tokens=440,
-                )
+                predicted_ids = whisper_model.generate(input_features, **gen_kwargs)
             if DEVICE == "cuda":
                 torch.cuda.synchronize()
             gen_ms = (time.perf_counter() - t0_gen) * 1000
