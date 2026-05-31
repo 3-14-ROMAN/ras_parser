@@ -67,20 +67,6 @@ export function clampTopN(raw) {
   return Math.max(1, Math.min(MAX_TOPN, Math.floor(n)));
 }
 
-// Сколько кандидатов реально прогоняем через reranker. Берём с ЗАПАСОМ от topN —
-// чтобы reranker мог поднять валидные акты, которые RRF задвинул в хвост. RRF
-// ранжирует грубо: нужный акт может оказаться 17-м, а реранкер его поднимет в топ.
-// Правило (просили так):
-//   topN 1..5  → 10        (флор: на мелких запросах всё равно даём буфер)
-//   topN 6..25 → topN × 2  (двойной запас)
-//   topN ≥ 26  → 50        (потолок = RRF_TOPK_FOR_RERANK, больше кандидатов нет)
-// Полные тексты, без обрезки. VRAM не упирается (reranker гонит блоками ≤131k
-// токенов последовательно, ~11-19 ГБ из 32); цена за больше кандидатов — латентность.
-export function rerankCandidateCount(topN) {
-  const n = Math.max(1, Math.floor(Number(topN) || DEFAULT_TOPN));
-  return Math.min(RRF_TOPK_FOR_RERANK, Math.max(10, n * 2));
-}
-
 export function makeSnippet(text, n) {
   if (!text) return "";
   const t = String(text).replace(/\s+/g, " ").trim();
@@ -272,12 +258,11 @@ export async function runSearchPipeline(params, opts = {}) {
     hydeTextForEmbed = hydeText.slice(0, HYDE_MAX_CHARS_FOR_EMBED);
     log("WARN", "search/hyde-truncated", { from: hydeTruncatedFrom, to: HYDE_MAX_CHARS_FOR_EMBED });
   }
-  const rerankCandidates = rerankCandidateCount(topN);
   log("INFO", "search/before-rerank-pipeline", {
     hyde_text_chars: hydeTextForEmbed?.length ?? 0,
     hyde_truncated_from: hydeTruncatedFrom || null,
     top_n: topN,
-    rerank_candidates: rerankCandidates,
+    rerank_candidates: RRF_TOPK_FOR_RERANK,
   });
 
   emit("search_start", {});
@@ -288,7 +273,11 @@ export async function runSearchPipeline(params, opts = {}) {
       perBranchLimit:        BRANCH_LIMIT,
       groupSize:             GROUP_SIZE,
       rrfK:                  RRF_K,
-      rrfTopK:               rerankCandidates,
+      // Всегда подаём в reranker ПОЛНЫЙ RRF-пул (50). Это даёт реранкеру шанс
+      // вытащить «закопанные» в RRF-хвосте акты независимо от того, сколько
+      // юзер просит в выдаче. На длинных юр. текстах реранкер pointwise → ~20с
+      // на 50 актов вне зависимости от topN (см. project_topn_and_whisper_filter).
+      rrfTopK:               RRF_TOPK_FOR_RERANK,
       topN,
       chunkWindow:           CHUNK_WINDOW,
       maxChars:              MAX_CHARS,
