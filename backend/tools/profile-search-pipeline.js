@@ -22,6 +22,7 @@ import {
   embedQuery,
   branchFullColbert,
   branchFullSparse,
+  branchFullDense,
   branchLongDense,
   branchLongSparse,
   branchLongColbert,
@@ -43,7 +44,22 @@ const PREFETCH_LIMIT   = Math.max(500, PER_BRANCH_LIMIT * 5);
 const RRF_TOPK         = 50;
 const RRF_K            = 60;
 const HYDRATE_TOP      = 50;
-const RERANK_TOPN      = 3;
+
+// TARGET_ACT_ID=<id> — диагностика одного акта: его ранг в каждой из 5 веток,
+// в RRF и у реранкера, отдельно для original-query и для HyDE. Изолирует, кто
+// уронил акт: конкретная ветка или дрейф HyDE. В этом режиме реранкер скорит
+// весь пул (topN=HYDRATE_TOP), иначе rerank_rank целевого акта не найти.
+const TARGET_ACT_ID = (process.env.TARGET_ACT_ID || "").trim() || null;
+const RERANK_TOPN   = TARGET_ACT_ID ? HYDRATE_TOP : 3;
+
+const BRANCH_NAMES = [
+  "full_colbert",
+  "full_sparse",
+  "full_dense",
+  "long_dense",
+  "long_sparse",
+  "long_colbert",
+];
 
 const ms = (n) => `${String(n).padStart(6)}ms`;
 
@@ -87,6 +103,51 @@ async function dumpCollectionConfig() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// 1b. Target act footprint в Qdrant (в каких ветках он вообще МОЖЕТ быть)
+// ──────────────────────────────────────────────────────────────────────────
+// full_colbert/full_sparse фильтруют unit_type=full_act; long_* фильтруют
+// unit_type=chunk. Акт = ЛИБО один full_act-поинт, ЛИБО N chunk-поинтов —
+// значит короткий акт достижим максимум в 2 ветках, длинный — максимум в 3.
+async function fetchActFootprint(actId) {
+  const body = {
+    filter: { must: [{ key: "act_id", match: { value: actId } }] },
+    with_payload: ["unit_type", "chunk_id", "is_long_act", "has_colbert", "case_number", "court"],
+    with_vector: false,
+    limit: 2000,
+  };
+  const res = await qdrant("POST", `/collections/${COLLECTION}/points/scroll`, body);
+  const pts = res?.result?.points ?? [];
+  if (pts.length === 0) return { exists: false, points: 0 };
+  const unitTypes = new Set(pts.map((p) => p.payload?.unit_type).filter(Boolean));
+  const isLong = pts.some((p) => p.payload?.is_long_act === true);
+  const isFull = unitTypes.has("full_act");
+  const isChunk = unitTypes.has("chunk");
+  const hasColbert = pts.some((p) => p.payload?.has_colbert === true);
+  // Ветки, в которых акт в принципе может появиться:
+  const eligible = new Set();
+  if (isFull) {
+    if (hasColbert) eligible.add("full_colbert");
+    eligible.add("full_sparse");
+    eligible.add("full_dense");
+  }
+  if (isChunk) {
+    eligible.add("long_dense");
+    eligible.add("long_sparse");
+    if (hasColbert) eligible.add("long_colbert");
+  }
+  return {
+    exists: true,
+    points: pts.length,
+    unit_types: [...unitTypes],
+    is_long_act: isLong,
+    has_colbert: hasColbert,
+    case_number: pts[0]?.payload?.case_number ?? null,
+    court: pts[0]?.payload?.court ?? null,
+    eligible,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // 2. Per-branch profile
 // ──────────────────────────────────────────────────────────────────────────
 async function profileBranches(q) {
@@ -98,6 +159,8 @@ async function profileBranches(q) {
       { uses_tokens: true,  uses_sparse: false, prefetch_using: "dense",      query_using: "colbert"  }],
     ["full_sparse",  branchFullSparse,  { limit: PER_BRANCH_LIMIT },
       { uses_tokens: false, uses_sparse: true,  prefetch_using: null,         query_using: "sparse"   }],
+    ["full_dense",   branchFullDense,   { limit: PER_BRANCH_LIMIT },
+      { uses_tokens: false, uses_sparse: false, prefetch_using: null,         query_using: "dense"    }],
     ["long_dense",   branchLongDense,   { limit: PER_BRANCH_LIMIT, groupSize: GROUP_SIZE },
       { uses_tokens: false, uses_sparse: false, prefetch_using: null,         query_using: "dense_late" }],
     ["long_sparse",  branchLongSparse,  { limit: PER_BRANCH_LIMIT, groupSize: GROUP_SIZE },
@@ -144,6 +207,7 @@ async function profilePostRetrieval(queryTextForRerank, branchResults) {
     {
       full_colbert: branchResults.full_colbert?.actIds ?? [],
       full_sparse:  branchResults.full_sparse?.actIds  ?? [],
+      full_dense:   branchResults.full_dense?.actIds   ?? [],
       long_dense:   branchResults.long_dense?.actIds   ?? [],
       long_sparse:  branchResults.long_sparse?.actIds  ?? [],
       long_colbert: branchResults.long_colbert?.actIds ?? [],
@@ -165,7 +229,7 @@ async function profilePostRetrieval(queryTextForRerank, branchResults) {
   const r = await rerank(queryTextForRerank, hydrated, { topN: RERANK_TOPN });
   const rerMs = Date.now() - tRer0;
   console.log(`  rerank(Jina)   ${ms(rerMs)}  scored=${r.scored}  skipped_empty=${r.skipped_empty}  topN=${RERANK_TOPN}`);
-  return { rrfMs, hydMs, rerMs };
+  return { rrfMs, hydMs, rerMs, merged, ranked: r.ranked ?? [] };
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -219,16 +283,80 @@ async function main() {
   }
 
   // Прогон 1: original query во всех ветках (как было до HyDE).
-  await profileRun("RUN A: original short query (no HyDE)", ORIGINAL_QUERY, ORIGINAL_QUERY);
+  const runA = await profileRun("RUN A: original short query (no HyDE)", ORIGINAL_QUERY, ORIGINAL_QUERY);
 
   // Прогон 2: HyDE в embed (во всех ветках), rerank на оригинале.
   // Это текущее «полное HyDE» поведение, которое 60+ секунд.
-  await profileRun("RUN B: HyDE-text in embed (all branches), rerank on original", hydeText, ORIGINAL_QUERY);
+  const runB = await profileRun("RUN B: HyDE-text in embed (all branches), rerank on original", hydeText, ORIGINAL_QUERY);
+
+  if (TARGET_ACT_ID) {
+    await reportTargetAct(TARGET_ACT_ID, runA, runB);
+  }
 
   console.log("\n=== HyDE text (для справки) ===");
   console.log(hydeText);
 
   await closePool().catch(() => {});
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// 6. Target-act report: ранг акта по веткам / RRF / rerank, A vs B
+// ──────────────────────────────────────────────────────────────────────────
+function _branchRank(branchResults, name, actId) {
+  const ids = branchResults?.[name]?.actIds ?? [];
+  const i = ids.indexOf(actId);
+  return i < 0 ? null : i + 1;
+}
+function _rrfRank(merged, actId) {
+  const i = (merged ?? []).findIndex(([id]) => id === actId);
+  return i < 0 ? null : i + 1;
+}
+function _rerankRank(ranked, actId) {
+  const hit = (ranked ?? []).find((r) => r.act_id === actId);
+  return hit ? hit.rerank_rank : null;
+}
+const _cell = (v) => (v == null ? "—" : String(v));
+
+async function reportTargetAct(actId, runA, runB) {
+  console.log(`\n\n==================== TARGET ACT: ${actId} ====================`);
+  const fp = await fetchActFootprint(actId);
+  if (!fp.exists) {
+    console.log(`⚠ act_id ${actId} НЕ найден в Qdrant (${COLLECTION}). Проверь id / коллекцию.`);
+    return;
+  }
+  console.log(
+    `footprint: points=${fp.points}  unit_types=[${fp.unit_types.join(",")}]  ` +
+    `is_long_act=${fp.is_long_act}  has_colbert=${fp.has_colbert}  ` +
+    `case=${fp.case_number ?? "-"}  court=${fp.court ?? "-"}`,
+  );
+  const eligibleStr = BRANCH_NAMES.map((n) => (fp.eligible.has(n) ? n : `~${n}`)).join("  ");
+  console.log(`eligible branches (физически достижимые): ${eligibleStr}`);
+  console.log(`  («~name» = ветка фильтрует этот акт по unit_type/has_colbert, попасть туда не может)`);
+  console.log("");
+
+  // Шапка таблицы.
+  const head = ["", ...BRANCH_NAMES.map((n) => n.replace("full_", "f_").replace("long_", "l_")), " RRF", "rerank"];
+  const widths = head.map((h) => Math.max(h.length, 6));
+  const fmtRow = (label, cells) =>
+    [label.padEnd(8), ...cells.map((c, i) => _cell(c).padStart(widths[i + 1]))].join("  ");
+  console.log(fmtRow("", head.slice(1)));
+
+  for (const [label, run] of [["RUN A", runA], ["RUN B", runB]]) {
+    const cells = [
+      ...BRANCH_NAMES.map((n) => _branchRank(run.branchResults, n, actId)),
+      _rrfRank(run.merged, actId),
+      _rerankRank(run.ranked, actId),
+    ];
+    console.log(fmtRow(label, cells));
+  }
+
+  console.log("");
+  console.log("Чтение:");
+  console.log("  • число = ранг акта в этой ветке (1 = верх); «—» = ветка его не вернула (за limit=100 или не eligible).");
+  console.log("  • RUN A = original query во всех ветках; RUN B = HyDE-текст во всех ветках. Reranker в обоих — на original.");
+  console.log("  • Если в RUN A ранги хорошие, а в RUN B провалились → виноват дрейф HyDE.");
+  console.log("  • Если «—» стоит в eligible-ветке → ветка реально промахнулась (limit/prefetch/синонимы).");
+  console.log("  • Низкий RRF при высоком rerank — это норма дизайна: RRF = консенсус веток, rerank = чтение текста.");
 }
 
 main().catch((e) => {

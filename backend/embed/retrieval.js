@@ -32,6 +32,10 @@
  * Веса по умолчанию (можно тюнить env / argument):
  *   full_colbert : 1.15  — самый точный сигнал для коротких актов (token-level)
  *   full_sparse  : 1.00  — точные юридические термины / статьи / номера
+ *   full_dense   : 1.00  — чистый dense (2048) для коротких актов: самостоятельная
+ *                          dense-дорожка (раньше dense full_act'а был лишь prefetch
+ *                          в colbert). Восстанавливает симметрию дорожек с long_*:
+ *                          короткий акт = 3 ветки (colbert+sparse+dense), как длинный.
  *   long_dense   : 1.00  — late-chunk dense mean-pool для длинных актов
  *   long_sparse  : 1.00  — точные термы внутри длинных актов
  *   long_colbert : 1.15  — late-chunk colbert MaxSim (паритет с short colbert)
@@ -198,6 +202,38 @@ export async function branchFullColbert(q, opts = {}) {
     },
     query:  q.colbert,
     using:  "colbert",
+    filter: flt,
+    limit,
+    with_payload: DEFAULT_PAYLOAD_FIELDS,
+    with_vector:  false,
+  };
+  const res = await qdrant("POST", `/collections/${COLLECTION}/points/query`, body);
+  const points = res?.result?.points ?? [];
+  return { points, actIds: rankedUniqueActIds(points) };
+}
+
+/**
+ * Ветка F — короткие акты, чистый dense (2048).
+ *   filter: unit_type=full_act
+ *   search: dense (2048-dim Jina v4 retrieval-embedding) напрямую
+ *
+ * Самостоятельная dense-дорожка для коротких актов. Раньше вектор `dense`
+ * full_act'ов использовался ТОЛЬКО как prefetch внутри branchFullColbert и
+ * не давал отдельного RRF-сигнала — из-за чего короткий акт мог попасть лишь
+ * в 2 ветки (full_colbert + full_sparse), тогда как длинный — в 3
+ * (long_dense + long_sparse + long_colbert). Это структурно занижало RRF
+ * коротких актов (RRF премирует консенсус дорожек). Ветка восстанавливает
+ * симметрию БЕЗ переэмбеддинга: вектор уже лежит в Qdrant. Семантический
+ * сигнал устойчивее sparse к лексическому разрыву (синонимы/парафраз).
+ */
+export async function branchFullDense(q, opts = {}) {
+  const limit = opts.limit ?? 100;
+  const flt = {
+    must: [{ key: "unit_type", match: { value: "full_act" } }],
+  };
+  const body = {
+    query: q.dense,
+    using: "dense",
     filter: flt,
     limit,
     with_payload: DEFAULT_PAYLOAD_FIELDS,
@@ -401,10 +437,21 @@ export function rrfMerge(branches, weights = {}, k = 60) {
 export const DEFAULT_RRF_WEIGHTS = {
   full_colbert: 1.15,
   full_sparse:  1.00,
+  full_dense:   1.00,  // ← симметрия с long_dense: короткий акт тоже получает чистую dense-дорожку
   long_dense:   1.00,
   long_sparse:  1.00,
   long_colbert: 1.15,
 };
+
+// full_dense по умолчанию ВЫКЛЮЧЕН. A/B (backend/tools/ab-full-dense.js,
+// 2026-05-31) показал: ветка сильно меняет выдачу (короткие акты вытесняют
+// длинные), но средняя релевантность top-9 не растёт — статистическая ничья
+// (Q1 +0.55*, Q2 +0.12, Q6 −0.11; * Q1 был на hyde_FAIL). Прод-вывод Romana
+// «текущая выдача лучшая» → не меняем ранжирование молча. Флаг оставлен, чтобы
+// можно было перепроверить с другим весом (напр. 0.3–0.5) без правки кода.
+// Когда OFF — branchFullDense не вызывается, actIds=[], RRF идентичен старым
+// 5 веткам (пустой список не вносит вклад).
+const FULL_DENSE_ENABLED = (process.env.RAS_RRF_ENABLE_FULL_DENSE ?? "0") === "1";
 
 /**
  * Прогнать все 4 ветки параллельно, склеить через RRF.
@@ -441,17 +488,23 @@ async function _searchAllImpl(queryText, opts = {}) {
   const branchOpts       = { limit: perBranchLimit };
   const longBranchOpts   = { limit: perBranchLimit, groupSize };
 
-  // 5 веток параллельно. Promise.all потому, что они независимы — пока одна
-  // ветка ждёт ответа Qdrant, другие тоже летят.
+  // Ветки параллельно. Promise.all потому, что они независимы — пока одна
+  // ветка ждёт ответа Qdrant, другие тоже летят. full_dense гейтится флагом:
+  // когда OFF — резолвится пустым, в Qdrant не ходит, вклада в RRF нет.
+  const fullDenseP = FULL_DENSE_ENABLED
+    ? branchFullDense(q, branchOpts)
+    : Promise.resolve({ points: [], actIds: [] });
   const [
     full_colbert,
     full_sparse,
+    full_dense,
     long_dense,
     long_sparse,
     long_colbert,
   ] = await Promise.all([
     branchFullColbert(q, branchOpts),
     branchFullSparse(q, branchOpts),
+    fullDenseP,
     branchLongDense(q, longBranchOpts),
     branchLongSparse(q, longBranchOpts),
     branchLongColbert(q, longBranchOpts),
@@ -461,6 +514,7 @@ async function _searchAllImpl(queryText, opts = {}) {
     {
       full_colbert: full_colbert.actIds,
       full_sparse:  full_sparse.actIds,
+      full_dense:   full_dense.actIds,
       long_dense:   long_dense.actIds,
       long_sparse:  long_sparse.actIds,
       long_colbert: long_colbert.actIds,
@@ -477,6 +531,7 @@ async function _searchAllImpl(queryText, opts = {}) {
     branches: {
       full_colbert,
       full_sparse,
+      full_dense,
       long_dense,
       long_sparse,
       long_colbert,

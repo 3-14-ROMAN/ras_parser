@@ -39,20 +39,28 @@ RAS Search — Supply это сервис для поиска судебной �
 ## Архитектура
 
 ```text
-Telegram Bot / HTTP API
+Telegram Bot / Web / HTTP API
         |
         v
-Search API
+Search API  (backend/search)
         |
-        +--> HyDE / query expansion
-        +--> Retrieval in Qdrant
-        +--> RRF fusion
-        +--> Jina reranker
-        +--> LLM summary
+        +--> HyDE (Gemini): запрос → гипотетический акт, которым эмбедится поиск
+        +--> Embedding (Jina v4): dense 2048 + ColBERT multivector (128/токен) + sparse
+        +--> Retrieval в Qdrant — гибрид по веткам:
+        |       короткие акты (full_act):  ColBERT MaxSim, sparse/BM25
+        |       длинные акты (late-chunk): dense, sparse, ColBERT — с group_by act_id
+        +--> RRF fusion: слияние веток по рангам (а не по несравнимым score'ам)
+        +--> Jina reranker v3: cross-encoder поверх полного текста топ-кандидатов
+        +--> LLM summary (Gemini): краткая выжимка по топ-актам
         |
         v
 Search results
 ```
+
+Поиск гибридный: ни один сырой score Qdrant не сравнивается между ветками
+(ColBERT MaxSim, dense Dot, sparse IDF — разные шкалы) — ветки сливаются только
+по позициям через RRF, а финальную точность даёт cross-encoder reranker,
+читающий полный текст акта. Подробности — в `backend/embed/retrieval.js`.
 
 Основные компоненты:
 
